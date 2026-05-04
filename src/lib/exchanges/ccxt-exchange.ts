@@ -124,7 +124,8 @@ export class CcxtGenericExchange implements IExchange {
 
   async marketBuy(pair: string, amountQuote: number): Promise<OrderResult> {
     const ticker = await this.getTicker(pair);
-    const amount = amountQuote / ticker.price;
+    const rawAmount = amountQuote / ticker.price;
+    const amount = Number(this.exchange.amountToPrecision(pair, rawAmount));
     const order = await this.exchange.createMarketBuyOrder(pair, amount);
     return {
       id: order.id, pair, side: "buy", type: "market",

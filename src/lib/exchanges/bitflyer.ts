@@ -167,9 +167,30 @@ export class BitFlyerExchange implements IExchange {
     };
   }
 
+  // BitFlyer精度要件に合わせて数量を丸める
+  private roundAmount(pair: string, amount: number): number {
+    const base = pair.split("/")[0];
+    const precisionMap: Record<string, number> = {
+      BTC: 8, ETH: 7, XRP: 6, XLM: 6, MONA: 6,
+    };
+    const minAmountMap: Record<string, number> = {
+      BTC: 0.001, ETH: 0.01, XRP: 0.1, XLM: 0.1, MONA: 0.1,
+    };
+    const precision = precisionMap[base] ?? 8;
+    const minAmount = minAmountMap[base] ?? 0.001;
+    const factor = Math.pow(10, precision);
+    const rounded = Math.floor(amount * factor) / factor;
+    return rounded >= minAmount ? rounded : 0;
+  }
+
   async marketBuy(pair: string, amountQuote: number): Promise<OrderResult> {
     const ticker = await this.getTicker(pair);
-    const amount = amountQuote / ticker.price;
+    const rawAmount = amountQuote / ticker.price;
+    const amount = this.roundAmount(pair, rawAmount);
+
+    if (amount <= 0) {
+      throw new Error(`${pair}: 注文額が最小取引単位未満 (¥${amountQuote.toLocaleString()})`);
+    }
 
     const order = await this.exchange.createMarketBuyOrder(pair, amount);
     return {
@@ -186,13 +207,19 @@ export class BitFlyerExchange implements IExchange {
   }
 
   async marketSell(pair: string, amountBase: number): Promise<OrderResult> {
-    const order = await this.exchange.createMarketSellOrder(pair, amountBase);
+    const amount = this.roundAmount(pair, amountBase);
+
+    if (amount <= 0) {
+      throw new Error(`${pair}: 売却量が最小取引単位未満`);
+    }
+
+    const order = await this.exchange.createMarketSellOrder(pair, amount);
     return {
       id: order.id,
       pair,
       side: "sell",
       type: "market",
-      amount: order.amount ?? amountBase,
+      amount: order.amount ?? amount,
       price: order.average ?? 0,
       status: (order.status as OrderResult["status"]) ?? "closed",
       timestamp: order.timestamp ?? Date.now(),
