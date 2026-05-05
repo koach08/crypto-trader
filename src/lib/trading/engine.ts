@@ -57,7 +57,7 @@ const state: EngineState = {
   lastCycleTimestamp: null,
   pairs: ["BTC/JPY", "ETH/JPY", "XRP/JPY"],
   intervalSeconds: 900,
-  riskManager: new RiskManager(2.0),
+  riskManager: new RiskManager(Number(process.env.MAX_DAILY_LOSS_PERCENT || "5.0")),
   paperTrader: new PaperTrader(),
   decisions: [],
   recentTrades: [],
