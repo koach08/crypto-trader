@@ -249,9 +249,9 @@ export default function Dashboard() {
               <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
               <XAxis dataKey="time" tick={{ fontSize: 10, fill: "#71717a" }} interval="preserveStartEnd" />
               <YAxis domain={["dataMin", "dataMax"]} tick={{ fontSize: 10, fill: "#71717a" }} width={65}
-                tickFormatter={(v: number) => `¥${(v / 1000).toFixed(0)}k`} />
+                tickFormatter={(v) => `¥${(Number(v) / 1000).toFixed(0)}k`} />
               <Tooltip contentStyle={{ background: "#18181b", border: "1px solid #3f3f46", borderRadius: 8, fontSize: 12 }}
-                formatter={(v: number) => [`¥${v.toLocaleString()}`, "価格"]} />
+                formatter={(v) => [`¥${Number(v).toLocaleString()}`, "価格"]} />
               <Area type="monotone" dataKey="price" stroke={ACCENT.blue} fill="url(#priceGrad)" strokeWidth={2} dot={false} />
             </AreaChart>
           </ResponsiveContainer>
@@ -296,7 +296,7 @@ export default function Dashboard() {
                   ))}
                 </Pie>
                 <Tooltip contentStyle={{ background: "#18181b", border: "1px solid #3f3f46", borderRadius: 8, fontSize: 11 }}
-                  formatter={(v: number) => [`¥${v.toLocaleString()}`, ""]} />
+                  formatter={(v) => [`¥${Number(v).toLocaleString()}`, ""]} />
               </PieChart>
             </ResponsiveContainer>
           ) : (
