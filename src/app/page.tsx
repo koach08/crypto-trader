@@ -3,7 +3,7 @@
 import { useState, useEffect, useCallback } from "react";
 import {
   LineChart, Line, AreaChart, Area, BarChart, Bar,
-  XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, PieChart, Pie, Cell,
+  XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
 } from "recharts";
 import type { BotStatus, Position, DailyPnL, AIDecision, TickerData, TradeRecord } from "@/lib/types";
 import { BITFLYER_PAIRS } from "@/lib/types";
@@ -88,7 +88,10 @@ export default function Dashboard() {
       ]);
 
       if (statusRes.ok) setData(await statusRes.json());
-      if (tradesRes.ok) setTrades(await tradesRes.json());
+      if (tradesRes.ok) {
+        const t = await tradesRes.json();
+        setTrades(Array.isArray(t) ? t : []);
+      }
 
       const newTickers: Record<string, TickerData> = {};
       for (let i = 0; i < BITFLYER_PAIRS.length; i++) {
@@ -114,15 +117,17 @@ export default function Dashboard() {
         ...pairs.map(p =>
           fetch(`/api/exchange/ohlcv?pair=${encodeURIComponent(p)}&timeframe=1h&limit=48`).then(r => r.ok ? r.json() : []).catch(() => [])
         ),
-        fetch("/api/news").then(r => r.ok ? r.json() : { articles: [] }).catch(() => ({ articles: [] })),
+        fetch("/api/news").then(r => r.ok ? r.json() : { articles: [] }).catch(() => ({ articles: [] } as { articles: NewsItem[] })),
         fetch("/api/data/pnl-history").then(r => r.ok ? r.json() : []).catch(() => []),
       ]);
 
       const hist: Record<string, OHLCVBar[]> = {};
       pairs.forEach((p, i) => { hist[p] = results[i]; });
       setPriceHistory(hist);
-      setNews(results[pairs.length]?.articles || []);
-      setPnlHistory(results[pairs.length + 1] || []);
+      const newsData = results[pairs.length];
+      setNews(Array.isArray(newsData?.articles) ? newsData.articles : []);
+      const pnlData = results[pairs.length + 1];
+      setPnlHistory(Array.isArray(pnlData) ? pnlData : []);
     } catch (e) {
       console.error(e);
     }
@@ -287,29 +292,25 @@ export default function Dashboard() {
         <div className="bg-zinc-900 rounded-xl p-4 border border-zinc-800">
           <h2 className="text-sm font-medium text-zinc-400 mb-2">ポートフォリオ</h2>
           {balanceData.length > 0 ? (
-            <ResponsiveContainer width="100%" height={120}>
-              <PieChart>
-                <Pie data={balanceData} dataKey="value" nameKey="name" cx="50%" cy="50%"
-                  innerRadius={30} outerRadius={50} paddingAngle={2}>
-                  {balanceData.map((_, i) => (
-                    <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />
-                  ))}
-                </Pie>
-                <Tooltip contentStyle={{ background: "#18181b", border: "1px solid #3f3f46", borderRadius: 8, fontSize: 11 }}
-                  formatter={(v) => [`¥${Number(v).toLocaleString()}`, ""]} />
-              </PieChart>
-            </ResponsiveContainer>
+            <div className="space-y-1.5">
+              {balanceData.map((d, i) => {
+                const total = balanceData.reduce((s, x) => s + x.value, 0);
+                const pct = total > 0 ? ((d.value / total) * 100).toFixed(0) : "0";
+                return (
+                  <div key={d.name} className="flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full shrink-0" style={{ background: PIE_COLORS[i % PIE_COLORS.length] }} />
+                    <span className="text-xs text-zinc-300 w-10">{d.name}</span>
+                    <div className="flex-1 bg-zinc-800 rounded-full h-2 overflow-hidden">
+                      <div className="h-full rounded-full" style={{ width: `${pct}%`, background: PIE_COLORS[i % PIE_COLORS.length] }} />
+                    </div>
+                    <span className="text-[10px] text-zinc-500 w-16 text-right">¥{d.value.toLocaleString()}</span>
+                  </div>
+                );
+              })}
+            </div>
           ) : (
             <div className="text-center text-zinc-600 text-xs py-8">ポジションなし</div>
           )}
-          <div className="flex flex-wrap gap-1 mt-1">
-            {balanceData.map((d, i) => (
-              <span key={d.name} className="text-[10px] flex items-center gap-1">
-                <span className="w-2 h-2 rounded-full" style={{ background: PIE_COLORS[i % PIE_COLORS.length] }} />
-                {d.name}
-              </span>
-            ))}
-          </div>
         </div>
       </div>
 
@@ -323,11 +324,7 @@ export default function Dashboard() {
               <XAxis dataKey="time" tick={{ fontSize: 9, fill: "#71717a" }} />
               <YAxis tick={{ fontSize: 9, fill: "#71717a" }} width={40} />
               <Tooltip contentStyle={{ background: "#18181b", border: "1px solid #3f3f46", borderRadius: 8, fontSize: 11 }} />
-              <Bar dataKey="pnl" fill={ACCENT.green} radius={[2, 2, 0, 0]}>
-                {tradeChartData.map((d, i) => (
-                  <Cell key={i} fill={d.pnl >= 0 ? ACCENT.green : ACCENT.red} />
-                ))}
-              </Bar>
+              <Bar dataKey="pnl" fill={ACCENT.green} radius={[2, 2, 0, 0]} />
             </BarChart>
           </ResponsiveContainer>
         </div>
