@@ -1,6 +1,6 @@
 import type { BotStatus, AIDecision, TradeRecord } from "../types";
 import { getExchange } from "../exchanges/factory";
-import { generateCryptoSignal } from "../indicators";
+import { generateCryptoSignal, detectRegime, type MarketRegime } from "../indicators";
 import { buildAnalysisPrompt } from "../ai/crypto-prompt";
 import { runAllEngines, runSingleEngine, setEnginesPaperMode } from "../ai/engines";
 import { buildConsensus } from "../ai/consensus";
@@ -109,6 +109,9 @@ async function runCycleForPair(pair: string): Promise<void> {
   // Technical analysis
   const signal = generateCryptoSignal(bars);
 
+  // レジーム検出（相場タイプ判定）
+  const regime = detectRegime(bars);
+
   // Recent decisions for this pair (anti flip-flop)
   const recentForPair = state.decisions
     .filter(d => d.pair === pair)
@@ -147,7 +150,7 @@ async function runCycleForPair(pair: string): Promise<void> {
   state.decisions.push(decision);
   if (state.decisions.length > 500) state.decisions = state.decisions.slice(-500);
 
-  console.log(`[${pair}] ${decision.action} 確信度${decision.confidence}% - ${decision.reason}`);
+  console.log(`[${pair}] ${decision.action} 確信度${decision.confidence}% [${regime}] - ${decision.reason}`);
 
   // Paper mode execution
   if (state.paperMode) {
@@ -351,14 +354,21 @@ async function runCycleForPair(pair: string): Promise<void> {
     }
 
     // DCA（ドルコスト平均法）: HOLDでもNサイクルごとに少額積立
-    if (DCA_ENABLED && decision.action === "HOLD" && state.cycleCount % DCA_INTERVAL_CYCLES === 0) {
+    // レジームに応じてDCA額を調整
+    const dcaMultiplier = regime === "TRENDING_UP" ? 2.0    // 上昇トレンド: 積極的に積む
+                        : regime === "RANGING" ? 1.0        // レンジ: 通常ペース
+                        : regime === "TRENDING_DOWN" ? 0.5  // 下降トレンド: 控えめ
+                        : 0;                                // VOLATILE: DCA停止
+    const dcaAmount = Math.round(DCA_AMOUNT_JPY * dcaMultiplier);
+
+    if (DCA_ENABLED && decision.action === "HOLD" && state.cycleCount % DCA_INTERVAL_CYCLES === 0 && dcaAmount > 0) {
       const balance = await liveExchange.getBalance();
       const jpyFree = balance.find(b => b.currency === "JPY")?.free ?? 0;
       const currentPositionJPY = realPosition.amount * ticker.price;
 
-      if (jpyFree >= DCA_AMOUNT_JPY && currentPositionJPY < LIVE_MAX_POSITION_JPY) {
+      if (jpyFree >= dcaAmount && currentPositionJPY < LIVE_MAX_POSITION_JPY) {
         try {
-          const order = await liveExchange.marketBuy(pair, DCA_AMOUNT_JPY);
+          const order = await liveExchange.marketBuy(pair, dcaAmount);
           const trade: TradeRecord = {
             id: `dca-${Date.now()}`,
             timestamp: new Date().toISOString(),
@@ -368,7 +378,7 @@ async function runCycleForPair(pair: string): Promise<void> {
             type: "market",
             amount: order.amount,
             price: order.price,
-            valueJPY: DCA_AMOUNT_JPY,
+            valueJPY: dcaAmount,
             orderId: order.id,
             fee: order.fee ?? 0,
             paperTrade: false,
@@ -396,7 +406,7 @@ async function runCycleForPair(pair: string): Promise<void> {
 
           await saveData("live-trades", state.liveTrades.slice(-200));
           await saveData("live-positions", Array.from(state.livePositions.values()));
-          console.log(`[${pair}] DCA BUY: ¥${DCA_AMOUNT_JPY} @ ¥${order.price.toLocaleString()}`);
+          console.log(`[${pair}] DCA BUY: ¥${dcaAmount} [${regime}] @ ¥${order.price.toLocaleString()}`);
         } catch (e) {
           console.error(`[${pair}] DCA BUY 失敗:`, e);
         }

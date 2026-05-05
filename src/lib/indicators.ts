@@ -252,3 +252,39 @@ export function generateCryptoSignal(bars: OHLCVBar[]): TechnicalSignal {
     score,
   };
 }
+
+// === レジーム検出 ===
+export type MarketRegime = "TRENDING_UP" | "TRENDING_DOWN" | "RANGING" | "VOLATILE";
+
+export function detectRegime(bars: OHLCVBar[]): MarketRegime {
+  if (bars.length < 50) return "RANGING";
+
+  const closes = bars.map(b => b.close);
+
+  // ADX的な方向性指標: SMA20とSMA50の関係 + 傾き
+  const sma20Vals = sma(closes, 20);
+  const sma50Vals = sma(closes, 50);
+  const sma20Now = sma20Vals[sma20Vals.length - 1];
+  const sma50Now = sma50Vals[sma50Vals.length - 1];
+  const sma20Prev = sma20Vals[sma20Vals.length - 10];
+
+  if (!sma20Now || !sma50Now || !sma20Prev) return "RANGING";
+
+  // ボラティリティ: ATRの相対値
+  const atrVals = atr(bars);
+  const atrNow = atrVals[atrVals.length - 1];
+  const avgPrice = closes[closes.length - 1];
+  const atrPercent = atrNow && avgPrice > 0 ? (atrNow / avgPrice) * 100 : 0;
+
+  // 高ボラ（ATR > 3%）→ VOLATILE
+  if (atrPercent > 3) return "VOLATILE";
+
+  // SMA20の傾き（10本前との差）
+  const slopePercent = ((sma20Now - sma20Prev) / sma20Prev) * 100;
+
+  // トレンド判定: SMA20 > SMA50 かつ上昇傾き
+  if (sma20Now > sma50Now && slopePercent > 0.5) return "TRENDING_UP";
+  if (sma20Now < sma50Now && slopePercent < -0.5) return "TRENDING_DOWN";
+
+  return "RANGING";
+}
