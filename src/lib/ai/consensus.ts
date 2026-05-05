@@ -53,7 +53,7 @@ export function buildConsensus(
   }
 
   // If confidence is too low, force HOLD (paper mode uses lower threshold)
-  const minConfidence = paperMode ? 40 : 60;
+  const minConfidence = paperMode ? 40 : 55;
   if (avgConfidence < minConfidence && winningAction !== "HOLD") {
     winningAction = "HOLD";
   }
