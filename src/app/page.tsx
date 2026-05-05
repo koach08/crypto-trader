@@ -1,33 +1,94 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import type { BotStatus, Position, DailyPnL, AIDecision, TickerData } from "@/lib/types";
+import {
+  LineChart, Line, AreaChart, Area, BarChart, Bar,
+  XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, PieChart, Pie, Cell,
+} from "recharts";
+import type { BotStatus, Position, DailyPnL, AIDecision, TickerData, TradeRecord } from "@/lib/types";
 import { BITFLYER_PAIRS } from "@/lib/types";
 
 interface StatusData {
   status: BotStatus;
   positions: Position[];
   dailyPnL: DailyPnL;
+  cumulativePnL: {
+    startCapitalJPY: number;
+    totalRealizedPnL: number;
+    unrealizedPnL: number;
+    totalPnL: number;
+    totalPnLPercent: number;
+    totalFees: number;
+    netPnL: number;
+    totalTrades: number;
+    closedTrades: number;
+    wins: number;
+    losses: number;
+    winRate: number;
+    positionValueJPY: number;
+  };
   recentDecisions: AIDecision[];
+}
+
+interface OHLCVBar {
+  timestamp: number;
+  close: number;
+  high: number;
+  low: number;
+  volume: number;
+}
+
+interface NewsItem {
+  title: string;
+  url: string;
+  source: string;
+  publishedAt: string;
+  body?: string;
+  categories?: string[];
+}
+
+interface PnLSnapshot {
+  timestamp: string;
+  totalPnL: number;
+  realizedPnL: number;
+  unrealizedPnL: number;
+  trades: number;
+}
+
+const ACCENT = { green: "#22c55e", red: "#ef4444", blue: "#3b82f6", purple: "#8b5cf6", amber: "#f59e0b", cyan: "#06b6d4" };
+const PIE_COLORS = [ACCENT.blue, ACCENT.purple, ACCENT.cyan, ACCENT.amber, ACCENT.green];
+
+function timeAgo(iso: string) {
+  const diff = Date.now() - new Date(iso).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 60) return `${mins}分前`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}時間前`;
+  return `${Math.floor(hrs / 24)}日前`;
 }
 
 export default function Dashboard() {
   const [data, setData] = useState<StatusData | null>(null);
   const [tickers, setTickers] = useState<Record<string, TickerData>>({});
+  const [priceHistory, setPriceHistory] = useState<Record<string, OHLCVBar[]>>({});
+  const [trades, setTrades] = useState<TradeRecord[]>([]);
+  const [news, setNews] = useState<NewsItem[]>([]);
+  const [pnlHistory, setPnlHistory] = useState<PnLSnapshot[]>([]);
   const [loading, setLoading] = useState(true);
+  const [activePair, setActivePair] = useState("ETH/JPY");
 
   const fetchData = useCallback(async () => {
     try {
-      const [statusRes, ...tickerResults] = await Promise.all([
+      const [statusRes, tradesRes, ...tickerResults] = await Promise.all([
         fetch("/api/bot/status"),
+        fetch("/api/trades"),
         ...BITFLYER_PAIRS.map(pair =>
           fetch(`/api/exchange/ticker?pair=${encodeURIComponent(pair)}`).catch(() => null)
         ),
       ]);
 
-      if (statusRes.ok) {
-        setData(await statusRes.json());
-      }
+      if (statusRes.ok) setData(await statusRes.json());
+      if (tradesRes.ok) setTrades(await tradesRes.json());
 
       const newTickers: Record<string, TickerData> = {};
       for (let i = 0; i < BITFLYER_PAIRS.length; i++) {
@@ -45,113 +106,269 @@ export default function Dashboard() {
     }
   }, []);
 
+  // 価格履歴・ニュース・PnL履歴は低頻度で取得
+  const fetchSlowData = useCallback(async () => {
+    try {
+      const pairs = ["ETH/JPY", "XRP/JPY"];
+      const results = await Promise.all([
+        ...pairs.map(p =>
+          fetch(`/api/exchange/ohlcv?pair=${encodeURIComponent(p)}&timeframe=1h&limit=48`).then(r => r.ok ? r.json() : []).catch(() => [])
+        ),
+        fetch("/api/news").then(r => r.ok ? r.json() : { articles: [] }).catch(() => ({ articles: [] })),
+        fetch("/api/data/pnl-history").then(r => r.ok ? r.json() : []).catch(() => []),
+      ]);
+
+      const hist: Record<string, OHLCVBar[]> = {};
+      pairs.forEach((p, i) => { hist[p] = results[i]; });
+      setPriceHistory(hist);
+      setNews(results[pairs.length]?.articles || []);
+      setPnlHistory(results[pairs.length + 1] || []);
+    } catch (e) {
+      console.error(e);
+    }
+  }, []);
+
   useEffect(() => {
     fetchData();
-    const id = setInterval(fetchData, 10000);
-    return () => clearInterval(id);
-  }, [fetchData]);
+    fetchSlowData();
+    const fast = setInterval(fetchData, 15000);
+    const slow = setInterval(fetchSlowData, 300000); // 5分ごと
+    return () => { clearInterval(fast); clearInterval(slow); };
+  }, [fetchData, fetchSlowData]);
 
   if (loading) {
     return <div className="text-center py-20 text-zinc-500">読み込み中...</div>;
   }
 
   const pnl = data?.dailyPnL;
+  const cum = data?.cumulativePnL;
   const status = data?.status;
 
+  // ポートフォリオ構成データ
+  const balanceData = Object.entries(tickers)
+    .filter(([, t]) => t.price > 0)
+    .map(([pair, t]) => {
+      const pos = data?.positions?.find(p => p.pair === pair);
+      const value = pos ? pos.amount * t.price : 0;
+      return { name: pair.split("/")[0], value: Math.round(value) };
+    })
+    .filter(d => d.value > 0);
+  const jpyFree = pnl?.startCapitalJPY ? pnl.startCapitalJPY - balanceData.reduce((s, d) => s + d.value, 0) : 0;
+  if (jpyFree > 0) balanceData.unshift({ name: "JPY", value: Math.round(jpyFree) });
+
+  // 価格チャート用データ
+  const chartBars = (priceHistory[activePair] || []).map(b => ({
+    time: new Date(b.timestamp).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }),
+    price: b.close,
+    volume: b.volume,
+  }));
+
+  // トレード損益チャート用データ
+  const tradeChartData = trades
+    .filter(t => t.side === "sell" && t.pnl !== undefined)
+    .map(t => ({
+      time: new Date(t.timestamp).toLocaleDateString("ja-JP", { month: "short", day: "numeric" }),
+      pnl: Math.round(t.pnl ?? 0),
+    }));
+
   return (
-    <div className="space-y-6">
-      {/* Bot Status */}
-      <div className="flex items-center gap-3">
+    <div className="space-y-5">
+      {/* ステータスバー */}
+      <div className="flex items-center gap-2 flex-wrap">
         <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-sm font-medium ${
           status?.running ? "bg-green-900/50 text-green-400" : "bg-zinc-800 text-zinc-400"
         }`}>
           <span className={`w-2 h-2 rounded-full ${status?.running ? "bg-green-400 animate-pulse" : "bg-zinc-600"}`} />
           {status?.running ? "稼働中" : "停止"}
         </span>
-        {status?.paperMode && (
-          <span className="px-2 py-0.5 rounded text-xs bg-yellow-900/50 text-yellow-400 font-medium">
-            ペーパーモード
-          </span>
+        {!status?.paperMode && status?.running && (
+          <span className="px-2 py-0.5 rounded text-xs bg-blue-900/50 text-blue-400 font-medium">LIVE</span>
         )}
         {status?.circuitBreakerState === "TRIGGERED" && (
-          <span className="px-2 py-0.5 rounded text-xs bg-red-900/50 text-red-400 font-medium">
-            サーキットブレーカー発動
-          </span>
+          <span className="px-2 py-0.5 rounded text-xs bg-red-900/50 text-red-400 font-medium">CB発動</span>
+        )}
+        <span className="text-xs text-zinc-600 ml-auto">Cycle #{status?.cycleCount ?? 0}</span>
+      </div>
+
+      {/* サマリーカード 4列 */}
+      <div className="grid grid-cols-2 gap-2">
+        <div className="bg-zinc-900 rounded-xl p-3 border border-zinc-800">
+          <div className="text-[10px] text-zinc-500 uppercase tracking-wider">本日損益</div>
+          <div className={`text-lg font-bold font-mono ${(pnl?.totalPnL ?? 0) >= 0 ? "text-green-400" : "text-red-400"}`}>
+            ¥{(pnl?.totalPnL ?? 0).toLocaleString(undefined, { maximumFractionDigits: 0 })}
+          </div>
+          <div className="text-[10px] text-zinc-500">{pnl?.wins ?? 0}W {pnl?.losses ?? 0}L</div>
+        </div>
+        <div className="bg-zinc-900 rounded-xl p-3 border border-zinc-800">
+          <div className="text-[10px] text-zinc-500 uppercase tracking-wider">累計損益</div>
+          <div className={`text-lg font-bold font-mono ${(cum?.totalPnL ?? 0) >= 0 ? "text-green-400" : "text-red-400"}`}>
+            ¥{(cum?.totalPnL ?? 0).toLocaleString(undefined, { maximumFractionDigits: 0 })}
+          </div>
+          <div className="text-[10px] text-zinc-500">{cum?.totalTrades ?? 0}回取引 WR{(cum?.winRate ?? 0).toFixed(0)}%</div>
+        </div>
+        <div className="bg-zinc-900 rounded-xl p-3 border border-zinc-800">
+          <div className="text-[10px] text-zinc-500 uppercase tracking-wider">運用資金</div>
+          <div className="text-lg font-bold font-mono">
+            ¥{(pnl?.startCapitalJPY ?? 0).toLocaleString()}
+          </div>
+          <div className="text-[10px] text-zinc-500">リスク使用 {pnl && pnl.startCapitalJPY > 0
+            ? `${Math.abs((Math.min(0, pnl.realizedPnL) / pnl.startCapitalJPY) * 100).toFixed(1)}%`
+            : "0%"} / 5%</div>
+        </div>
+        <div className="bg-zinc-900 rounded-xl p-3 border border-zinc-800">
+          <div className="text-[10px] text-zinc-500 uppercase tracking-wider">手数料合計</div>
+          <div className="text-lg font-bold font-mono text-zinc-300">
+            ¥{(cum?.totalFees ?? 0).toLocaleString(undefined, { maximumFractionDigits: 0 })}
+          </div>
+          <div className="text-[10px] text-zinc-500">純利益 ¥{(cum?.netPnL ?? 0).toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
+        </div>
+      </div>
+
+      {/* 価格チャート */}
+      <div className="bg-zinc-900 rounded-xl p-4 border border-zinc-800">
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-sm font-medium text-zinc-400">価格推移 (48h)</h2>
+          <div className="flex gap-1">
+            {["ETH/JPY", "XRP/JPY"].map(p => (
+              <button key={p} onClick={() => setActivePair(p)}
+                className={`px-2 py-0.5 rounded text-xs font-medium ${activePair === p ? "bg-blue-600 text-white" : "bg-zinc-800 text-zinc-400"}`}>
+                {p.split("/")[0]}
+              </button>
+            ))}
+          </div>
+        </div>
+        {chartBars.length > 0 ? (
+          <ResponsiveContainer width="100%" height={180}>
+            <AreaChart data={chartBars}>
+              <defs>
+                <linearGradient id="priceGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor={ACCENT.blue} stopOpacity={0.3} />
+                  <stop offset="95%" stopColor={ACCENT.blue} stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
+              <XAxis dataKey="time" tick={{ fontSize: 10, fill: "#71717a" }} interval="preserveStartEnd" />
+              <YAxis domain={["dataMin", "dataMax"]} tick={{ fontSize: 10, fill: "#71717a" }} width={65}
+                tickFormatter={(v: number) => `¥${(v / 1000).toFixed(0)}k`} />
+              <Tooltip contentStyle={{ background: "#18181b", border: "1px solid #3f3f46", borderRadius: 8, fontSize: 12 }}
+                formatter={(v: number) => [`¥${v.toLocaleString()}`, "価格"]} />
+              <Area type="monotone" dataKey="price" stroke={ACCENT.blue} fill="url(#priceGrad)" strokeWidth={2} dot={false} />
+            </AreaChart>
+          </ResponsiveContainer>
+        ) : (
+          <div className="text-center text-zinc-600 text-sm py-10">データ取得中...</div>
         )}
       </div>
 
-      {/* Summary Cards */}
-      <div className="grid grid-cols-3 gap-3">
+      {/* PnL推移 + ポートフォリオ構成 */}
+      <div className="grid grid-cols-2 gap-3">
+        {/* 損益推移 */}
         <div className="bg-zinc-900 rounded-xl p-4 border border-zinc-800">
-          <div className="text-xs text-zinc-500 mb-1">本日損益</div>
-          <div className={`text-xl font-bold ${(pnl?.totalPnL ?? 0) >= 0 ? "text-green-400" : "text-red-400"}`}>
-            ¥{(pnl?.totalPnL ?? 0).toLocaleString()}
-          </div>
-          <div className="text-xs text-zinc-500 mt-1">
-            {pnl ? `${pnl.wins}勝 ${pnl.losses}敗` : "0勝 0敗"}
-          </div>
+          <h2 className="text-sm font-medium text-zinc-400 mb-2">損益推移</h2>
+          {pnlHistory.length > 0 ? (
+            <ResponsiveContainer width="100%" height={120}>
+              <LineChart data={pnlHistory.map(p => ({
+                time: new Date(p.timestamp).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }),
+                pnl: Math.round(p.totalPnL),
+              }))}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
+                <XAxis dataKey="time" tick={{ fontSize: 9, fill: "#71717a" }} />
+                <YAxis tick={{ fontSize: 9, fill: "#71717a" }} width={40} />
+                <Tooltip contentStyle={{ background: "#18181b", border: "1px solid #3f3f46", borderRadius: 8, fontSize: 11 }} />
+                <Line type="monotone" dataKey="pnl" stroke={ACCENT.green} strokeWidth={2} dot={false} />
+              </LineChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="text-center text-zinc-600 text-xs py-8">データ蓄積中...</div>
+          )}
         </div>
+
+        {/* ポートフォリオ */}
         <div className="bg-zinc-900 rounded-xl p-4 border border-zinc-800">
-          <div className="text-xs text-zinc-500 mb-1">サイクル</div>
-          <div className="text-xl font-bold">{status?.cycleCount ?? 0}</div>
-          <div className="text-xs text-zinc-500 mt-1">
-            {status?.activePairs?.length ?? 0}ペア稼働
+          <h2 className="text-sm font-medium text-zinc-400 mb-2">ポートフォリオ</h2>
+          {balanceData.length > 0 ? (
+            <ResponsiveContainer width="100%" height={120}>
+              <PieChart>
+                <Pie data={balanceData} dataKey="value" nameKey="name" cx="50%" cy="50%"
+                  innerRadius={30} outerRadius={50} paddingAngle={2}>
+                  {balanceData.map((_, i) => (
+                    <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />
+                  ))}
+                </Pie>
+                <Tooltip contentStyle={{ background: "#18181b", border: "1px solid #3f3f46", borderRadius: 8, fontSize: 11 }}
+                  formatter={(v: number) => [`¥${v.toLocaleString()}`, ""]} />
+              </PieChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="text-center text-zinc-600 text-xs py-8">ポジションなし</div>
+          )}
+          <div className="flex flex-wrap gap-1 mt-1">
+            {balanceData.map((d, i) => (
+              <span key={d.name} className="text-[10px] flex items-center gap-1">
+                <span className="w-2 h-2 rounded-full" style={{ background: PIE_COLORS[i % PIE_COLORS.length] }} />
+                {d.name}
+              </span>
+            ))}
           </div>
-        </div>
-        <div className="bg-zinc-900 rounded-xl p-4 border border-zinc-800">
-          <div className="text-xs text-zinc-500 mb-1">リスク使用</div>
-          <div className="text-xl font-bold">
-            {pnl && pnl.startCapitalJPY > 0
-              ? `${Math.abs((Math.min(0, pnl.realizedPnL) / pnl.startCapitalJPY) * 100).toFixed(1)}%`
-              : "0%"}
-          </div>
-          <div className="text-xs text-zinc-500 mt-1">上限2%</div>
         </div>
       </div>
 
-      {/* Live Prices */}
+      {/* トレード損益バー */}
+      {tradeChartData.length > 0 && (
+        <div className="bg-zinc-900 rounded-xl p-4 border border-zinc-800">
+          <h2 className="text-sm font-medium text-zinc-400 mb-2">取引損益</h2>
+          <ResponsiveContainer width="100%" height={100}>
+            <BarChart data={tradeChartData}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
+              <XAxis dataKey="time" tick={{ fontSize: 9, fill: "#71717a" }} />
+              <YAxis tick={{ fontSize: 9, fill: "#71717a" }} width={40} />
+              <Tooltip contentStyle={{ background: "#18181b", border: "1px solid #3f3f46", borderRadius: 8, fontSize: 11 }} />
+              <Bar dataKey="pnl" fill={ACCENT.green} radius={[2, 2, 0, 0]}>
+                {tradeChartData.map((d, i) => (
+                  <Cell key={i} fill={d.pnl >= 0 ? ACCENT.green : ACCENT.red} />
+                ))}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+
+      {/* 市場価格 */}
       <div>
         <h2 className="text-sm font-medium text-zinc-400 mb-2">市場価格</h2>
-        <div className="space-y-2">
-          {BITFLYER_PAIRS.map(pair => {
+        <div className="grid grid-cols-2 gap-2">
+          {BITFLYER_PAIRS.slice(0, 4).map(pair => {
             const t = tickers[pair];
+            if (!t) return null;
+            const isUp = t.changePercent24h >= 0;
             return (
-              <div key={pair} className="flex items-center justify-between bg-zinc-900 rounded-lg px-4 py-3 border border-zinc-800">
-                <div>
-                  <div className="font-medium">{pair.split("/")[0]}</div>
-                  <div className="text-xs text-zinc-500">{pair}</div>
+              <div key={pair} className="bg-zinc-900 rounded-lg px-3 py-2 border border-zinc-800">
+                <div className="flex items-center justify-between">
+                  <span className="font-medium text-sm">{pair.split("/")[0]}</span>
+                  <span className={`text-xs font-mono ${isUp ? "text-green-400" : "text-red-400"}`}>
+                    {isUp ? "+" : ""}{t.changePercent24h.toFixed(1)}%
+                  </span>
                 </div>
-                <div className="text-right">
-                  {t ? (
-                    <>
-                      <div className="font-mono font-medium">¥{t.price.toLocaleString()}</div>
-                      <div className="text-xs text-zinc-500">Vol: {t.volume24h.toFixed(1)}</div>
-                    </>
-                  ) : (
-                    <div className="text-zinc-600">--</div>
-                  )}
-                </div>
+                <div className="font-mono text-sm mt-0.5">¥{t.price.toLocaleString()}</div>
               </div>
             );
           })}
         </div>
       </div>
 
-      {/* Active Positions */}
+      {/* アクティブポジション */}
       {data?.positions && data.positions.length > 0 && (
         <div>
-          <h2 className="text-sm font-medium text-zinc-400 mb-2">アクティブポジション</h2>
-          <div className="space-y-2">
+          <h2 className="text-sm font-medium text-zinc-400 mb-2">ポジション</h2>
+          <div className="space-y-1.5">
             {data.positions.map(pos => (
-              <div key={pos.pair} className="bg-zinc-900 rounded-lg px-4 py-3 border border-zinc-800">
-                <div className="flex justify-between items-center">
-                  <div>
-                    <span className="font-medium">{pos.pair}</span>
-                    <span className="text-xs text-zinc-500 ml-2">{pos.amount.toFixed(6)}</span>
-                  </div>
-                  <div className={`font-mono ${pos.unrealizedPnL >= 0 ? "text-green-400" : "text-red-400"}`}>
-                    ¥{pos.unrealizedPnL.toLocaleString()} ({pos.unrealizedPnLPercent.toFixed(1)}%)
-                  </div>
+              <div key={pos.pair} className="bg-zinc-900 rounded-lg px-3 py-2 border border-zinc-800 flex justify-between items-center">
+                <div>
+                  <span className="font-medium text-sm">{pos.pair.split("/")[0]}</span>
+                  <span className="text-xs text-zinc-500 ml-2">{pos.amount.toFixed(6)}</span>
+                </div>
+                <div className={`font-mono text-sm ${pos.unrealizedPnL >= 0 ? "text-green-400" : "text-red-400"}`}>
+                  ¥{pos.unrealizedPnL.toLocaleString(undefined, { maximumFractionDigits: 0 })}
                 </div>
               </div>
             ))}
@@ -159,28 +376,55 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* Recent AI Decisions */}
+      {/* AI判断 */}
       {data?.recentDecisions && data.recentDecisions.length > 0 && (
         <div>
-          <h2 className="text-sm font-medium text-zinc-400 mb-2">最新AI判断</h2>
-          <div className="space-y-1.5">
-            {data.recentDecisions.slice(-5).reverse().map((d, i) => (
-              <div key={i} className="flex items-start gap-2 text-sm bg-zinc-900/50 rounded-lg px-3 py-2">
+          <h2 className="text-sm font-medium text-zinc-400 mb-2">AI判断</h2>
+          <div className="space-y-1">
+            {data.recentDecisions.slice(-6).reverse().map((d, i) => (
+              <div key={i} className="flex items-start gap-2 text-xs bg-zinc-900/50 rounded-lg px-3 py-1.5">
                 <span className={`font-mono font-bold shrink-0 ${
                   d.action === "BUY" ? "text-green-400" : d.action === "SELL" ? "text-red-400" : "text-zinc-500"
-                }`}>
-                  {d.action}
-                </span>
-                <div className="min-w-0">
-                  <span className="text-zinc-400">{d.pair}</span>
-                  <span className="text-zinc-600 ml-1">確信度{d.confidence}%</span>
-                  <div className="text-xs text-zinc-500 truncate">{d.reason}</div>
-                </div>
+                }`}>{d.action}</span>
+                <span className="text-zinc-400 shrink-0">{d.pair.split("/")[0]}</span>
+                <span className="text-zinc-600 shrink-0">{d.confidence}%</span>
+                <span className="text-zinc-500 truncate">{d.reason?.slice(0, 60)}</span>
               </div>
             ))}
           </div>
         </div>
       )}
+
+      {/* ニュースフィード */}
+      <div>
+        <h2 className="text-sm font-medium text-zinc-400 mb-2">暗号通貨ニュース</h2>
+        <div className="space-y-1.5 max-h-80 overflow-y-auto">
+          {news.length > 0 ? news.map((n, i) => (
+            <a key={i} href={n.url} target="_blank" rel="noopener noreferrer"
+              className="block bg-zinc-900/50 rounded-lg px-3 py-2 border border-zinc-800/50 hover:border-zinc-700 transition-colors">
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="text-sm font-medium text-zinc-200 line-clamp-2">{n.title}</div>
+                  {n.body && <div className="text-xs text-zinc-500 mt-0.5 line-clamp-1">{n.body}</div>}
+                </div>
+                <div className="text-[10px] text-zinc-600 shrink-0 text-right">
+                  <div>{n.source}</div>
+                  <div>{timeAgo(n.publishedAt)}</div>
+                </div>
+              </div>
+              {n.categories && n.categories.length > 0 && (
+                <div className="flex gap-1 mt-1">
+                  {n.categories.slice(0, 3).map(c => (
+                    <span key={c} className="text-[9px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-500">{c}</span>
+                  ))}
+                </div>
+              )}
+            </a>
+          )) : (
+            <div className="text-center text-zinc-600 text-sm py-6">ニュース取得中...</div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

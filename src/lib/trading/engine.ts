@@ -438,6 +438,20 @@ async function runCycle(): Promise<void> {
       console.error(`[${pair}] サイクルエラー:`, e);
     }
   }
+
+  // PnL履歴を記録（グラフ用、12サイクル=3時間ごと）
+  if (state.cycleCount % 12 === 0) {
+    const daily = state.riskManager.getDailyPnL();
+    const history = await loadData<{ timestamp: string; realizedPnL: number; unrealizedPnL: number; totalPnL: number; trades: number }[]>("pnl-history", []);
+    history.push({
+      timestamp: new Date().toISOString(),
+      realizedPnL: daily.realizedPnL,
+      unrealizedPnL: daily.unrealizedPnL,
+      totalPnL: daily.totalPnL,
+      trades: daily.trades,
+    });
+    await saveData("pnl-history", history.slice(-500));
+  }
 }
 
 // === Public API ===
