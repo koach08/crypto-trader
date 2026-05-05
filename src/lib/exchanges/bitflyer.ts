@@ -106,7 +106,7 @@ export class BitFlyerExchange implements IExchange {
           return data;
         }
       } catch (e) {
-        console.warn(`CryptoCompare attempt ${attempt + 1} failed for ${base}/${quote}:`, e);
+        // CryptoCompare retry - silent
       }
       if (attempt === 0) await new Promise(r => setTimeout(r, 1000));
     }
@@ -119,9 +119,9 @@ export class BitFlyerExchange implements IExchange {
         `https://api.coingecko.com/api/v3/coins/${cgId}/ohlc?vs_currency=${cgQuote}&days=4`,
         { signal: AbortSignal.timeout(15000) }
       );
+      if (!resp.ok) return []; // Throttled or error - silently return empty
       const ohlc = await resp.json();
       if (Array.isArray(ohlc) && ohlc.length > 0) {
-        console.log(`[${base}/${quote}] CoinGecko fallback: ${ohlc.length} bars`);
         return ohlc.slice(-limit).map((bar: number[]) => ({
           time: Math.floor(bar[0] / 1000),
           open: bar[1],
@@ -131,8 +131,8 @@ export class BitFlyerExchange implements IExchange {
           volumefrom: 0,
         }));
       }
-    } catch (e) {
-      console.warn(`CoinGecko fallback failed for ${base}/${quote}:`, e);
+    } catch {
+      // CoinGecko throttle - silent fail, not critical
     }
 
     return [];
