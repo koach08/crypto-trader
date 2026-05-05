@@ -271,7 +271,9 @@ export function detectRegime(bars: OHLCVBar[]): MarketRegime {
   if (!sma20Now || !sma50Now || !sma20Prev) return "RANGING";
 
   // ボラティリティ: ATRの相対値
-  const atrVals = atr(bars);
+  const highs = bars.map(b => b.high);
+  const lows = bars.map(b => b.low);
+  const atrVals = atr(highs, lows, closes);
   const atrNow = atrVals[atrVals.length - 1];
   const avgPrice = closes[closes.length - 1];
   const atrPercent = atrNow && avgPrice > 0 ? (atrNow / avgPrice) * 100 : 0;
