@@ -8,6 +8,9 @@ import { getFearGreedIndex } from "../ai/fear-greed";
 import { RiskManager } from "./risk-manager";
 import { PaperTrader } from "./paper-trader";
 import { loadData, saveData } from "../data";
+import { runQuantAnalysis } from "../quant/signals";
+import { calculateFinalDecision } from "../quant/scoring-engine";
+import { saveAudit, recordOutcome } from "../quant/audit-log";
 
 const PAPER_VIRTUAL_CAPITAL_JPY = 1_000_000; // ペーパートレード仮想資金 ¥100万
 const PAPER_TRADE_AMOUNT_JPY = 50_000;       // 1回の取引額
@@ -146,11 +149,39 @@ async function runCycleForPair(pair: string): Promise<void> {
     decision = buildConsensus([result], pair, "bitflyer", signal.score, fearGreed.value, state.paperMode);
   }
 
+  // === クオンツ分析 + スコアリングエンジン ===
+  // LLMの判断を「アドバイザーの1人」として、統計的シグナルと合議で最終判断
+  const quantAnalysis = runQuantAnalysis(bars);
+  const scoringResult = calculateFinalDecision({
+    pair,
+    price: ticker.price,
+    quantAnalysis,
+    aiAction: decision.action,
+    aiConfidence: decision.confidence,
+    aiReason: decision.reason,
+    technicalScore: signal.score,
+    regime,
+    fearGreedIndex: fearGreed.value,
+  });
+
+  // スコアリングエンジンの結果でdecisionを上書き
+  decision.action = scoringResult.action;
+  decision.confidence = scoringResult.confidence;
+  decision.reason = scoringResult.reason;
+
+  // 監査ログを保存（判断根拠の完全な記録）
+  const auditEntry = {
+    ...scoringResult.audit,
+    id: `audit-${Date.now()}-${pair.replace("/", "")}`,
+    timestamp: new Date().toISOString(),
+  };
+  await saveAudit(auditEntry).catch(() => {}); // 監査ログ保存失敗はbot停止しない
+
   // Store decision
   state.decisions.push(decision);
   if (state.decisions.length > 500) state.decisions = state.decisions.slice(-500);
 
-  console.log(`[${pair}] ${decision.action} 確信度${decision.confidence}% [${regime}] - ${decision.reason}`);
+  console.log(`[${pair}] ${decision.action} 確信度${decision.confidence}% [${regime}] Q:${quantAnalysis.compositeScore} - ${decision.reason}`);
 
   // Paper mode execution
   if (state.paperMode) {
@@ -301,6 +332,8 @@ async function runCycleForPair(pair: string): Promise<void> {
         await saveData("live-trades", state.liveTrades.slice(-200));
         await saveData("live-positions", Array.from(state.livePositions.values()));
         console.log(`[${pair}] LIVE SELL: 損益 ¥${pnl.toLocaleString()} (${pnlPercent.toFixed(1)}%)`);
+        // 監査ログに結果を記録（改善ループ用）
+        await recordOutcome(pair, order.price, pnl, pnlPercent).catch(() => {});
       } catch (e) {
         console.error(`[${pair}] LIVE SELL 失敗:`, e);
       }
@@ -347,6 +380,7 @@ async function runCycleForPair(pair: string): Promise<void> {
           await saveData("live-trades", state.liveTrades.slice(-200));
           await saveData("live-positions", Array.from(state.livePositions.values()));
           console.log(`[${pair}] LIVE ${triggerType.toUpperCase()}: 損益 ¥${pnl.toLocaleString()} (${pnlPercent.toFixed(1)}%)`);
+          await recordOutcome(pair, order.price, pnl, pnlPercent).catch(() => {});
         } catch (e) {
           console.error(`[${pair}] LIVE ${triggerType.toUpperCase()} 失敗:`, e);
         }
