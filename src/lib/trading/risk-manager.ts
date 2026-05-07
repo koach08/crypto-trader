@@ -54,6 +54,46 @@ export class RiskManager {
     }
   }
 
+  /** 日付が変わったら dailyPnL をリセット。Bot起動中の0時跨ぎに対応。 */
+  async rolloverIfNewDay(currentCapitalJPY: number): Promise<boolean> {
+    const today = new Date().toISOString().split("T")[0];
+    if (this.dailyPnL.date === today) return false;
+
+    this.dailyPnL = {
+      ...this.getEmptyDay(),
+      startCapitalJPY: currentCapitalJPY,
+      currentCapitalJPY,
+    };
+    await this.save();
+    return true;
+  }
+
+  /** 取引履歴から今日分のみ再計算してdailyPnLを正規化。
+   *  既存データが起動以来の累積になっている場合の修復用 */
+  async recomputeDailyFromTrades(
+    trades: { timestamp: string; side: string; pnl?: number }[]
+  ): Promise<void> {
+    const today = new Date().toISOString().split("T")[0];
+    const todayTrades = trades.filter(
+      (t) =>
+        t.timestamp.startsWith(today) &&
+        t.side === "sell" &&
+        t.pnl !== undefined
+    );
+
+    this.dailyPnL.date = today;
+    this.dailyPnL.realizedPnL = todayTrades.reduce((s, t) => s + (t.pnl ?? 0), 0);
+    this.dailyPnL.trades = todayTrades.length;
+    this.dailyPnL.wins = todayTrades.filter((t) => (t.pnl ?? 0) > 0).length;
+    this.dailyPnL.losses = todayTrades.filter((t) => (t.pnl ?? 0) < 0).length;
+    this.dailyPnL.totalPnL = this.dailyPnL.realizedPnL + this.dailyPnL.unrealizedPnL;
+    if (this.dailyPnL.startCapitalJPY > 0) {
+      this.dailyPnL.totalPnLPercent =
+        (this.dailyPnL.totalPnL / this.dailyPnL.startCapitalJPY) * 100;
+    }
+    await this.save();
+  }
+
   getState(): CircuitBreakerState {
     if (this.dailyPnL.circuitBreakerTriggered) return "TRIGGERED";
     const lossPercent = this.dailyPnL.startCapitalJPY > 0

@@ -542,6 +542,38 @@ async function runCycle(): Promise<void> {
   state.lastCycleTimestamp = new Date().toISOString();
   console.log(`\n=== サイクル #${state.cycleCount} (${state.lastCycleTimestamp}) ===`);
 
+  // 日付ロールオーバー: 0時を跨いだら dailyPnL をリセット
+  try {
+    let currentCapital = 0;
+    if (state.paperMode) {
+      const positions = state.paperTrader.getAllPositions();
+      const positionValue = positions.reduce((s, p) => s + p.valueJPY, 0);
+      const realizedSoFar = state.paperTrader
+        .getTrades()
+        .filter((t) => t.side === "sell" && t.pnl !== undefined)
+        .reduce((s, t) => s + (t.pnl ?? 0), 0);
+      currentCapital = PAPER_VIRTUAL_CAPITAL_JPY + realizedSoFar + positionValue;
+    } else {
+      const exchange = getExchange();
+      await exchange.connect();
+      const balance = await exchange.getBalance();
+      currentCapital = balance.find((b) => b.currency === "JPY")?.total ?? 0;
+      // 保有暗号通貨も評価額に加算
+      for (const [posPair, pos] of state.livePositions) {
+        try {
+          const t = await exchange.getTicker(posPair);
+          currentCapital += pos.amount * t.price;
+        } catch { /* ティッカー取れない場合は無視 */ }
+      }
+    }
+    const rolled = await state.riskManager.rolloverIfNewDay(currentCapital);
+    if (rolled) {
+      console.log(`日付ロールオーバー: 開始資金 ¥${currentCapital.toLocaleString()} で本日損益をリセット`);
+    }
+  } catch (e) {
+    console.error("日付ロールオーバー失敗:", e);
+  }
+
   for (const pair of state.pairs) {
     try {
       await runCycleForPair(pair);
@@ -586,6 +618,8 @@ export async function startBot(options?: {
   if (state.paperMode) {
     // ペーパーモード: 仮想資金で検証
     await state.riskManager.init(PAPER_VIRTUAL_CAPITAL_JPY);
+    // 既存データ修復: dailyPnL を本日分のみに再計算
+    await state.riskManager.recomputeDailyFromTrades(state.paperTrader.getTrades());
     console.log(`Bot起動 | ペーパー: true | 仮想資金: ¥${PAPER_VIRTUAL_CAPITAL_JPY.toLocaleString()} | ペア: ${state.pairs.join(", ")} | 間隔: ${state.intervalSeconds}秒`);
   } else {
     const exchange = getExchange();
@@ -593,6 +627,8 @@ export async function startBot(options?: {
     const balance = await exchange.getBalance();
     const jpyTotal = balance.find(b => b.currency === "JPY")?.total ?? 0;
     await state.riskManager.init(jpyTotal);
+    // 既存データ修復: dailyPnL を本日分のみに再計算
+    await state.riskManager.recomputeDailyFromTrades(state.liveTrades);
     console.log(`Bot起動 | ライブ | 資金: ¥${jpyTotal.toLocaleString()} | ペア: ${state.pairs.join(", ")} | 間隔: ${state.intervalSeconds}秒`);
   }
 

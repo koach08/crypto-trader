@@ -204,7 +204,7 @@ export default function Dashboard() {
             <span className="text-xs text-zinc-500 ml-1 font-sans">サイクル</span>
           </div>
           <div className="text-[10px] text-zinc-500">
-            取引 {cum?.totalTrades ?? 0}回 / <span className="text-green-400">{cum?.wins ?? 0}W</span> <span className="text-red-400">{cum?.losses ?? 0}L</span>
+            決済 {cum?.closedTrades ?? 0}回 / <span className="text-green-400">{cum?.wins ?? 0}W</span> <span className="text-red-400">{cum?.losses ?? 0}L</span>
             {cum && cum.closedTrades > 0 && ` (WR${cum.winRate.toFixed(0)}%)`}
           </div>
         </div>
@@ -220,7 +220,7 @@ export default function Dashboard() {
           <div className={`text-lg font-bold font-mono ${(cum?.totalPnL ?? 0) >= 0 ? "text-green-400" : "text-red-400"}`}>
             ¥{(cum?.totalPnL ?? 0).toLocaleString(undefined, { maximumFractionDigits: 0 })}
           </div>
-          <div className="text-[10px] text-zinc-500">{cum?.totalTrades ?? 0}回取引 WR{(cum?.winRate ?? 0).toFixed(0)}%</div>
+          <div className="text-[10px] text-zinc-500">{cum?.closedTrades ?? 0}回決済 WR{(cum?.winRate ?? 0).toFixed(0)}%</div>
         </div>
         <div className="bg-zinc-900 rounded-xl p-3 border border-zinc-800">
           <div className="text-[10px] text-zinc-500 uppercase tracking-wider">運用資金</div>
