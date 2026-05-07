@@ -1,5 +1,5 @@
 import ccxt, { type Exchange as CcxtExchange } from "ccxt";
-import type { IExchange } from "./types";
+import type { IExchange, ExecutionRecord } from "./types";
 import type { TickerData, OHLCVBar, Balance, OrderResult, ExchangeConfig } from "../types";
 
 export class BitFlyerExchange implements IExchange {
@@ -234,6 +234,63 @@ export class BitFlyerExchange implements IExchange {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * BitFlyer の全約定履歴を取得（/v1/me/getexecutions 経由）。
+   * sinceMs を指定するとそれより古い分はスキップ。
+   * ページングは ccxt の since/limit と count パラメータでハンドリング。
+   */
+  async fetchExecutions(pair: string, sinceMs?: number): Promise<ExecutionRecord[]> {
+    const out: ExecutionRecord[] = [];
+    const PAGE_SIZE = 500;
+    // BitFlyer の getexecutions は新しい順に返ってくる。
+    // ccxt の fetchMyTrades(symbol, since, limit) は内部で since 以降を要求する。
+    // ページング: 'before' ID指定で古い側へ進む。
+    let beforeId: string | undefined;
+    for (let page = 0; page < 50; page++) {
+      const params: Record<string, unknown> = { count: PAGE_SIZE };
+      if (beforeId) params.before = beforeId;
+
+      let trades;
+      try {
+        trades = await this.exchange.fetchMyTrades(pair, undefined, PAGE_SIZE, params);
+      } catch (e) {
+        console.error(`[bitflyer] fetchMyTrades(${pair}) page ${page} 失敗:`, e);
+        break;
+      }
+      if (!trades || trades.length === 0) break;
+
+      let reachedSince = false;
+      for (const t of trades) {
+        const ts = t.timestamp ?? 0;
+        if (sinceMs && ts && ts < sinceMs) {
+          reachedSince = true;
+          continue;
+        }
+        if (!t.side || (t.side !== "buy" && t.side !== "sell")) continue;
+        out.push({
+          id: String(t.id ?? `${pair}-${ts}-${out.length}`),
+          timestamp: ts || Date.now(),
+          pair,
+          side: t.side,
+          amount: t.amount ?? 0,
+          price: t.price ?? 0,
+          fee: t.fee?.cost ?? 0,
+        });
+      }
+
+      // 進める ID を取得（ccxtのidは新しい順なので末尾が最古）
+      const last = trades[trades.length - 1];
+      if (!last?.id) break;
+      const nextBefore = String(last.id);
+      if (nextBefore === beforeId) break; // ループ防止
+      beforeId = nextBefore;
+
+      if (reachedSince || trades.length < PAGE_SIZE) break;
+    }
+
+    return out;
   }
 
   async getOpenOrders(pair: string): Promise<OrderResult[]> {

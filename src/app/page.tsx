@@ -55,6 +55,37 @@ interface PnLSnapshot {
   trades: number;
 }
 
+interface LifetimeSummary {
+  totalRealizedPnL: number;
+  totalFees: number;
+  netRealizedPnL: number;
+  closedTrades: number;
+  wins: number;
+  losses: number;
+  winRate: number;
+  totalBuyVolumeJPY: number;
+  totalSellVolumeJPY: number;
+  byPair: {
+    pair: string;
+    realizedPnL: number;
+    closedTrades: number;
+    wins: number;
+    losses: number;
+    totalFees: number;
+    remainingInventory: number;
+    averageBuyPrice: number;
+  }[];
+  firstTradeTimestamp: number | null;
+  lastTradeTimestamp: number | null;
+  executionCount: number;
+}
+
+interface LifetimeResponse {
+  summary: LifetimeSummary;
+  cachedAt: string;
+  fetchedNow: boolean;
+}
+
 const ACCENT = { green: "#22c55e", red: "#ef4444", blue: "#3b82f6", purple: "#8b5cf6", amber: "#f59e0b", cyan: "#06b6d4" };
 const PIE_COLORS = [ACCENT.blue, ACCENT.purple, ACCENT.cyan, ACCENT.amber, ACCENT.green];
 
@@ -74,6 +105,8 @@ export default function Dashboard() {
   const [trades, setTrades] = useState<TradeRecord[]>([]);
   const [news, setNews] = useState<NewsItem[]>([]);
   const [pnlHistory, setPnlHistory] = useState<PnLSnapshot[]>([]);
+  const [lifetime, setLifetime] = useState<LifetimeResponse | null>(null);
+  const [lifetimeLoading, setLifetimeLoading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [activePair, setActivePair] = useState("ETH/JPY");
 
@@ -133,13 +166,30 @@ export default function Dashboard() {
     }
   }, []);
 
+  const fetchLifetime = useCallback(async (refresh = false) => {
+    setLifetimeLoading(true);
+    try {
+      const res = await fetch(`/api/bot/lifetime${refresh ? "?refresh=1" : ""}`);
+      if (res.ok) {
+        const data = (await res.json()) as LifetimeResponse;
+        setLifetime(data);
+      }
+    } catch (e) {
+      console.error("lifetime fetch失敗:", e);
+    } finally {
+      setLifetimeLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     fetchData();
     fetchSlowData();
+    fetchLifetime();
     const fast = setInterval(fetchData, 15000);
     const slow = setInterval(fetchSlowData, 300000); // 5分ごと
-    return () => { clearInterval(fast); clearInterval(slow); };
-  }, [fetchData, fetchSlowData]);
+    const lifeInt = setInterval(() => fetchLifetime(), 30 * 60 * 1000); // 30分ごと
+    return () => { clearInterval(fast); clearInterval(slow); clearInterval(lifeInt); };
+  }, [fetchData, fetchSlowData, fetchLifetime]);
 
   if (loading) {
     return <div className="text-center py-20 text-zinc-500">読み込み中...</div>;
@@ -340,6 +390,73 @@ export default function Dashboard() {
           </ResponsiveContainer>
         </div>
       )}
+
+      {/* BitFlyer 生涯損益（取引所側の全約定履歴ベース） */}
+      <div className="bg-zinc-900 rounded-xl p-4 border border-zinc-800">
+        <div className="flex items-center justify-between mb-3">
+          <div>
+            <h2 className="text-sm font-medium text-zinc-200">BitFlyer 生涯損益</h2>
+            <div className="text-[10px] text-zinc-600">
+              取引所APIの全約定履歴からFIFO計算 (Bot再起動でも消えない)
+            </div>
+          </div>
+          <button
+            onClick={() => fetchLifetime(true)}
+            disabled={lifetimeLoading}
+            className="px-2.5 py-1 text-[10px] rounded bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 text-zinc-300"
+          >
+            {lifetimeLoading ? "更新中..." : "BitFlyer再取得"}
+          </button>
+        </div>
+        {lifetime ? (
+          <>
+            <div className="grid grid-cols-2 gap-2 mb-3">
+              <div className="bg-zinc-950/40 rounded-lg p-3">
+                <div className="text-[10px] text-zinc-500">確定損益（手数料控除後）</div>
+                <div className={`text-xl font-bold font-mono ${lifetime.summary.netRealizedPnL >= 0 ? "text-green-400" : "text-red-400"}`}>
+                  ¥{Math.round(lifetime.summary.netRealizedPnL).toLocaleString()}
+                </div>
+                <div className="text-[10px] text-zinc-500">
+                  決済 {lifetime.summary.closedTrades}回 (<span className="text-green-400">{lifetime.summary.wins}W</span> <span className="text-red-400">{lifetime.summary.losses}L</span>) WR {lifetime.summary.winRate.toFixed(0)}%
+                </div>
+              </div>
+              <div className="bg-zinc-950/40 rounded-lg p-3">
+                <div className="text-[10px] text-zinc-500">総売買代金 / 手数料</div>
+                <div className="text-base font-mono text-zinc-200">
+                  ¥{Math.round(lifetime.summary.totalBuyVolumeJPY + lifetime.summary.totalSellVolumeJPY).toLocaleString()}
+                </div>
+                <div className="text-[10px] text-zinc-500">
+                  手数料 ¥{Math.round(lifetime.summary.totalFees).toLocaleString()} / 約定 {lifetime.summary.executionCount}件
+                </div>
+              </div>
+            </div>
+            {lifetime.summary.byPair.length > 0 && (
+              <div className="space-y-1">
+                {lifetime.summary.byPair.map((p) => (
+                  <div key={p.pair} className="flex items-center justify-between text-xs bg-zinc-950/40 rounded px-3 py-1.5">
+                    <span className="font-medium text-zinc-300 w-20">{p.pair.split("/")[0]}</span>
+                    <span className="text-zinc-500 w-28 text-right">{p.closedTrades}回 ({p.wins}W{p.losses}L)</span>
+                    <span className="text-zinc-600 text-[10px] w-32 text-right">残在庫 {p.remainingInventory.toFixed(4)}</span>
+                    <span className={`font-mono font-bold w-24 text-right ${p.realizedPnL >= 0 ? "text-green-400" : "text-red-400"}`}>
+                      ¥{Math.round(p.realizedPnL).toLocaleString()}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div className="text-[10px] text-zinc-700 mt-2">
+              キャッシュ: {new Date(lifetime.cachedAt).toLocaleString("ja-JP")}
+              {lifetime.summary.firstTradeTimestamp && (
+                <span className="ml-2">| 初取引: {new Date(lifetime.summary.firstTradeTimestamp).toLocaleDateString("ja-JP")}</span>
+              )}
+            </div>
+          </>
+        ) : (
+          <div className="text-center text-zinc-600 text-xs py-4">
+            {lifetimeLoading ? "BitFlyerから取得中..." : "未取得"}
+          </div>
+        )}
+      </div>
 
       {/* 市場価格 */}
       <div>
