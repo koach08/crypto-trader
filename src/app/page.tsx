@@ -195,8 +195,19 @@ export default function Dashboard() {
         <span className="text-xs text-zinc-600 ml-auto">Cycle #{status?.cycleCount ?? 0}</span>
       </div>
 
-      {/* サマリーカード 4列 */}
-      <div className="grid grid-cols-2 gap-2">
+      {/* サマリーカード */}
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
+        <div className="bg-zinc-900 rounded-xl p-3 border border-zinc-800">
+          <div className="text-[10px] text-zinc-500 uppercase tracking-wider">稼働状況</div>
+          <div className="text-lg font-bold font-mono text-zinc-100">
+            {status?.cycleCount ?? 0}
+            <span className="text-xs text-zinc-500 ml-1 font-sans">サイクル</span>
+          </div>
+          <div className="text-[10px] text-zinc-500">
+            取引 {cum?.totalTrades ?? 0}回 / <span className="text-green-400">{cum?.wins ?? 0}W</span> <span className="text-red-400">{cum?.losses ?? 0}L</span>
+            {cum && cum.closedTrades > 0 && ` (WR${cum.winRate.toFixed(0)}%)`}
+          </div>
+        </div>
         <div className="bg-zinc-900 rounded-xl p-3 border border-zinc-800">
           <div className="text-[10px] text-zinc-500 uppercase tracking-wider">本日損益</div>
           <div className={`text-lg font-bold font-mono ${(pnl?.totalPnL ?? 0) >= 0 ? "text-green-400" : "text-red-400"}`}>
@@ -418,7 +429,7 @@ export default function Dashboard() {
               )}
             </a>
           )) : (
-            <div className="text-center text-zinc-600 text-sm py-6">ニュース取得中...</div>
+            <div className="text-center text-zinc-600 text-sm py-6">ニュースなし</div>
           )}
         </div>
       </div>

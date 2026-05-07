@@ -10,7 +10,9 @@ import { PaperTrader } from "./paper-trader";
 import { loadData, saveData } from "../data";
 import { runQuantAnalysis } from "../quant/signals";
 import { calculateFinalDecision } from "../quant/scoring-engine";
-import { saveAudit, recordOutcome } from "../quant/audit-log";
+import { saveAudit, recordOutcome, getAudits } from "../quant/audit-log";
+import { checkMTFAlignment, checkEdge, calibrateConfidence, computeTrailingStop } from "./discipline";
+import { atr as atrIndicator } from "../indicators";
 
 const PAPER_VIRTUAL_CAPITAL_JPY = 1_000_000; // ペーパートレード仮想資金 ¥100万
 const PAPER_TRADE_AMOUNT_JPY = 50_000;       // 1回の取引額
@@ -169,6 +171,50 @@ async function runCycleForPair(pair: string): Promise<void> {
   decision.confidence = scoringResult.confidence;
   decision.reason = scoringResult.reason;
 
+  // === 取引規律フィルタ群（Alpha Arena 教訓） ===
+  // 勝ち取引の率を上げるため、期待値マイナスの取引を排除する
+  const disciplineNotes: string[] = [];
+
+  // 1. 信頼度キャリブレーション: 過去の判断と実績から確信度を補正
+  if (decision.action !== "HOLD") {
+    const allAudits = await getAudits(500).catch(() => []);
+    const cal = calibrateConfidence(allAudits, decision.confidence);
+    if (cal.calibrated !== cal.raw) {
+      decision.confidence = cal.calibrated;
+      disciplineNotes.push(`[補正] ${cal.reason}`);
+    }
+  }
+
+  // 2. マルチタイムフレーム整合性: h1の判断がh4トレンドと逆なら見送り
+  if (decision.action !== "HOLD") {
+    const mtf = checkMTFAlignment(bars, decision.action);
+    if (!mtf.aligned) {
+      disciplineNotes.push(`[MTF] ${mtf.reason}`);
+      decision.action = "HOLD";
+      decision.confidence = Math.min(decision.confidence, 40);
+    } else {
+      disciplineNotes.push(`[MTF] ${mtf.reason}`);
+    }
+  }
+
+  // 3. 期待値ゲート: 手数料を引いてもプラスEVか確認
+  if (decision.action !== "HOLD") {
+    const tp = decision.suggestedTakeProfitPercent ?? 3.0;
+    const sl = decision.suggestedStopLossPercent ?? 2.0;
+    const edge = checkEdge(decision.confidence, tp, sl);
+    if (!edge.passed) {
+      disciplineNotes.push(`[EV] ${edge.reason}`);
+      decision.action = "HOLD";
+      decision.confidence = Math.min(decision.confidence, 40);
+    } else {
+      disciplineNotes.push(`[EV] ${edge.reason}`);
+    }
+  }
+
+  if (disciplineNotes.length > 0) {
+    decision.reason = `${decision.reason} | ${disciplineNotes.join(" / ")}`;
+  }
+
   // 監査ログを保存（判断根拠の完全な記録）
   const auditEntry = {
     ...scoringResult.audit,
@@ -278,7 +324,8 @@ async function runCycleForPair(pair: string): Promise<void> {
             const avgPrice = (existing.entryPrice * existing.amount + order.price * order.amount) / totalAmount;
             existing.entryPrice = avgPrice;
             existing.amount = totalAmount;
-            existing.stopLossPercent = decision.suggestedStopLossPercent;
+            // SL は緩めない（既存がトレーリング中なら既存を保持、新提案の方が厳しければ採用）
+            existing.stopLossPercent = Math.min(existing.stopLossPercent, decision.suggestedStopLossPercent);
             existing.takeProfitPercent = decision.suggestedTakeProfitPercent;
           } else {
             state.livePositions.set(pair, {
@@ -339,8 +386,38 @@ async function runCycleForPair(pair: string): Promise<void> {
       }
     }
 
-    // ライブ SL/TP チェック
+    // ライブ SL/TP チェック（トレーリングストップ込み）
     if (livePos && realPosition.free > 0) {
+      // トレーリングストップ: 含み益が出たら SL をブレイクイーブン → ATR追従で引き上げ
+      const atrVals = atrIndicator(
+        bars.map(b => b.high),
+        bars.map(b => b.low),
+        bars.map(b => b.close),
+        14
+      );
+      const lastATR = atrVals.filter((v): v is number => v !== null).slice(-1)[0] ?? 0;
+      if (lastATR > 0) {
+        const trail = computeTrailingStop({
+          entryPrice: livePos.entryPrice,
+          currentPrice: ticker.price,
+          atr: lastATR,
+          currentStopLossPercent: livePos.stopLossPercent,
+          breakevenTriggerPercent: 1.0,
+          trailFactor: 1.0,
+        });
+        if (trail.movedToBreakeven || trail.trailing) {
+          const oldSL = livePos.stopLossPercent;
+          // 内部表現は「エントリーから-X%下落でSL発動」のXのみ正の値
+          // newStopLossPercentが0以下なら、利益確定方向に移動 → -newSLPercent (逆符号にして「-X%」として保持)
+          // 簡略化: 利益方向への移動はSLを「-(profit - atrTrail)」にすれば、changePercent <= -SL でトリガ
+          livePos.stopLossPercent = trail.newStopLossPercent;
+          if (livePos.stopLossPercent !== oldSL) {
+            console.log(`[${pair}] トレーリングSL: ${oldSL.toFixed(2)}% → ${livePos.stopLossPercent.toFixed(2)}% (${trail.reason})`);
+            await saveData("live-positions", Array.from(state.livePositions.values()));
+          }
+        }
+      }
+
       const changePercent = ((ticker.price - livePos.entryPrice) / livePos.entryPrice) * 100;
       let triggerType: "stop_loss" | "take_profit" | null = null;
 
