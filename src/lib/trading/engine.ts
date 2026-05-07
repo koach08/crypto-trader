@@ -84,6 +84,9 @@ async function ensureDataLoaded(): Promise<void> {
       state.liveTrades = await loadData<TradeRecord[]>("live-trades", []);
       const savedPositions = await loadData<LivePositionEntry[]>("live-positions", []);
       for (const p of savedPositions) {
+        // 古い保存形式で SL/TP が欠落している場合のデフォルト
+        if (typeof p.stopLossPercent !== "number") p.stopLossPercent = 2.0;
+        if (typeof p.takeProfitPercent !== "number") p.takeProfitPercent = 3.0;
         state.livePositions.set(p.pair, p);
       }
     })();
@@ -396,7 +399,7 @@ async function runCycleForPair(pair: string): Promise<void> {
         14
       );
       const lastATR = atrVals.filter((v): v is number => v !== null).slice(-1)[0] ?? 0;
-      if (lastATR > 0) {
+      if (lastATR > 0 && typeof livePos.stopLossPercent === "number") {
         const trail = computeTrailingStop({
           entryPrice: livePos.entryPrice,
           currentPrice: ticker.price,
@@ -407,11 +410,8 @@ async function runCycleForPair(pair: string): Promise<void> {
         });
         if (trail.movedToBreakeven || trail.trailing) {
           const oldSL = livePos.stopLossPercent;
-          // 内部表現は「エントリーから-X%下落でSL発動」のXのみ正の値
-          // newStopLossPercentが0以下なら、利益確定方向に移動 → -newSLPercent (逆符号にして「-X%」として保持)
-          // 簡略化: 利益方向への移動はSLを「-(profit - atrTrail)」にすれば、changePercent <= -SL でトリガ
           livePos.stopLossPercent = trail.newStopLossPercent;
-          if (livePos.stopLossPercent !== oldSL) {
+          if (livePos.stopLossPercent !== oldSL && typeof livePos.stopLossPercent === "number") {
             console.log(`[${pair}] トレーリングSL: ${oldSL.toFixed(2)}% → ${livePos.stopLossPercent.toFixed(2)}% (${trail.reason})`);
             await saveData("live-positions", Array.from(state.livePositions.values()));
           }
