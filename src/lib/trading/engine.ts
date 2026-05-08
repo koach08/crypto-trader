@@ -86,6 +86,20 @@ async function ensureDataLoaded(): Promise<void> {
       await state.riskManager.loadSaved();
       state.decisions = await loadData<AIDecision[]>("decisions", []);
       state.liveTrades = await loadData<TradeRecord[]>("live-trades", []);
+      // 過去のバグで pnl が不正値 (-100% など、order.average=0 由来) のものを補正
+      let repaired = 0;
+      for (const t of state.liveTrades) {
+        if (t.pnlPercent !== undefined && t.pnlPercent <= -90 && t.price === 0) {
+          // ccxt が average=0 で返したことによる偽計算。pnl を 0 に置き換える
+          t.pnl = 0;
+          t.pnlPercent = 0;
+          repaired++;
+        }
+      }
+      if (repaired > 0) {
+        await saveData("live-trades", state.liveTrades.slice(-200));
+        console.log(`[migration] live-trades: ${repaired} 件の不正pnlを補正 (price=0 由来)`);
+      }
       const savedPositions = await loadData<LivePositionEntry[]>("live-positions", []);
       for (const p of savedPositions) {
         // 古い保存形式で SL/TP が欠落している場合のデフォルト
@@ -830,6 +844,11 @@ export async function startBot(options?: {
     await state.riskManager.init(jpyTotal);
     // 既存データ修復: dailyPnL を本日分のみに再計算
     await state.riskManager.recomputeDailyFromTrades(state.liveTrades);
+    // 不正pnl補正後、CBが誤発動状態なら解除（recompute後の正味loss%で再判定される）
+    if (state.riskManager.getState() !== "TRIGGERED") {
+      state.riskManager.reset();
+      await state.riskManager.save();
+    }
     // 重要: livePositions を BitFlyer 実残高から復元（SL/TP動作の前提）
     await reconcileLivePositionsFromExchange();
     console.log(`Bot起動 | ライブ | 資金: ¥${jpyTotal.toLocaleString()} | ペア: ${state.pairs.join(", ")} | 間隔: ${state.intervalSeconds}秒`);
