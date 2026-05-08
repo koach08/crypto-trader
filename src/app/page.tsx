@@ -114,6 +114,7 @@ interface DiagnosticsResponse {
   byAction: { BUY: number; SELL: number; HOLD: number };
   filters: { rejectedByMTF: number; rejectedByEV: number; calibrationApplied: number };
   byPair: Record<string, { total: number; buy: number; sell: number; hold: number }>;
+  hasOpenPosition?: boolean;
   sample: { timestamp: string; pair: string; action: string; confidence: number; reason: string }[];
 }
 
@@ -702,9 +703,14 @@ export default function Dashboard() {
               <span className="font-mono text-zinc-400">{diagnostics.filters.calibrationApplied}回</span>
             </div>
           </div>
-          {diagnostics.byAction.SELL === 0 && diagnostics.byAction.HOLD > 10 && (
+          {diagnostics.byAction.SELL === 0 && diagnostics.byAction.HOLD > 10 && diagnostics.hasOpenPosition && (
             <div className="text-[10px] text-yellow-300/80 bg-yellow-950/20 border border-yellow-800/30 rounded p-2 mb-2">
-              ⚠️ 直近で SELL 判断ゼロ。緊急ロスカット番兵 (-{5}%) のみ売却の可能性あり。
+              ⚠️ ポジション保有中なのに SELL 判断ゼロ。緊急ロスカット番兵 (-5%) のみ売却の可能性あり。
+            </div>
+          )}
+          {diagnostics.byAction.SELL === 0 && diagnostics.byAction.HOLD > 10 && !diagnostics.hasOpenPosition && (
+            <div className="text-[10px] text-zinc-500 bg-zinc-950/40 border border-zinc-800/50 rounded p-2 mb-2">
+              ℹ️ ポジション無 + HOLD連発 = エッジ無し局面で待機中（仕様通り、F&G中立帯 or 一致度不足）
             </div>
           )}
           <div className="space-y-1">

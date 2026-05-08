@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { loadData } from "@/lib/data";
 import type { AIDecision } from "@/lib/types";
+import { getExchange } from "@/lib/exchanges/factory";
 
 export async function GET() {
   const decisions = await loadData<AIDecision[]>("decisions", []);
@@ -32,6 +33,18 @@ export async function GET() {
     else byPair[d.pair].hold++;
   }
 
+  // 「ポジション持ってるのに SELL が出てない」を本当の異常として検知するため
+  // BitFlyer の現物残高をチェック
+  let hasOpenPosition = false;
+  try {
+    const exchange = getExchange();
+    await exchange.connect();
+    const balance = await exchange.getBalance();
+    hasOpenPosition = balance.some(
+      (b) => b.currency !== "JPY" && b.total > 0.0001
+    );
+  } catch { /* 取得失敗時は false のまま */ }
+
   return NextResponse.json({
     window: total,
     byAction,
@@ -41,6 +54,7 @@ export async function GET() {
       calibrationApplied,
     },
     byPair,
+    hasOpenPosition,
     sample: recent.slice(-15).reverse().map((d) => ({
       timestamp: d.timestamp,
       pair: d.pair,
