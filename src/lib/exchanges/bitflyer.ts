@@ -208,27 +208,46 @@ export class BitFlyerExchange implements IExchange {
 
   async marketSell(pair: string, amountBase: number): Promise<OrderResult> {
     // BitFlyer は free 残高をピタリ送ると内部精度ズレで "Insufficient funds" を返すことがある。
-    // 0.05% を shave して安全側に丸める。手動売却UIも同様の処理をしている模様。
-    const safeAmount = amountBase * 0.9995;
-    const amount = this.roundAmount(pair, safeAmount);
-
-    if (amount <= 0) {
-      throw new Error(`${pair}: 売却量が最小取引単位未満 (要求 ${amountBase}, 安全側 ${safeAmount})`);
-    }
-
-    console.log(`[bitflyer] marketSell ${pair}: 要求${amountBase} → 送信${amount} (free精度バッファ控除)`);
-    const order = await this.exchange.createMarketSellOrder(pair, amount);
-    return {
-      id: order.id,
-      pair,
-      side: "sell",
-      type: "market",
-      amount: order.amount ?? amount,
-      price: order.average ?? 0,
-      status: (order.status as OrderResult["status"]) ?? "closed",
-      timestamp: order.timestamp ?? Date.now(),
-      fee: order.fee?.cost ?? 0,
+    // 段階的に buffer を増やしてリトライ: 0.5% → 1% → 2% → 5%
+    const base = pair.split("/")[0];
+    const minAmountMap: Record<string, number> = {
+      BTC: 0.001, ETH: 0.01, XRP: 0.1, XLM: 0.1, MONA: 0.1,
     };
+    const minAmount = minAmountMap[base] ?? 0.001;
+
+    const buffers = [0.995, 0.99, 0.98, 0.95];
+    let lastError: unknown = null;
+    for (const buffer of buffers) {
+      const safeAmount = Math.max(amountBase * buffer, minAmount);
+      const amount = this.roundAmount(pair, safeAmount);
+      if (amount <= 0) continue;
+
+      try {
+        console.log(`[bitflyer] marketSell ${pair}: 要求${amountBase} buffer=${(1 - buffer) * 100}% → 送信${amount}`);
+        const order = await this.exchange.createMarketSellOrder(pair, amount);
+        return {
+          id: order.id,
+          pair,
+          side: "sell",
+          type: "market",
+          amount: order.amount ?? amount,
+          price: order.average ?? 0,
+          status: (order.status as OrderResult["status"]) ?? "closed",
+          timestamp: order.timestamp ?? Date.now(),
+          fee: order.fee?.cost ?? 0,
+        };
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (msg.includes("Insufficient funds")) {
+          console.log(`[bitflyer] ${pair}: buffer ${(1 - buffer) * 100}% でも Insufficient、次のbufferへ`);
+          lastError = e;
+          continue;
+        }
+        // Insufficient 以外のエラーは即throw
+        throw e;
+      }
+    }
+    throw lastError ?? new Error(`${pair}: 全bufferで売却失敗`);
   }
 
   async cancelOrder(orderId: string, pair: string): Promise<boolean> {
