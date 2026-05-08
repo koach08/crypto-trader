@@ -86,6 +86,29 @@ interface LifetimeResponse {
   fetchedNow: boolean;
 }
 
+interface NavSnapshot {
+  timestamp: string;
+  jpy: number;
+  cryptoValueJPY: number;
+  total: number;
+}
+
+interface NavDelta {
+  total: number;
+  percent: number;
+  fromTimestamp: string;
+}
+
+interface NavResponse {
+  current: NavSnapshot | null;
+  first: NavSnapshot | null;
+  delta24h: NavDelta | null;
+  delta7d: NavDelta | null;
+  delta30d: NavDelta | null;
+  deltaLifetime: NavDelta | null;
+  history: NavSnapshot[];
+}
+
 const ACCENT = { green: "#22c55e", red: "#ef4444", blue: "#3b82f6", purple: "#8b5cf6", amber: "#f59e0b", cyan: "#06b6d4" };
 const PIE_COLORS = [ACCENT.blue, ACCENT.purple, ACCENT.cyan, ACCENT.amber, ACCENT.green];
 
@@ -107,6 +130,7 @@ export default function Dashboard() {
   const [pnlHistory, setPnlHistory] = useState<PnLSnapshot[]>([]);
   const [lifetime, setLifetime] = useState<LifetimeResponse | null>(null);
   const [lifetimeLoading, setLifetimeLoading] = useState(false);
+  const [nav, setNav] = useState<NavResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [activePair, setActivePair] = useState("ETH/JPY");
 
@@ -181,15 +205,29 @@ export default function Dashboard() {
     }
   }, []);
 
+  const fetchNav = useCallback(async () => {
+    try {
+      const res = await fetch("/api/bot/nav");
+      if (res.ok) {
+        const data = (await res.json()) as NavResponse;
+        setNav(data);
+      }
+    } catch (e) {
+      console.error("nav fetch失敗:", e);
+    }
+  }, []);
+
   useEffect(() => {
     fetchData();
     fetchSlowData();
     fetchLifetime();
+    fetchNav();
     const fast = setInterval(fetchData, 15000);
     const slow = setInterval(fetchSlowData, 300000); // 5分ごと
+    const navInt = setInterval(fetchNav, 60_000); // 1分ごと
     const lifeInt = setInterval(() => fetchLifetime(), 30 * 60 * 1000); // 30分ごと
-    return () => { clearInterval(fast); clearInterval(slow); clearInterval(lifeInt); };
-  }, [fetchData, fetchSlowData, fetchLifetime]);
+    return () => { clearInterval(fast); clearInterval(slow); clearInterval(navInt); clearInterval(lifeInt); };
+  }, [fetchData, fetchSlowData, fetchLifetime, fetchNav]);
 
   if (loading) {
     return <div className="text-center py-20 text-zinc-500">読み込み中...</div>;
@@ -310,6 +348,55 @@ export default function Dashboard() {
               <div>手数料 ¥{Math.round(lifetime.summary.totalFees).toLocaleString()}</div>
             </div>
           </div>
+
+          {/* 総資産推移 */}
+          {nav?.current && (
+            <div className="mt-4 pt-4 border-t border-zinc-800/60">
+              <div className="flex items-baseline justify-between flex-wrap gap-3 mb-2">
+                <div>
+                  <span className="text-[10px] text-zinc-500 uppercase tracking-wider mr-2">総資産</span>
+                  <span className="text-2xl font-bold font-mono text-zinc-100">
+                    ¥{Math.round(nav.current.total).toLocaleString()}
+                  </span>
+                  <span className="text-[10px] text-zinc-600 ml-2">
+                    JPY ¥{Math.round(nav.current.jpy).toLocaleString()} + 暗号通貨 ¥{Math.round(nav.current.cryptoValueJPY).toLocaleString()}
+                  </span>
+                </div>
+              </div>
+              <div className="flex gap-2 flex-wrap">
+                {[
+                  { key: "delta24h", label: "24h", d: nav.delta24h },
+                  { key: "delta7d", label: "7日", d: nav.delta7d },
+                  { key: "delta30d", label: "30日", d: nav.delta30d },
+                  { key: "deltaLifetime", label: "全期間", d: nav.deltaLifetime },
+                ].map(({ key, label, d }) => {
+                  if (!d) {
+                    return (
+                      <div key={key} className="px-2 py-1 rounded bg-zinc-900/60 border border-zinc-800 text-[10px] text-zinc-600">
+                        {label}: 履歴不足
+                      </div>
+                    );
+                  }
+                  const up = d.total >= 0;
+                  return (
+                    <div
+                      key={key}
+                      className={`px-2.5 py-1 rounded border text-xs font-mono flex items-center gap-1 ${
+                        up
+                          ? "border-green-500/30 bg-green-950/30 text-green-300"
+                          : "border-red-500/30 bg-red-950/30 text-red-300"
+                      }`}
+                    >
+                      <span className="text-[10px] opacity-70">{label}</span>
+                      <span>{up ? "▲" : "▼"}</span>
+                      <span className="font-semibold">{up ? "+" : ""}¥{Math.round(d.total).toLocaleString()}</span>
+                      <span className="opacity-70">({up ? "+" : ""}{d.percent.toFixed(2)}%)</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
         </div>
       ) : (
         <div className="rounded-2xl p-5 border-2 border-zinc-800 bg-zinc-950/40 text-center text-zinc-500 text-sm">

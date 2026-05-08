@@ -595,6 +595,65 @@ async function runCycle(): Promise<void> {
     });
     await saveData("pnl-history", history.slice(-500));
   }
+
+  // 総資産スナップショット（毎サイクル記録、ライブモードのみ）
+  if (!state.paperMode) {
+    try {
+      await recordNavSnapshot();
+    } catch (e) {
+      console.error("NAV snapshot 失敗:", e);
+    }
+  }
+}
+
+interface NavSnapshot {
+  timestamp: string;
+  jpy: number;
+  cryptoValueJPY: number;
+  total: number;
+  positions: Record<string, { amount: number; price: number; valueJPY: number }>;
+}
+
+async function recordNavSnapshot(): Promise<void> {
+  const exchange = getExchange();
+  await exchange.connect();
+  const balance = await exchange.getBalance();
+  const jpy = balance.find((b) => b.currency === "JPY")?.total ?? 0;
+
+  let cryptoValueJPY = 0;
+  const positions: NavSnapshot["positions"] = {};
+  for (const pair of state.pairs) {
+    const base = pair.split("/")[0];
+    const bal = balance.find((b) => b.currency === base);
+    if (bal && bal.total > 0) {
+      try {
+        const t = await exchange.getTicker(pair);
+        const valueJPY = bal.total * t.price;
+        cryptoValueJPY += valueJPY;
+        positions[pair] = { amount: bal.total, price: t.price, valueJPY };
+      } catch {
+        // ticker取得失敗はスキップ
+      }
+    }
+  }
+  const total = jpy + cryptoValueJPY;
+  const history = await loadData<NavSnapshot[]>("nav-history", []);
+  // 直近スナップショットと差が±¥10未満かつ5分以内なら重複扱いでスキップ
+  const last = history[history.length - 1];
+  if (last) {
+    const lastTime = new Date(last.timestamp).getTime();
+    const sinceLast = Date.now() - lastTime;
+    if (sinceLast < 5 * 60 * 1000 && Math.abs(last.total - total) < 10) return;
+  }
+  history.push({
+    timestamp: new Date().toISOString(),
+    jpy,
+    cryptoValueJPY,
+    total,
+    positions,
+  });
+  // 最大2000件保持（1サイクル15分なら約3週間）
+  await saveData("nav-history", history.slice(-2000));
 }
 
 // === Public API ===
