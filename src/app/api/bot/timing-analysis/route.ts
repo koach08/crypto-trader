@@ -3,10 +3,10 @@ import { loadData } from "@/lib/data";
 import { detectRegime } from "@/lib/indicators";
 import type { OHLCVBar, TradeRecord } from "@/lib/types";
 
-const COINGECKO_IDS: Record<string, string> = {
-  "BTC/JPY": "bitcoin",
-  "ETH/JPY": "ethereum",
-  "XRP/JPY": "ripple",
+const YAHOO_CRYPTO_SYMBOLS: Record<string, string> = {
+  "BTC/JPY": "BTC-JPY",
+  "ETH/JPY": "ETH-JPY",
+  "XRP/JPY": "XRP-JPY",
 };
 
 interface FngEntry {
@@ -40,23 +40,37 @@ async function fetchFng(days: number): Promise<FngEntry[]> {
   }
 }
 
-async function fetchCoingeckoDaily(coinId: string, days: number): Promise<OHLCVBar[]> {
+async function fetchYahooDaily(symbol: string, days: number): Promise<OHLCVBar[]> {
   try {
     const r = await fetch(
-      `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=jpy&days=${days}&interval=daily`,
-      { signal: AbortSignal.timeout(10000), next: { revalidate: 3600 } }
+      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=${days}d&interval=1d`,
+      {
+        signal: AbortSignal.timeout(10000),
+        headers: { "User-Agent": "Mozilla/5.0" },
+        next: { revalidate: 3600 },
+      }
     );
     if (!r.ok) return [];
     const json = await r.json();
-    const prices: [number, number][] = json.prices ?? [];
-    return prices.map(([ts, price]) => ({
-      timestamp: ts,
-      open: price,
-      high: price,
-      low: price,
-      close: price,
-      volume: 0,
-    }));
+    const result = json?.chart?.result?.[0];
+    if (!result) return [];
+    const timestamps: number[] = result.timestamp ?? [];
+    const quote = result.indicators?.quote?.[0];
+    if (!quote) return [];
+    const bars: OHLCVBar[] = [];
+    for (let i = 0; i < timestamps.length; i++) {
+      const close = quote.close?.[i];
+      if (close == null) continue;
+      bars.push({
+        timestamp: timestamps[i] * 1000,
+        open: quote.open?.[i] ?? close,
+        high: quote.high?.[i] ?? close,
+        low: quote.low?.[i] ?? close,
+        close,
+        volume: quote.volume?.[i] ?? 0,
+      });
+    }
+    return bars;
   } catch {
     return [];
   }
@@ -96,10 +110,10 @@ export async function GET() {
   const fngAvg = fng.length > 0 ? fng.reduce((s, f) => s + f.value, 0) / fng.length : 50;
 
   // 2. ペア毎の値動き + レジーム集計
-  const pairs = Object.keys(COINGECKO_IDS);
+  const pairs = Object.keys(YAHOO_CRYPTO_SYMBOLS);
   const perPair = await Promise.all(
     pairs.map(async (pair) => {
-      const bars = await fetchCoingeckoDaily(COINGECKO_IDS[pair], days);
+      const bars = await fetchYahooDaily(YAHOO_CRYPTO_SYMBOLS[pair], days);
       const recent = bars.slice(-days);
       const change = pctChange(recent);
       const regimes = computeRegimePerDay(bars);
