@@ -207,12 +207,16 @@ export class BitFlyerExchange implements IExchange {
   }
 
   async marketSell(pair: string, amountBase: number): Promise<OrderResult> {
-    const amount = this.roundAmount(pair, amountBase);
+    // BitFlyer は free 残高をピタリ送ると内部精度ズレで "Insufficient funds" を返すことがある。
+    // 0.05% を shave して安全側に丸める。手動売却UIも同様の処理をしている模様。
+    const safeAmount = amountBase * 0.9995;
+    const amount = this.roundAmount(pair, safeAmount);
 
     if (amount <= 0) {
-      throw new Error(`${pair}: 売却量が最小取引単位未満`);
+      throw new Error(`${pair}: 売却量が最小取引単位未満 (要求 ${amountBase}, 安全側 ${safeAmount})`);
     }
 
+    console.log(`[bitflyer] marketSell ${pair}: 要求${amountBase} → 送信${amount} (free精度バッファ控除)`);
     const order = await this.exchange.createMarketSellOrder(pair, amount);
     return {
       id: order.id,
