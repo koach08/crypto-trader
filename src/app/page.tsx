@@ -130,6 +130,28 @@ interface LearningResponse {
   };
 }
 
+interface TimingAnalysis {
+  days: number;
+  fng: {
+    avg: number;
+    extremeDays: number;
+    fearDays: number;
+    greedDays: number;
+    history: { value: number; classification: string; date: string }[];
+  };
+  pairs: {
+    pair: string;
+    days: number;
+    firstClose: number;
+    lastClose: number;
+    changePercent: number;
+    regimes: Record<string, number>;
+  }[];
+  botActivity: { totalTrades: number; buys: number; sells: number; realizedPnL: number };
+  buyHoldAvgReturnPercent: number;
+  verdicts: string[];
+}
+
 const ACCENT = { green: "#22c55e", red: "#ef4444", blue: "#3b82f6", purple: "#8b5cf6", amber: "#f59e0b", cyan: "#06b6d4" };
 const PIE_COLORS = [ACCENT.blue, ACCENT.purple, ACCENT.cyan, ACCENT.amber, ACCENT.green];
 
@@ -154,6 +176,7 @@ export default function Dashboard() {
   const [nav, setNav] = useState<NavResponse | null>(null);
   const [diagnostics, setDiagnostics] = useState<DiagnosticsResponse | null>(null);
   const [learning, setLearning] = useState<LearningResponse | null>(null);
+  const [timing, setTiming] = useState<TimingAnalysis | null>(null);
   const [loading, setLoading] = useState(true);
   const [activePair, setActivePair] = useState("ETH/JPY");
 
@@ -264,6 +287,18 @@ export default function Dashboard() {
     }
   }, []);
 
+  const fetchTiming = useCallback(async () => {
+    try {
+      const res = await fetch("/api/bot/timing-analysis");
+      if (res.ok) {
+        const data = (await res.json()) as TimingAnalysis;
+        setTiming(data);
+      }
+    } catch (e) {
+      console.error("timing fetch失敗:", e);
+    }
+  }, []);
+
   useEffect(() => {
     fetchData();
     fetchSlowData();
@@ -271,14 +306,16 @@ export default function Dashboard() {
     fetchNav();
     fetchDiagnostics();
     fetchLearning();
+    fetchTiming();
     const fast = setInterval(fetchData, 15000);
     const slow = setInterval(fetchSlowData, 300000); // 5分ごと
     const navInt = setInterval(fetchNav, 60_000); // 1分ごと
     const diagInt = setInterval(fetchDiagnostics, 60_000); // 1分ごと
     const learnInt = setInterval(fetchLearning, 5 * 60_000); // 5分ごと
+    const timingInt = setInterval(fetchTiming, 60 * 60_000); // 1時間ごと
     const lifeInt = setInterval(() => fetchLifetime(), 30 * 60 * 1000); // 30分ごと
-    return () => { clearInterval(fast); clearInterval(slow); clearInterval(navInt); clearInterval(diagInt); clearInterval(learnInt); clearInterval(lifeInt); };
-  }, [fetchData, fetchSlowData, fetchLifetime, fetchNav, fetchDiagnostics, fetchLearning]);
+    return () => { clearInterval(fast); clearInterval(slow); clearInterval(navInt); clearInterval(diagInt); clearInterval(learnInt); clearInterval(timingInt); clearInterval(lifeInt); };
+  }, [fetchData, fetchSlowData, fetchLifetime, fetchNav, fetchDiagnostics, fetchLearning, fetchTiming]);
 
   if (loading) {
     return <div className="text-center py-20 text-zinc-500">読み込み中...</div>;
@@ -729,6 +766,107 @@ export default function Dashboard() {
                 </span>
                 <span className="text-zinc-600 shrink-0 w-10">{d.confidence}%</span>
                 <span className="text-zinc-500 truncate">{d.reason}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* 市場環境タイミング分析: 「タイミング悪かったか」を客観評価 */}
+      {timing && (
+        <div className="bg-zinc-900 rounded-xl p-4 border border-zinc-800">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-medium text-zinc-200">市場環境タイミング分析 (直近{timing.days}日)</h2>
+            <button
+              onClick={fetchTiming}
+              className="px-2 py-0.5 text-[10px] rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-400"
+            >
+              更新
+            </button>
+          </div>
+
+          {/* F&G + Buy&Hold + Bot活動 */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-3">
+            <div className="bg-zinc-950/40 rounded-lg p-2">
+              <div className="text-[10px] text-zinc-500">F&G 平均</div>
+              <div className={`text-lg font-bold font-mono ${
+                timing.fng.avg < 30 ? "text-green-400" :
+                timing.fng.avg > 70 ? "text-red-400" : "text-zinc-300"
+              }`}>{timing.fng.avg.toFixed(0)}</div>
+              <div className="text-[10px] text-zinc-600">
+                Fear {timing.fng.fearDays}日 / Greed {timing.fng.greedDays}日
+              </div>
+            </div>
+            <div className="bg-zinc-950/40 rounded-lg p-2">
+              <div className="text-[10px] text-zinc-500">エントリー機会</div>
+              <div className={`text-lg font-bold font-mono ${
+                timing.fng.extremeDays >= 5 ? "text-green-400" : "text-orange-400"
+              }`}>{timing.fng.extremeDays}日</div>
+              <div className="text-[10px] text-zinc-600">F&G extreme日数</div>
+            </div>
+            <div className="bg-zinc-950/40 rounded-lg p-2">
+              <div className="text-[10px] text-zinc-500">Buy&amp;Hold 平均</div>
+              <div className={`text-lg font-bold font-mono ${
+                timing.buyHoldAvgReturnPercent > 0 ? "text-green-400" :
+                timing.buyHoldAvgReturnPercent < 0 ? "text-red-400" : "text-zinc-300"
+              }`}>
+                {timing.buyHoldAvgReturnPercent > 0 ? "+" : ""}{timing.buyHoldAvgReturnPercent.toFixed(1)}%
+              </div>
+              <div className="text-[10px] text-zinc-600">3通貨平均</div>
+            </div>
+            <div className="bg-zinc-950/40 rounded-lg p-2">
+              <div className="text-[10px] text-zinc-500">Bot 取引</div>
+              <div className="text-lg font-bold font-mono text-zinc-300">
+                {timing.botActivity.totalTrades}回
+              </div>
+              <div className="text-[10px] text-zinc-600">
+                <span className="text-green-400">B{timing.botActivity.buys}</span> / <span className="text-red-400">S{timing.botActivity.sells}</span>
+                {timing.botActivity.realizedPnL !== 0 && (
+                  <span className={`ml-1 ${timing.botActivity.realizedPnL >= 0 ? "text-green-400" : "text-red-400"}`}>
+                    ¥{timing.botActivity.realizedPnL.toLocaleString()}
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* ペア別レジーム分布 */}
+          <div className="space-y-1.5 mb-3">
+            {timing.pairs.map(p => {
+              const total = (p.regimes.TRENDING_UP ?? 0) + (p.regimes.TRENDING_DOWN ?? 0) + (p.regimes.RANGING ?? 0) + (p.regimes.VOLATILE ?? 0);
+              const upPct = total > 0 ? ((p.regimes.TRENDING_UP ?? 0) / total) * 100 : 0;
+              const downPct = total > 0 ? ((p.regimes.TRENDING_DOWN ?? 0) / total) * 100 : 0;
+              const rangePct = total > 0 ? ((p.regimes.RANGING ?? 0) / total) * 100 : 0;
+              const volPct = total > 0 ? ((p.regimes.VOLATILE ?? 0) / total) * 100 : 0;
+              return (
+                <div key={p.pair} className="flex items-center gap-2 text-xs">
+                  <span className="font-medium text-zinc-300 w-12 shrink-0">{p.pair.split("/")[0]}</span>
+                  <span className={`font-mono w-16 shrink-0 ${
+                    p.changePercent >= 0 ? "text-green-400" : "text-red-400"
+                  }`}>
+                    {p.changePercent >= 0 ? "+" : ""}{p.changePercent.toFixed(1)}%
+                  </span>
+                  <div className="flex-1 flex h-3 rounded overflow-hidden bg-zinc-800/50">
+                    {upPct > 0 && <div className="bg-green-500/60" style={{ width: `${upPct}%` }} title={`上昇${p.regimes.TRENDING_UP}日`} />}
+                    {rangePct > 0 && <div className="bg-zinc-500/60" style={{ width: `${rangePct}%` }} title={`レンジ${p.regimes.RANGING}日`} />}
+                    {volPct > 0 && <div className="bg-yellow-500/60" style={{ width: `${volPct}%` }} title={`高ボラ${p.regimes.VOLATILE}日`} />}
+                    {downPct > 0 && <div className="bg-red-500/60" style={{ width: `${downPct}%` }} title={`下降${p.regimes.TRENDING_DOWN}日`} />}
+                  </div>
+                  <span className="text-[10px] text-zinc-600 w-24 text-right">
+                    上{p.regimes.TRENDING_UP ?? 0}/下{p.regimes.TRENDING_DOWN ?? 0}/横{p.regimes.RANGING ?? 0}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* 結論 */}
+          <div className="border-t border-zinc-800 pt-2 space-y-1">
+            <div className="text-[10px] text-zinc-500 font-semibold uppercase mb-1">結論</div>
+            {timing.verdicts.map((v, i) => (
+              <div key={i} className="text-xs text-zinc-300 flex gap-2">
+                <span className="text-purple-400 shrink-0">▸</span>
+                <span>{v}</span>
               </div>
             ))}
           </div>
