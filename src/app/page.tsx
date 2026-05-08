@@ -226,6 +226,24 @@ export default function Dashboard() {
       pnl: Math.round(t.pnl ?? 0),
     }));
 
+  // 生涯損益の判定（BitFlyer 確定 + 現在の含み損益）
+  const lifetimeUnrealized = lifetime?.summary.byPair.reduce((sum, p) => {
+    const t = tickers[p.pair];
+    if (!t || p.remainingInventory <= 0 || p.averageBuyPrice <= 0) return sum;
+    return sum + (t.price - p.averageBuyPrice) * p.remainingInventory;
+  }, 0) ?? 0;
+  const lifetimeRealized = lifetime?.summary.netRealizedPnL ?? 0;
+  const lifetimeTotalPnL = lifetimeRealized + lifetimeUnrealized;
+  const daysSinceFirst = lifetime?.summary.firstTradeTimestamp
+    ? Math.max(1, Math.floor((Date.now() - lifetime.summary.firstTradeTimestamp) / (1000 * 60 * 60 * 24)))
+    : 0;
+  // 現在の運用元本推定: 累計買付金額 - 累計売却金額 + 残在庫の取得原価 = 投じた純額
+  const lifetimeNetInflow =
+    (lifetime?.summary.totalBuyVolumeJPY ?? 0) - (lifetime?.summary.totalSellVolumeJPY ?? 0);
+  const verdict: "WIN" | "LOSS" | "EVEN" =
+    Math.abs(lifetimeTotalPnL) < 100 || !lifetime ? "EVEN" :
+    lifetimeTotalPnL > 0 ? "WIN" : "LOSS";
+
   return (
     <div className="space-y-5">
       {/* ステータスバー */}
@@ -244,6 +262,60 @@ export default function Dashboard() {
         )}
         <span className="text-xs text-zinc-600 ml-auto">Cycle #{status?.cycleCount ?? 0}</span>
       </div>
+
+      {/* 結論バナー: 勝ってるか負けてるか */}
+      {lifetime ? (
+        <div className={`rounded-2xl p-5 border-2 ${
+          verdict === "WIN" ? "border-green-500/40 bg-gradient-to-br from-green-950/40 to-zinc-950" :
+          verdict === "LOSS" ? "border-red-500/40 bg-gradient-to-br from-red-950/40 to-zinc-950" :
+          "border-zinc-700 bg-gradient-to-br from-zinc-900 to-zinc-950"
+        }`}>
+          <div className="flex items-start justify-between gap-3 flex-wrap">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 mb-1">
+                <span className={`text-xs font-bold tracking-widest uppercase ${
+                  verdict === "WIN" ? "text-green-400" :
+                  verdict === "LOSS" ? "text-red-400" : "text-zinc-400"
+                }`}>
+                  {verdict === "WIN" ? "勝ってる" : verdict === "LOSS" ? "負けてる" : "ほぼトントン"}
+                </span>
+                <span className="text-[10px] text-zinc-600">
+                  BitFlyer全期間 (確定 + 含み)
+                </span>
+              </div>
+              <div className={`text-4xl font-black font-mono leading-tight ${
+                lifetimeTotalPnL >= 0 ? "text-green-400" : "text-red-400"
+              }`}>
+                {lifetimeTotalPnL >= 0 ? "+" : ""}¥{Math.round(lifetimeTotalPnL).toLocaleString()}
+              </div>
+              <div className="text-xs text-zinc-500 mt-1">
+                確定 <span className={lifetimeRealized >= 0 ? "text-green-400" : "text-red-400"}>
+                  {lifetimeRealized >= 0 ? "+" : ""}¥{Math.round(lifetimeRealized).toLocaleString()}
+                </span>
+                <span className="mx-1.5 text-zinc-700">/</span>
+                含み <span className={lifetimeUnrealized >= 0 ? "text-green-400" : "text-red-400"}>
+                  {lifetimeUnrealized >= 0 ? "+" : ""}¥{Math.round(lifetimeUnrealized).toLocaleString()}
+                </span>
+                {daysSinceFirst > 0 && (
+                  <>
+                    <span className="mx-1.5 text-zinc-700">/</span>
+                    {daysSinceFirst}日経過
+                  </>
+                )}
+              </div>
+            </div>
+            <div className="text-right text-[11px] text-zinc-500 leading-snug">
+              <div>純投入額: <span className="font-mono text-zinc-300">¥{Math.round(lifetimeNetInflow).toLocaleString()}</span></div>
+              <div>決済 {lifetime.summary.closedTrades}回 (<span className="text-green-400">{lifetime.summary.wins}W</span> <span className="text-red-400">{lifetime.summary.losses}L</span>) WR {lifetime.summary.winRate.toFixed(0)}%</div>
+              <div>手数料 ¥{Math.round(lifetime.summary.totalFees).toLocaleString()}</div>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="rounded-2xl p-5 border-2 border-zinc-800 bg-zinc-950/40 text-center text-zinc-500 text-sm">
+          {lifetimeLoading ? "BitFlyer履歴から損益を計算中..." : "BitFlyer履歴未取得"}
+        </div>
+      )}
 
       {/* サマリーカード */}
       <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
