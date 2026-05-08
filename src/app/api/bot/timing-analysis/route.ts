@@ -74,8 +74,9 @@ function computeRegimePerDay(bars: OHLCVBar[]): Record<string, number> {
     RANGING: 0,
     VOLATILE: 0,
   };
-  // SMA 計算には十分な過去が要るので最後20日分だけ判定
-  const startIdx = Math.max(50, bars.length - 20);
+  // detectRegime は最低でも20本ぐらい必要。データが少ない場合は条件を緩める
+  const minWindow = Math.min(20, Math.max(10, Math.floor(bars.length / 2)));
+  const startIdx = Math.max(minWindow, bars.length - 30); // 最大30日まで遡って判定
   for (let i = startIdx; i < bars.length; i++) {
     const window = bars.slice(0, i + 1);
     const r = detectRegime(window);
