@@ -109,6 +109,14 @@ interface NavResponse {
   history: NavSnapshot[];
 }
 
+interface DiagnosticsResponse {
+  window: number;
+  byAction: { BUY: number; SELL: number; HOLD: number };
+  filters: { rejectedByMTF: number; rejectedByEV: number; calibrationApplied: number };
+  byPair: Record<string, { total: number; buy: number; sell: number; hold: number }>;
+  sample: { timestamp: string; pair: string; action: string; confidence: number; reason: string }[];
+}
+
 const ACCENT = { green: "#22c55e", red: "#ef4444", blue: "#3b82f6", purple: "#8b5cf6", amber: "#f59e0b", cyan: "#06b6d4" };
 const PIE_COLORS = [ACCENT.blue, ACCENT.purple, ACCENT.cyan, ACCENT.amber, ACCENT.green];
 
@@ -131,6 +139,7 @@ export default function Dashboard() {
   const [lifetime, setLifetime] = useState<LifetimeResponse | null>(null);
   const [lifetimeLoading, setLifetimeLoading] = useState(false);
   const [nav, setNav] = useState<NavResponse | null>(null);
+  const [diagnostics, setDiagnostics] = useState<DiagnosticsResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [activePair, setActivePair] = useState("ETH/JPY");
 
@@ -217,17 +226,31 @@ export default function Dashboard() {
     }
   }, []);
 
+  const fetchDiagnostics = useCallback(async () => {
+    try {
+      const res = await fetch("/api/bot/diagnostics");
+      if (res.ok) {
+        const data = (await res.json()) as DiagnosticsResponse;
+        setDiagnostics(data);
+      }
+    } catch (e) {
+      console.error("diagnostics fetch失敗:", e);
+    }
+  }, []);
+
   useEffect(() => {
     fetchData();
     fetchSlowData();
     fetchLifetime();
     fetchNav();
+    fetchDiagnostics();
     const fast = setInterval(fetchData, 15000);
     const slow = setInterval(fetchSlowData, 300000); // 5分ごと
     const navInt = setInterval(fetchNav, 60_000); // 1分ごと
+    const diagInt = setInterval(fetchDiagnostics, 60_000); // 1分ごと
     const lifeInt = setInterval(() => fetchLifetime(), 30 * 60 * 1000); // 30分ごと
-    return () => { clearInterval(fast); clearInterval(slow); clearInterval(navInt); clearInterval(lifeInt); };
-  }, [fetchData, fetchSlowData, fetchLifetime, fetchNav]);
+    return () => { clearInterval(fast); clearInterval(slow); clearInterval(navInt); clearInterval(diagInt); clearInterval(lifeInt); };
+  }, [fetchData, fetchSlowData, fetchLifetime, fetchNav, fetchDiagnostics]);
 
   if (loading) {
     return <div className="text-center py-20 text-zinc-500">読み込み中...</div>;
@@ -616,6 +639,68 @@ export default function Dashboard() {
           </div>
         )}
       </div>
+
+      {/* 判断パイプライン診断 */}
+      {diagnostics && diagnostics.window > 0 && (
+        <div className="bg-zinc-900 rounded-xl p-4 border border-zinc-800">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-medium text-zinc-200">判断パイプライン診断</h2>
+            <span className="text-[10px] text-zinc-600">直近{diagnostics.window}判断</span>
+          </div>
+          <div className="grid grid-cols-3 gap-2 mb-3">
+            <div className="bg-zinc-950/40 rounded-lg p-2 text-center">
+              <div className="text-[10px] text-zinc-500">BUY</div>
+              <div className="text-lg font-bold text-green-400 font-mono">{diagnostics.byAction.BUY}</div>
+            </div>
+            <div className="bg-zinc-950/40 rounded-lg p-2 text-center">
+              <div className="text-[10px] text-zinc-500">SELL</div>
+              <div className="text-lg font-bold text-red-400 font-mono">{diagnostics.byAction.SELL}</div>
+            </div>
+            <div className="bg-zinc-950/40 rounded-lg p-2 text-center">
+              <div className="text-[10px] text-zinc-500">HOLD</div>
+              <div className="text-lg font-bold text-zinc-400 font-mono">{diagnostics.byAction.HOLD}</div>
+            </div>
+          </div>
+          <div className="text-[11px] text-zinc-500 space-y-1 mb-3">
+            <div className="flex justify-between">
+              <span>MTFフィルタで HOLD化</span>
+              <span className="font-mono text-yellow-400">{diagnostics.filters.rejectedByMTF}回</span>
+            </div>
+            <div className="flex justify-between">
+              <span>EVゲートで HOLD化</span>
+              <span className="font-mono text-yellow-400">{diagnostics.filters.rejectedByEV}回</span>
+            </div>
+            <div className="flex justify-between">
+              <span>確信度キャリブレーション適用</span>
+              <span className="font-mono text-zinc-400">{diagnostics.filters.calibrationApplied}回</span>
+            </div>
+          </div>
+          {diagnostics.byAction.SELL === 0 && diagnostics.byAction.HOLD > 10 && (
+            <div className="text-[10px] text-yellow-300/80 bg-yellow-950/20 border border-yellow-800/30 rounded p-2 mb-2">
+              ⚠️ 直近で SELL 判断ゼロ。緊急ロスカット番兵 (-{5}%) のみ売却の可能性あり。
+            </div>
+          )}
+          <div className="space-y-1">
+            {diagnostics.sample.slice(0, 6).map((d, i) => (
+              <div key={i} className="flex items-start gap-2 text-[11px] bg-zinc-950/30 rounded px-2 py-1">
+                <span className="text-zinc-600 shrink-0 font-mono">
+                  {d.timestamp.slice(11, 16)}
+                </span>
+                <span className="text-zinc-400 shrink-0 w-12">{d.pair.split("/")[0]}</span>
+                <span
+                  className={`shrink-0 font-bold w-12 ${
+                    d.action === "BUY" ? "text-green-400" : d.action === "SELL" ? "text-red-400" : "text-zinc-500"
+                  }`}
+                >
+                  {d.action}
+                </span>
+                <span className="text-zinc-600 shrink-0 w-10">{d.confidence}%</span>
+                <span className="text-zinc-500 truncate">{d.reason}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* 市場価格 */}
       <div>

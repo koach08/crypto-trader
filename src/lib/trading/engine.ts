@@ -13,6 +13,10 @@ import { calculateFinalDecision } from "../quant/scoring-engine";
 import { saveAudit, recordOutcome, getAudits } from "../quant/audit-log";
 import { checkMTFAlignment, checkEdge, calibrateConfidence, computeTrailingStop } from "./discipline";
 import { atr as atrIndicator } from "../indicators";
+import { computeLifetimePnL } from "./lifetime";
+
+// 緊急ロスカット閾値（pipelineと無関係に発火）
+const EMERGENCY_LOSS_PERCENT = 5.0;
 
 const PAPER_VIRTUAL_CAPITAL_JPY = 1_000_000; // ペーパートレード仮想資金 ¥100万
 const PAPER_TRADE_AMOUNT_JPY = 50_000;       // 1回の取引額
@@ -113,6 +117,16 @@ async function runCycleForPair(pair: string): Promise<void> {
     exchange.getPosition(pair),
     getFearGreedIndex(),
   ]);
+
+  // === 緊急ロスカット番兵: pipeline 前に独立判定 ===
+  // AI 判断・規律フィルタ・確信度閾値とは無関係に、含み損が閾値超えたら強制売却
+  if (!state.paperMode) {
+    const cut = await emergencyLossCut(pair, ticker.price);
+    if (cut) {
+      console.log(`[${pair}] 緊急ロスカット後はサイクル終了`);
+      return;
+    }
+  }
 
   // Technical analysis
   const signal = generateCryptoSignal(bars);
@@ -466,9 +480,10 @@ async function runCycleForPair(pair: string): Promise<void> {
 
     // DCA（ドルコスト平均法）: HOLDでもNサイクルごとに少額積立
     // レジームに応じてDCA額を調整
+    // 重要: 下降トレンドではDCA停止 (含み損拡大の負け筋を防ぐ)
     const dcaMultiplier = regime === "TRENDING_UP" ? 2.0    // 上昇トレンド: 積極的に積む
                         : regime === "RANGING" ? 1.0        // レンジ: 通常ペース
-                        : regime === "TRENDING_DOWN" ? 0.5  // 下降トレンド: 控えめ
+                        : regime === "TRENDING_DOWN" ? 0    // 下降トレンド: DCA停止
                         : 0;                                // VOLATILE: DCA停止
     const dcaAmount = Math.round(DCA_AMOUNT_JPY * dcaMultiplier);
 
@@ -614,6 +629,128 @@ interface NavSnapshot {
   positions: Record<string, { amount: number; price: number; valueJPY: number }>;
 }
 
+/**
+ * BitFlyer の実残高 + 約定履歴から livePositions を再構築する。
+ * Bot 再起動・デプロイで in-memory state が消えても、SL/TP が機能するように。
+ */
+async function reconcileLivePositionsFromExchange(): Promise<void> {
+  if (state.paperMode) return;
+  try {
+    const exchange = getExchange();
+    if (!exchange.fetchExecutions) return;
+    await exchange.connect();
+
+    for (const pair of state.pairs) {
+      const realPos = await exchange.getPosition(pair);
+      if (realPos.amount <= 0.0000001) continue;
+
+      const tracked = state.livePositions.get(pair);
+      const alreadyAligned =
+        tracked &&
+        Math.abs(tracked.amount - realPos.amount) < 0.00001 &&
+        typeof tracked.stopLossPercent === "number" &&
+        tracked.entryPrice > 0;
+      if (alreadyAligned) continue;
+
+      // FIFO で残在庫の avg buy price を計算
+      let avgPrice = 0;
+      try {
+        const executions = await exchange.fetchExecutions(pair);
+        const summary = computeLifetimePnL(executions);
+        const stats = summary.byPair.find((p) => p.pair === pair);
+        if (stats && stats.remainingInventory > 0 && stats.averageBuyPrice > 0) {
+          avgPrice = stats.averageBuyPrice;
+        }
+      } catch (e) {
+        console.error(`[reconcile] ${pair} 約定履歴取得失敗:`, e);
+      }
+
+      // フォールバック: 現在価格を avg として記録（直ちには SL 発火しない）
+      if (avgPrice <= 0) {
+        try {
+          const ticker = await exchange.getTicker(pair);
+          avgPrice = ticker.price;
+        } catch {
+          continue;
+        }
+      }
+
+      state.livePositions.set(pair, {
+        pair,
+        entryPrice: avgPrice,
+        amount: realPos.amount,
+        entryTimestamp: tracked?.entryTimestamp ?? new Date().toISOString(),
+        stopLossPercent:
+          typeof tracked?.stopLossPercent === "number" ? tracked.stopLossPercent : 2.0,
+        takeProfitPercent:
+          typeof tracked?.takeProfitPercent === "number" ? tracked.takeProfitPercent : 3.0,
+      });
+      console.log(
+        `[reconcile] ${pair}: amount=${realPos.amount} avg=¥${Math.round(avgPrice).toLocaleString()} SL=2.0% TP=3.0% から復元`
+      );
+    }
+
+    await saveData("live-positions", Array.from(state.livePositions.values()));
+  } catch (e) {
+    console.error("livePositions 復元失敗:", e);
+  }
+}
+
+/**
+ * 緊急ロスカット番兵。pipeline と完全独立に動作。
+ * 含み損が EMERGENCY_LOSS_PERCENT を超えたら問答無用で全量売却。
+ * AI の HOLD 判断・MTF/EV フィルタ・確信度閾値をすべて無視する。
+ */
+async function emergencyLossCut(pair: string, currentPrice: number): Promise<boolean> {
+  if (state.paperMode) return false;
+  try {
+    const exchange = getExchange();
+    const realPos = await exchange.getPosition(pair);
+    if (realPos.free <= 0.0000001) return false;
+
+    const livePos = state.livePositions.get(pair);
+    if (!livePos || livePos.entryPrice <= 0) return false;
+
+    const lossPercent = ((currentPrice - livePos.entryPrice) / livePos.entryPrice) * 100;
+    if (lossPercent > -EMERGENCY_LOSS_PERCENT) return false;
+
+    console.log(
+      `[${pair}] 🚨 緊急ロスカット発動: 含み損 ${lossPercent.toFixed(2)}% (${-EMERGENCY_LOSS_PERCENT}% 閾値超え)`
+    );
+    const order = await exchange.marketSell(pair, realPos.free);
+    const pnl = (order.price - livePos.entryPrice) * order.amount;
+    const pnlPercent = ((order.price - livePos.entryPrice) / livePos.entryPrice) * 100;
+
+    const trade: TradeRecord = {
+      id: `emergency-${Date.now()}`,
+      timestamp: new Date().toISOString(),
+      exchange: "bitflyer",
+      pair,
+      side: "sell",
+      type: "stop_loss",
+      amount: order.amount,
+      price: order.price,
+      valueJPY: order.amount * order.price,
+      orderId: order.id,
+      fee: order.fee ?? 0,
+      pnl,
+      pnlPercent,
+      paperTrade: false,
+    };
+    state.recentTrades.push(trade);
+    state.liveTrades.push(trade);
+    state.riskManager.recordTrade(pnl);
+    state.livePositions.delete(pair);
+    await saveData("live-trades", state.liveTrades.slice(-200));
+    await saveData("live-positions", Array.from(state.livePositions.values()));
+    await recordOutcome(pair, order.price, pnl, pnlPercent).catch(() => {});
+    return true;
+  } catch (e) {
+    console.error(`[${pair}] 緊急ロスカット失敗:`, e);
+    return false;
+  }
+}
+
 async function recordNavSnapshot(): Promise<void> {
   const exchange = getExchange();
   await exchange.connect();
@@ -688,6 +825,8 @@ export async function startBot(options?: {
     await state.riskManager.init(jpyTotal);
     // 既存データ修復: dailyPnL を本日分のみに再計算
     await state.riskManager.recomputeDailyFromTrades(state.liveTrades);
+    // 重要: livePositions を BitFlyer 実残高から復元（SL/TP動作の前提）
+    await reconcileLivePositionsFromExchange();
     console.log(`Bot起動 | ライブ | 資金: ¥${jpyTotal.toLocaleString()} | ペア: ${state.pairs.join(", ")} | 間隔: ${state.intervalSeconds}秒`);
   }
 
