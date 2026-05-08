@@ -367,9 +367,10 @@ async function runCycleForPair(pair: string): Promise<void> {
     else if (decision.action === "SELL" && decision.confidence >= LIVE_CONFIDENCE_THRESHOLD && realPosition.free > 0) {
       try {
         const order = await liveExchange.marketSell(pair, realPosition.free);
+        const fillPrice = order.price > 0 ? order.price : ticker.price;
         const entryPrice = livePos?.entryPrice ?? 0;
-        const pnl = entryPrice > 0 ? (order.price - entryPrice) * order.amount : 0;
-        const pnlPercent = entryPrice > 0 ? ((order.price - entryPrice) / entryPrice) * 100 : 0;
+        const pnl = entryPrice > 0 ? (fillPrice - entryPrice) * order.amount : 0;
+        const pnlPercent = entryPrice > 0 ? ((fillPrice - entryPrice) / entryPrice) * 100 : 0;
 
         const trade: TradeRecord = {
           id: `live-${Date.now()}`,
@@ -379,8 +380,8 @@ async function runCycleForPair(pair: string): Promise<void> {
           side: "sell",
           type: "market",
           amount: order.amount,
-          price: order.price,
-          valueJPY: order.amount * order.price,
+          price: fillPrice,
+          valueJPY: order.amount * fillPrice,
           orderId: order.id,
           fee: order.fee ?? 0,
           pnl,
@@ -397,7 +398,7 @@ async function runCycleForPair(pair: string): Promise<void> {
         await saveData("live-positions", Array.from(state.livePositions.values()));
         console.log(`[${pair}] LIVE SELL: 損益 ¥${pnl.toLocaleString()} (${pnlPercent.toFixed(1)}%)`);
         // 監査ログに結果を記録（改善ループ用）
-        await recordOutcome(pair, order.price, pnl, pnlPercent).catch(() => {});
+        await recordOutcome(pair, fillPrice, pnl, pnlPercent).catch(() => {});
       } catch (e) {
         console.error(`[${pair}] LIVE SELL 失敗:`, e);
       }
@@ -444,8 +445,10 @@ async function runCycleForPair(pair: string): Promise<void> {
       if (triggerType) {
         try {
           const order = await liveExchange.marketSell(pair, realPosition.free);
-          const pnl = (order.price - livePos.entryPrice) * order.amount;
-          const pnlPercent = ((order.price - livePos.entryPrice) / livePos.entryPrice) * 100;
+          // BitFlyer (ccxt) は order.average を 0 で返すことがある。ticker.price で代替。
+          const fillPrice = order.price > 0 ? order.price : ticker.price;
+          const pnl = (fillPrice - livePos.entryPrice) * order.amount;
+          const pnlPercent = ((fillPrice - livePos.entryPrice) / livePos.entryPrice) * 100;
 
           const trade: TradeRecord = {
             id: `live-${Date.now()}`,
@@ -455,8 +458,8 @@ async function runCycleForPair(pair: string): Promise<void> {
             side: "sell",
             type: triggerType,
             amount: order.amount,
-            price: order.price,
-            valueJPY: order.amount * order.price,
+            price: fillPrice,
+            valueJPY: order.amount * fillPrice,
             orderId: order.id,
             fee: order.fee ?? 0,
             pnl,
@@ -471,7 +474,7 @@ async function runCycleForPair(pair: string): Promise<void> {
           await saveData("live-trades", state.liveTrades.slice(-200));
           await saveData("live-positions", Array.from(state.livePositions.values()));
           console.log(`[${pair}] LIVE ${triggerType.toUpperCase()}: 損益 ¥${pnl.toLocaleString()} (${pnlPercent.toFixed(1)}%)`);
-          await recordOutcome(pair, order.price, pnl, pnlPercent).catch(() => {});
+          await recordOutcome(pair, fillPrice, pnl, pnlPercent).catch(() => {});
         } catch (e) {
           console.error(`[${pair}] LIVE ${triggerType.toUpperCase()} 失敗:`, e);
         }
@@ -718,8 +721,9 @@ async function emergencyLossCut(pair: string, currentPrice: number): Promise<boo
       `[${pair}] 🚨 緊急ロスカット発動: 含み損 ${lossPercent.toFixed(2)}% (${-EMERGENCY_LOSS_PERCENT}% 閾値超え)`
     );
     const order = await exchange.marketSell(pair, realPos.free);
-    const pnl = (order.price - livePos.entryPrice) * order.amount;
-    const pnlPercent = ((order.price - livePos.entryPrice) / livePos.entryPrice) * 100;
+    const fillPrice = order.price > 0 ? order.price : currentPrice;
+    const pnl = (fillPrice - livePos.entryPrice) * order.amount;
+    const pnlPercent = ((fillPrice - livePos.entryPrice) / livePos.entryPrice) * 100;
 
     const trade: TradeRecord = {
       id: `emergency-${Date.now()}`,
@@ -729,8 +733,8 @@ async function emergencyLossCut(pair: string, currentPrice: number): Promise<boo
       side: "sell",
       type: "stop_loss",
       amount: order.amount,
-      price: order.price,
-      valueJPY: order.amount * order.price,
+      price: fillPrice,
+      valueJPY: order.amount * fillPrice,
       orderId: order.id,
       fee: order.fee ?? 0,
       pnl,
@@ -743,7 +747,8 @@ async function emergencyLossCut(pair: string, currentPrice: number): Promise<boo
     state.livePositions.delete(pair);
     await saveData("live-trades", state.liveTrades.slice(-200));
     await saveData("live-positions", Array.from(state.livePositions.values()));
-    await recordOutcome(pair, order.price, pnl, pnlPercent).catch(() => {});
+    await recordOutcome(pair, fillPrice, pnl, pnlPercent).catch(() => {});
+    console.log(`[${pair}] 緊急ロスカット執行: 損益 ¥${Math.round(pnl).toLocaleString()} (${pnlPercent.toFixed(1)}%)`);
     return true;
   } catch (e) {
     console.error(`[${pair}] 緊急ロスカット失敗:`, e);
