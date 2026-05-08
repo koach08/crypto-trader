@@ -181,6 +181,48 @@ export function calibrateConfidence(
   };
 }
 
+// === Fear & Greed 中立帯フィルタ ===
+// F&G が中立 (25-75) の時はエッジが無いので新規エントリーを出さない。
+// 既存ポジションの SL/TP は別経路 (本フィルタの対象外)。
+
+export interface SentimentEdgeCheck {
+  passed: boolean;
+  fearGreed: number;
+  reason: string;
+}
+
+export function checkSentimentEdge(
+  fearGreed: number,
+  intendedAction: "BUY" | "SELL" | "HOLD"
+): SentimentEdgeCheck {
+  if (intendedAction === "HOLD") {
+    return { passed: true, fearGreed, reason: "HOLD" };
+  }
+  // 極端な恐怖 (<=30) で BUY、極端な強欲 (>=70) で SELL のみ通す
+  if (intendedAction === "BUY" && fearGreed > 30) {
+    return {
+      passed: false,
+      fearGreed,
+      reason: `F&G ${fearGreed} は恐怖極端域 (≤30) ではなく、新規買いはエッジ薄`,
+    };
+  }
+  if (intendedAction === "SELL" && fearGreed < 70) {
+    return {
+      passed: false,
+      fearGreed,
+      reason: `F&G ${fearGreed} は強欲極端域 (≥70) ではなく、新規売りはエッジ薄`,
+    };
+  }
+  return {
+    passed: true,
+    fearGreed,
+    reason:
+      intendedAction === "BUY"
+        ? `F&G ${fearGreed} 恐怖域 (≤30)、逆張り買いの伝統的エッジ`
+        : `F&G ${fearGreed} 強欲域 (≥70)、利確局面`,
+  };
+}
+
 // === 4. トレーリングストップ ===
 
 export interface TrailingStopResult {

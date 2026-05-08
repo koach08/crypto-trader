@@ -46,12 +46,17 @@ interface ScoringResult {
 }
 
 // ソースごとの重み（合計100%）
+// Alpha Arena 教訓を反映: AI ウェイトを 25% → 10% に下げ、quant/regime を強化
 const WEIGHTS = {
-  quant: 0.40,
-  ai: 0.25,
+  quant: 0.45,
+  ai: 0.10,        // AI は veto 寄り、メインドライバーから外す
   technical: 0.20,
-  regime: 0.15,
+  regime: 0.25,    // レジームを大きめにして「市場の方向に逆らわない」
 };
+
+// エッジが無い時はトレードしない: より厳しい閾値
+const MIN_ABS_SCORE = 25;       // 旧 15 → 25 (低エッジ取引を排除)
+const MIN_AGREEMENT = 0.75;      // 旧 0.50 → 0.75 (3/4以上の一致が必要)
 
 /** AI判断をスコアに変換 */
 function aiToScore(action: CryptoAction, confidence: number): number {
@@ -113,8 +118,8 @@ export function calculateFinalDecision(input: ScoringInput): ScoringResult {
   let action: CryptoAction;
   const absScore = Math.abs(compositeScore);
 
-  if (absScore < 15 || agreement < 0.5) {
-    // スコアが弱いか、ソース間で意見が割れてる → HOLD
+  if (absScore < MIN_ABS_SCORE || agreement < MIN_AGREEMENT) {
+    // スコアが弱いか、ソース間で意見が割れてる → HOLD (エッジ無し)
     action = "HOLD";
   } else if (compositeScore > 0) {
     action = "BUY";

@@ -279,6 +279,54 @@ function volatilityState(bars: OHLCVBar[]): QuantSignal {
   };
 }
 
+/** ATRブレイクアウト: 直近20本高値/安値 + ATR×0.3 を超えるトレンド継続シグナル */
+function atrBreakout(bars: OHLCVBar[]): QuantSignal {
+  const closes = bars.map(b => b.close);
+  const highs = bars.map(b => b.high);
+  const lows = bars.map(b => b.low);
+  const atrVals = atr(highs, lows, closes, 14);
+  const currentATR = atrVals[atrVals.length - 1];
+  const price = closes[closes.length - 1];
+
+  if (currentATR === null || closes.length < 21 || price <= 0) {
+    return { name: "ATRブレイクアウト", score: 0, confidence: 0, reason: "データ不足", factors: {} };
+  }
+
+  const lookback = 20;
+  const recentHighs = highs.slice(-lookback - 1, -1); // 現在を除く20本
+  const recentLows = lows.slice(-lookback - 1, -1);
+  const breakoutHigh = Math.max(...recentHighs);
+  const breakoutLow = Math.min(...recentLows);
+  const buffer = currentATR * 0.3;
+
+  let score = 0;
+  let reason = "";
+
+  if (price > breakoutHigh + buffer) {
+    score = 70;
+    reason = `${lookback}本高値¥${Math.round(breakoutHigh).toLocaleString()} + ATR×0.3 を超えるブレイクアウト`;
+  } else if (price < breakoutLow - buffer) {
+    score = -70;
+    reason = `${lookback}本安値¥${Math.round(breakoutLow).toLocaleString()} - ATR×0.3 を割るブレイクダウン`;
+  } else {
+    const rangePosition = ((price - breakoutLow) / (breakoutHigh - breakoutLow)) * 100;
+    reason = `レンジ内 (${lookback}本: ¥${Math.round(breakoutLow).toLocaleString()}〜¥${Math.round(breakoutHigh).toLocaleString()}, 位置${rangePosition.toFixed(0)}%)`;
+  }
+
+  return {
+    name: "ATRブレイクアウト",
+    score,
+    confidence: 80,
+    reason,
+    factors: {
+      price: Number(price.toFixed(2)),
+      breakoutHigh: Number(breakoutHigh.toFixed(2)),
+      breakoutLow: Number(breakoutLow.toFixed(2)),
+      atr: Number(currentATR.toFixed(2)),
+    },
+  };
+}
+
 // === メインの合成関数 ===
 
 export const BASELINE_SIGNAL_WEIGHTS: Record<string, number> = {
@@ -287,6 +335,7 @@ export const BASELINE_SIGNAL_WEIGHTS: Record<string, number> = {
   "モメンタム": 1.2,
   "出来高異常": 0.6,
   "ボラティリティ": 0.5,
+  "ATRブレイクアウト": 1.5, // 新規、最高ウェイト
 };
 
 // 学習されたウェイト (Phase 2 自己改善ループで上書き)
@@ -307,6 +356,7 @@ export function runQuantAnalysis(bars: OHLCVBar[]): QuantAnalysis {
     momentumTrend(bars),
     volumeAnomaly(bars),
     volatilityState(bars),
+    atrBreakout(bars),
   ];
 
   // 加重平均スコア（信頼度も加味、学習済みweightsを使用）
