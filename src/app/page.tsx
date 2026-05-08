@@ -117,6 +117,18 @@ interface DiagnosticsResponse {
   sample: { timestamp: string; pair: string; action: string; confidence: number; reason: string }[];
 }
 
+interface LearningResponse {
+  active: Record<string, number>;
+  summary: {
+    baseline: Record<string, number>;
+    learned: Record<string, number>;
+    perSignal: { name: string; total: number; correct: number; accuracy: number; weightMultiplier: number }[];
+    totalAudits: number;
+    completedAudits: number;
+    ready: boolean;
+  };
+}
+
 const ACCENT = { green: "#22c55e", red: "#ef4444", blue: "#3b82f6", purple: "#8b5cf6", amber: "#f59e0b", cyan: "#06b6d4" };
 const PIE_COLORS = [ACCENT.blue, ACCENT.purple, ACCENT.cyan, ACCENT.amber, ACCENT.green];
 
@@ -140,6 +152,7 @@ export default function Dashboard() {
   const [lifetimeLoading, setLifetimeLoading] = useState(false);
   const [nav, setNav] = useState<NavResponse | null>(null);
   const [diagnostics, setDiagnostics] = useState<DiagnosticsResponse | null>(null);
+  const [learning, setLearning] = useState<LearningResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [activePair, setActivePair] = useState("ETH/JPY");
 
@@ -238,19 +251,33 @@ export default function Dashboard() {
     }
   }, []);
 
+  const fetchLearning = useCallback(async () => {
+    try {
+      const res = await fetch("/api/bot/learning");
+      if (res.ok) {
+        const data = (await res.json()) as LearningResponse;
+        setLearning(data);
+      }
+    } catch (e) {
+      console.error("learning fetch失敗:", e);
+    }
+  }, []);
+
   useEffect(() => {
     fetchData();
     fetchSlowData();
     fetchLifetime();
     fetchNav();
     fetchDiagnostics();
+    fetchLearning();
     const fast = setInterval(fetchData, 15000);
     const slow = setInterval(fetchSlowData, 300000); // 5分ごと
     const navInt = setInterval(fetchNav, 60_000); // 1分ごと
     const diagInt = setInterval(fetchDiagnostics, 60_000); // 1分ごと
+    const learnInt = setInterval(fetchLearning, 5 * 60_000); // 5分ごと
     const lifeInt = setInterval(() => fetchLifetime(), 30 * 60 * 1000); // 30分ごと
-    return () => { clearInterval(fast); clearInterval(slow); clearInterval(navInt); clearInterval(diagInt); clearInterval(lifeInt); };
-  }, [fetchData, fetchSlowData, fetchLifetime, fetchNav, fetchDiagnostics]);
+    return () => { clearInterval(fast); clearInterval(slow); clearInterval(navInt); clearInterval(diagInt); clearInterval(learnInt); clearInterval(lifeInt); };
+  }, [fetchData, fetchSlowData, fetchLifetime, fetchNav, fetchDiagnostics, fetchLearning]);
 
   if (loading) {
     return <div className="text-center py-20 text-zinc-500">読み込み中...</div>;
@@ -699,6 +726,61 @@ export default function Dashboard() {
               </div>
             ))}
           </div>
+        </div>
+      )}
+
+      {/* Phase 2 自己改善: シグナル別の実勝率と学習ウェイト */}
+      {learning && (
+        <div className="bg-zinc-900 rounded-xl p-4 border border-zinc-800">
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <h2 className="text-sm font-medium text-zinc-200">シグナル学習状態</h2>
+              <div className="text-[10px] text-zinc-600">
+                {learning.summary.ready
+                  ? `学習適用中 (完了取引${learning.summary.completedAudits}件)`
+                  : `データ蓄積中 (完了取引${learning.summary.completedAudits}件 / シグナル毎30件以上で発動)`}
+              </div>
+            </div>
+          </div>
+          <div className="space-y-1.5">
+            {learning.summary.perSignal.map((s) => {
+              const baseline = learning.summary.baseline[s.name] ?? 1.0;
+              const active = learning.active[s.name] ?? baseline;
+              const changed = Math.abs(active - baseline) > 0.01;
+              return (
+                <div key={s.name} className="flex items-center gap-2 text-xs bg-zinc-950/40 rounded px-3 py-1.5">
+                  <span className="font-medium text-zinc-300 w-32 shrink-0">{s.name}</span>
+                  <span className="text-zinc-500 w-20 shrink-0 font-mono">{s.correct}/{s.total}</span>
+                  <span
+                    className={`w-14 shrink-0 font-mono ${
+                      s.total < 30 ? "text-zinc-600" :
+                      s.accuracy > 0.55 ? "text-green-400" :
+                      s.accuracy < 0.45 ? "text-red-400" : "text-zinc-400"
+                    }`}
+                  >
+                    {s.total > 0 ? `${(s.accuracy * 100).toFixed(0)}%` : "—"}
+                  </span>
+                  <div className="flex-1 flex items-center gap-2">
+                    <span className="text-zinc-600 text-[10px]">基準 {baseline.toFixed(1)}</span>
+                    <span className="text-zinc-700">→</span>
+                    <span
+                      className={`text-[10px] font-mono ${
+                        changed ? (active > baseline ? "text-green-400" : "text-orange-400") : "text-zinc-500"
+                      }`}
+                    >
+                      実効 {active.toFixed(2)}
+                      {changed && (active > baseline ? " ▲" : " ▼")}
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          {!learning.summary.ready && (
+            <div className="text-[10px] text-zinc-700 mt-2">
+              監査ログが各シグナル30件以上溜まると自動的に重み調整が発動します。それまでは baseline ウェイトで運用。
+            </div>
+          )}
         </div>
       )}
 

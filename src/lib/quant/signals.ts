@@ -281,13 +281,24 @@ function volatilityState(bars: OHLCVBar[]): QuantSignal {
 
 // === メインの合成関数 ===
 
-const SIGNAL_WEIGHTS: Record<string, number> = {
+export const BASELINE_SIGNAL_WEIGHTS: Record<string, number> = {
   "RSI平均回帰": 1.0,
   "ボリンジャー逆張り": 0.8,
   "モメンタム": 1.2,
   "出来高異常": 0.6,
   "ボラティリティ": 0.5,
 };
+
+// 学習されたウェイト (Phase 2 自己改善ループで上書き)
+let activeSignalWeights: Record<string, number> = { ...BASELINE_SIGNAL_WEIGHTS };
+
+export function setActiveSignalWeights(weights: Record<string, number>): void {
+  activeSignalWeights = { ...BASELINE_SIGNAL_WEIGHTS, ...weights };
+}
+
+export function getActiveSignalWeights(): Record<string, number> {
+  return { ...activeSignalWeights };
+}
 
 export function runQuantAnalysis(bars: OHLCVBar[]): QuantAnalysis {
   const signals: QuantSignal[] = [
@@ -298,12 +309,12 @@ export function runQuantAnalysis(bars: OHLCVBar[]): QuantAnalysis {
     volatilityState(bars),
   ];
 
-  // 加重平均スコア（信頼度も加味）
+  // 加重平均スコア（信頼度も加味、学習済みweightsを使用）
   let weightedSum = 0;
   let weightTotal = 0;
   for (const sig of signals) {
     if (sig.confidence > 0) {
-      const w = (SIGNAL_WEIGHTS[sig.name] ?? 1.0) * (sig.confidence / 100);
+      const w = (activeSignalWeights[sig.name] ?? 1.0) * (sig.confidence / 100);
       weightedSum += sig.score * w;
       weightTotal += w;
     }

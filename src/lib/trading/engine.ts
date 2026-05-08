@@ -8,9 +8,10 @@ import { getFearGreedIndex } from "../ai/fear-greed";
 import { RiskManager } from "./risk-manager";
 import { PaperTrader } from "./paper-trader";
 import { loadData, saveData } from "../data";
-import { runQuantAnalysis } from "../quant/signals";
+import { runQuantAnalysis, BASELINE_SIGNAL_WEIGHTS, setActiveSignalWeights } from "../quant/signals";
 import { calculateFinalDecision } from "../quant/scoring-engine";
 import { saveAudit, recordOutcome, getAudits } from "../quant/audit-log";
+import { computeLearnedWeights } from "../quant/signal-learning";
 import { checkMTFAlignment, checkEdge, calibrateConfidence, computeTrailingStop } from "./discipline";
 import { atr as atrIndicator } from "../indicators";
 import { computeLifetimePnL } from "./lifetime";
@@ -636,6 +637,25 @@ async function runCycle(): Promise<void> {
       console.error("NAV snapshot 失敗:", e);
     }
   }
+
+  // Phase 2: 信号ウェイト学習を 24サイクル(=6時間)ごとに再計算
+  if (state.cycleCount % 24 === 0) {
+    try {
+      const audits = await getAudits(500);
+      const summary = computeLearnedWeights(audits, BASELINE_SIGNAL_WEIGHTS);
+      if (summary.ready) {
+        setActiveSignalWeights(summary.learned);
+        console.log(
+          `[learning] シグナルウェイト更新 (完了取引${summary.completedAudits}件):`,
+          Object.entries(summary.learned)
+            .map(([k, v]) => `${k}=${v.toFixed(2)}`)
+            .join(", ")
+        );
+      }
+    } catch (e) {
+      console.error("learning失敗:", e);
+    }
+  }
 }
 
 interface NavSnapshot {
@@ -852,6 +872,20 @@ export async function startBot(options?: {
     // 重要: livePositions を BitFlyer 実残高から復元（SL/TP動作の前提）
     await reconcileLivePositionsFromExchange();
     console.log(`Bot起動 | ライブ | 資金: ¥${jpyTotal.toLocaleString()} | ペア: ${state.pairs.join(", ")} | 間隔: ${state.intervalSeconds}秒`);
+  }
+
+  // Phase 2: 起動時にも学習済みウェイトを適用 (前回までの蓄積を引き継ぐ)
+  try {
+    const audits = await getAudits(500);
+    const summary = computeLearnedWeights(audits, BASELINE_SIGNAL_WEIGHTS);
+    if (summary.ready) {
+      setActiveSignalWeights(summary.learned);
+      console.log(`[learning] 起動時ウェイト適用 (完了取引${summary.completedAudits}件)`);
+    } else {
+      console.log(`[learning] サンプル不足 (完了取引${summary.completedAudits}件 < 30/シグナル)、baseline使用`);
+    }
+  } catch (e) {
+    console.error("[learning] 起動時失敗:", e);
   }
 
   // Run immediately
