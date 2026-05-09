@@ -637,9 +637,9 @@ export default function Dashboard() {
       <div className="bg-zinc-900 rounded-xl p-4 border border-zinc-800">
         <div className="flex items-center justify-between mb-3">
           <div>
-            <h2 className="text-sm font-medium text-zinc-200">BitFlyer 生涯損益</h2>
+            <h2 className="text-sm font-medium text-zinc-200">Bot 取引履歴 損益 (BTC/ETH/XRP)</h2>
             <div className="text-[10px] text-zinc-600">
-              取引所APIの全約定履歴からFIFO計算 (Bot再起動でも消えない)
+              取引所APIの全約定履歴からFIFO計算。Bot対象ペア限定 (XLM/MONA等の口座保有は別)
             </div>
           </div>
           <button
@@ -686,22 +686,37 @@ export default function Dashboard() {
                   const unrealized = t && p.remainingInventory > 0 && p.averageBuyPrice > 0
                     ? (t.price - p.averageBuyPrice) * p.remainingInventory
                     : 0;
+                  const investedJPY = p.remainingInventory * p.averageBuyPrice;
+                  const currentJPY = t && p.remainingInventory > 0 ? p.remainingInventory * t.price : 0;
                   return (
-                    <div key={p.pair} className="flex items-center justify-between text-xs bg-zinc-950/40 rounded px-3 py-1.5 gap-2">
-                      <span className="font-medium text-zinc-300 w-12 shrink-0">{p.pair.split("/")[0]}</span>
-                      <span className="text-zinc-500 text-[10px] w-20 shrink-0">{p.closedTrades}回 ({p.wins}W{p.losses}L)</span>
-                      <span className="text-zinc-600 text-[10px] flex-1 text-right">
-                        残 {p.remainingInventory.toFixed(4)} @ avg ¥{Math.round(p.averageBuyPrice).toLocaleString()}
-                        {t && p.remainingInventory > 0 && (
-                          <span className="ml-1 text-zinc-500">→ 現在 ¥{Math.round(t.price).toLocaleString()}</span>
-                        )}
-                      </span>
-                      <span className={`font-mono w-20 text-right text-[11px] ${p.realizedPnL >= 0 ? "text-green-400" : "text-red-400"}`}>
-                        確定 {p.realizedPnL >= 0 ? "+" : ""}{Math.round(p.realizedPnL).toLocaleString()}
-                      </span>
-                      <span className={`font-mono w-20 text-right text-[11px] ${unrealized >= 0 ? "text-green-400" : "text-red-400"}`}>
-                        含み {unrealized >= 0 ? "+" : ""}{Math.round(unrealized).toLocaleString()}
-                      </span>
+                    <div key={p.pair} className="bg-zinc-950/40 rounded px-3 py-1.5 text-xs">
+                      <div className="flex items-center gap-2 mb-0.5">
+                        <span className="font-medium text-zinc-300 w-12 shrink-0">{p.pair.split("/")[0]}</span>
+                        <span className="text-zinc-500 text-[10px] w-20 shrink-0">{p.closedTrades}回 ({p.wins}W{p.losses}L)</span>
+                        <span className="text-zinc-300 flex-1 text-right">
+                          残 <span className="font-mono">{p.remainingInventory.toFixed(4)}</span>
+                          {p.remainingInventory > 0 && (
+                            <span className="text-zinc-500 ml-1.5">
+                              (投入 <span className="font-mono text-zinc-300">¥{Math.round(investedJPY).toLocaleString()}</span>
+                              {currentJPY > 0 && (
+                                <span> → 評価 <span className={`font-mono ${currentJPY >= investedJPY ? "text-green-400" : "text-red-400"}`}>¥{Math.round(currentJPY).toLocaleString()}</span></span>
+                              )})
+                            </span>
+                          )}
+                        </span>
+                        <span className={`font-mono w-20 text-right text-[11px] ${p.realizedPnL >= 0 ? "text-green-400" : "text-red-400"}`}>
+                          確定 {p.realizedPnL >= 0 ? "+" : ""}{Math.round(p.realizedPnL).toLocaleString()}
+                        </span>
+                        <span className={`font-mono w-20 text-right text-[11px] ${unrealized >= 0 ? "text-green-400" : "text-red-400"}`}>
+                          含み {unrealized >= 0 ? "+" : ""}{Math.round(unrealized).toLocaleString()}
+                        </span>
+                      </div>
+                      {p.remainingInventory > 0 && (
+                        <div className="text-[10px] text-zinc-600 ml-14">
+                          単価: 平均 ¥{Math.round(p.averageBuyPrice).toLocaleString()}/{p.pair.split("/")[0]}
+                          {t && (<span> · 現在 ¥{Math.round(t.price).toLocaleString()}/{p.pair.split("/")[0]}</span>)}
+                        </div>
+                      )}
                     </div>
                   );
                 })}

@@ -830,18 +830,17 @@ async function recordNavSnapshot(): Promise<void> {
 
   let cryptoValueJPY = 0;
   const positions: NavSnapshot["positions"] = {};
-  for (const pair of state.pairs) {
-    const base = pair.split("/")[0];
-    const bal = balance.find((b) => b.currency === base);
-    if (bal && bal.total > 0) {
-      try {
-        const t = await exchange.getTicker(pair);
-        const valueJPY = bal.total * t.price;
-        cryptoValueJPY += valueJPY;
-        positions[pair] = { amount: bal.total, price: t.price, valueJPY };
-      } catch {
-        // ticker取得失敗はスキップ
-      }
+  // 全暗号通貨残高を評価 (state.pairs に限らない、BTC/XLM/MONA等の dust も合算)
+  for (const bal of balance) {
+    if (bal.currency === "JPY" || bal.total <= 0.0000001) continue;
+    const pair = `${bal.currency}/JPY`;
+    try {
+      const t = await exchange.getTicker(pair);
+      const valueJPY = bal.total * t.price;
+      cryptoValueJPY += valueJPY;
+      positions[pair] = { amount: bal.total, price: t.price, valueJPY };
+    } catch {
+      // ticker取得失敗はスキップ
     }
   }
   const total = jpy + cryptoValueJPY;
