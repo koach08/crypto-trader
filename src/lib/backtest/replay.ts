@@ -130,9 +130,9 @@ export function runBacktest(config: BacktestConfig): BacktestResult {
     let reason = scoring.reason;
 
     // 3) 規律フィルタ
-    // F&G は Quant 強い (|score|≥35) ならスキップ (トレンドフォローモード)
+    // F&G は Quant 強い (|score|≥25) ならスキップ (トレンドフォローモード)
     if (action !== "HOLD") {
-      const quantStrong = Math.abs(quantAnalysis.compositeScore) >= 35;
+      const quantStrong = Math.abs(quantAnalysis.compositeScore) >= 25;
       if (!quantStrong) {
         const sent = checkSentimentEdge(fng, action);
         if (!sent.passed) action = "HOLD";

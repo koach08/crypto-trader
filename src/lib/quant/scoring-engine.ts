@@ -54,12 +54,11 @@ const WEIGHTS = {
   regime: 0.25,    // レジームを大きめにして「市場の方向に逆らわない」
 };
 
-// 取引閾値: 利益を出すには動かないと話にならない、ただし安易な取引はしない
-// - Quant 単独 ≥35 で発火 (RenTech 的な統計エッジ尊重)
-// - 中程度 (|composite|≥12) なら方向ソースの2/3以上 で発火
-const MIN_ABS_SCORE = 12;
-const MIN_AGREEMENT = 0.66;
-const QUANT_STRONG_OVERRIDE = 35;
+// 取引閾値: backtest で 1-4回/年と少なすぎたので機会拾える設定に
+// MTF/EV/SL/緊急ロスカット が下流で働くので入口は広めに。
+const MIN_ABS_SCORE = 10;
+const MIN_AGREEMENT = 0.51;          // 過半数 (50%超)
+const QUANT_STRONG_OVERRIDE = 25;    // Quant 単独 ≥25 で発火
 
 /** AI判断をスコアに変換 */
 function aiToScore(action: CryptoAction, confidence: number): number {
