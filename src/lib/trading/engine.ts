@@ -219,15 +219,22 @@ async function runCycleForPair(pair: string): Promise<void> {
     }
   }
 
-  // 1.5. F&G 中立帯フィルタ: エッジ無し局面は新規エントリー禁止
+  // 1.5. F&G 中立帯フィルタ: 中程度シグナル時のみ適用 (Quant 強気=単独でトレンドフォロー)
+  // Quant 単独で強力な時 (|score|≥35) は F&G を無視してトレンドフォロー
+  // バックテストで「F&G フィルタ厳格すぎて XRP 2y +195% を取りこぼす」と判明
   if (decision.action !== "HOLD") {
-    const sentiment = checkSentimentEdge(fearGreed.value, decision.action);
-    if (!sentiment.passed) {
-      disciplineNotes.push(`[F&G] ${sentiment.reason}`);
-      decision.action = "HOLD";
-      decision.confidence = Math.min(decision.confidence, 40);
+    const quantStrong = Math.abs(quantAnalysis.compositeScore) >= 35;
+    if (quantStrong) {
+      disciplineNotes.push(`[F&G] スキップ (Quant単独 ${quantAnalysis.compositeScore}pt 強い、トレンドフォローモード)`);
     } else {
-      disciplineNotes.push(`[F&G] ${sentiment.reason}`);
+      const sentiment = checkSentimentEdge(fearGreed.value, decision.action);
+      if (!sentiment.passed) {
+        disciplineNotes.push(`[F&G] ${sentiment.reason}`);
+        decision.action = "HOLD";
+        decision.confidence = Math.min(decision.confidence, 40);
+      } else {
+        disciplineNotes.push(`[F&G] ${sentiment.reason}`);
+      }
     }
   }
 
