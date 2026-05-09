@@ -54,9 +54,12 @@ const WEIGHTS = {
   regime: 0.25,    // レジームを大きめにして「市場の方向に逆らわない」
 };
 
-// エッジが無い時はトレードしない: より厳しい閾値
-const MIN_ABS_SCORE = 25;       // 旧 15 → 25 (低エッジ取引を排除)
-const MIN_AGREEMENT = 0.75;      // 旧 0.50 → 0.75 (3/4以上の一致が必要)
+// 取引閾値: 動かないbot と 負けるbot の中間を狙う
+// - Quant が強い (|score|≥50) なら他ソースの一致無視で単独発火 = STRONG_OVERRIDE
+// - 中程度 (|score|≥18) なら方向のあるソースの2/3以上 で発火
+const MIN_ABS_SCORE = 18;
+const MIN_AGREEMENT = 0.66;          // 方向あり ソースのうち 2/3 以上
+const QUANT_STRONG_OVERRIDE = 50;    // Quant単独でこの閾値超なら一致度無視
 
 /** AI判断をスコアに変換 */
 function aiToScore(action: CryptoAction, confidence: number): number {
@@ -96,16 +99,18 @@ export function calculateFinalDecision(input: ScoringInput): ScoringResult {
     techScore * WEIGHTS.technical +
     regimeResult.score * WEIGHTS.regime;
 
-  // 各ソースの一致度チェック（多数派がどれだけ揃ってるか）
+  // 各ソースの一致度チェック: 「方向のあるソース」のみカウント (HOLD/0は除外)
   const directions = [
     Math.sign(quantScore),
     Math.sign(aiScore),
     Math.sign(techScore),
     Math.sign(regimeResult.score),
   ];
-  const buyVotes = directions.filter(d => d > 0).length;
-  const sellVotes = directions.filter(d => d < 0).length;
-  const agreement = Math.max(buyVotes, sellVotes) / 4; // 0.25 ~ 1.0
+  const directional = directions.filter((d) => d !== 0);
+  const buyVotes = directional.filter((d) => d > 0).length;
+  const sellVotes = directional.filter((d) => d < 0).length;
+  const totalVotes = Math.max(1, directional.length);
+  const agreement = Math.max(buyVotes, sellVotes) / totalVotes;
 
   // 信頼度 = ソース一致度 × 平均信頼度
   const confidence = Math.round(
@@ -117,9 +122,14 @@ export function calculateFinalDecision(input: ScoringInput): ScoringResult {
   // 最終アクション決定
   let action: CryptoAction;
   const absScore = Math.abs(compositeScore);
+  const absQuant = Math.abs(quantScore);
 
-  if (absScore < MIN_ABS_SCORE || agreement < MIN_AGREEMENT) {
-    // スコアが弱いか、ソース間で意見が割れてる → HOLD (エッジ無し)
+  // STRONG_OVERRIDE: Quant単独で十分強い (絶対値≥50) なら一致度無視で発火
+  // (RenTech 的な統計ベース。「他ソースが追いついてないだけ」の場合の機会)
+  if (absQuant >= QUANT_STRONG_OVERRIDE) {
+    action = quantScore > 0 ? "BUY" : "SELL";
+  } else if (absScore < MIN_ABS_SCORE || agreement < MIN_AGREEMENT) {
+    // 中程度以下: スコア弱いか、方向ソース間で意見割れ → HOLD
     action = "HOLD";
   } else if (compositeScore > 0) {
     action = "BUY";

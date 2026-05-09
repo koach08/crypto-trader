@@ -198,19 +198,19 @@ export function checkSentimentEdge(
   if (intendedAction === "HOLD") {
     return { passed: true, fearGreed, reason: "HOLD" };
   }
-  // 極端な恐怖 (<=30) で BUY、極端な強欲 (>=70) で SELL のみ通す
-  if (intendedAction === "BUY" && fearGreed > 30) {
+  // 恐怖 (≤35) で BUY、強欲 (≥65) で SELL のみ通す。やや緩めに、機会を確保
+  if (intendedAction === "BUY" && fearGreed > 35) {
     return {
       passed: false,
       fearGreed,
-      reason: `F&G ${fearGreed} は恐怖極端域 (≤30) ではなく、新規買いはエッジ薄`,
+      reason: `F&G ${fearGreed} は恐怖域 (≤35) ではなく、新規買いはエッジ薄`,
     };
   }
-  if (intendedAction === "SELL" && fearGreed < 70) {
+  if (intendedAction === "SELL" && fearGreed < 65) {
     return {
       passed: false,
       fearGreed,
-      reason: `F&G ${fearGreed} は強欲極端域 (≥70) ではなく、新規売りはエッジ薄`,
+      reason: `F&G ${fearGreed} は強欲域 (≥65) ではなく、新規売りはエッジ薄`,
     };
   }
   return {
@@ -218,8 +218,8 @@ export function checkSentimentEdge(
     fearGreed,
     reason:
       intendedAction === "BUY"
-        ? `F&G ${fearGreed} 恐怖域 (≤30)、逆張り買いの伝統的エッジ`
-        : `F&G ${fearGreed} 強欲域 (≥70)、利確局面`,
+        ? `F&G ${fearGreed} 恐怖域 (≤35)、逆張り買いの伝統的エッジ`
+        : `F&G ${fearGreed} 強欲域 (≥65)、利確局面`,
   };
 }
 
