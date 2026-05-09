@@ -366,9 +366,7 @@ export default function Dashboard() {
   // 現在の運用元本推定: 累計買付金額 - 累計売却金額 + 残在庫の取得原価 = 投じた純額
   const lifetimeNetInflow =
     (lifetime?.summary.totalBuyVolumeJPY ?? 0) - (lifetime?.summary.totalSellVolumeJPY ?? 0);
-  const verdict: "WIN" | "LOSS" | "EVEN" =
-    Math.abs(lifetimeTotalPnL) < 100 || !lifetime ? "EVEN" :
-    lifetimeTotalPnL > 0 ? "WIN" : "LOSS";
+  // verdict ラベルは削除。色 (緑/赤) と数字でだけ表現する
 
   return (
     <div className="space-y-5">
@@ -389,21 +387,18 @@ export default function Dashboard() {
         <span className="text-xs text-zinc-600 ml-auto">Cycle #{status?.cycleCount ?? 0}</span>
       </div>
 
-      {/* 結論バナー: 勝ってるか負けてるか */}
+      {/* 累計損益バナー: 色だけで判定、文言は中立 */}
       {lifetime ? (
         <div className={`rounded-2xl p-5 border-2 ${
-          verdict === "WIN" ? "border-green-500/40 bg-gradient-to-br from-green-950/40 to-zinc-950" :
-          verdict === "LOSS" ? "border-red-500/40 bg-gradient-to-br from-red-950/40 to-zinc-950" :
+          lifetimeTotalPnL > 0 ? "border-green-500/40 bg-gradient-to-br from-green-950/40 to-zinc-950" :
+          lifetimeTotalPnL < 0 ? "border-red-500/40 bg-gradient-to-br from-red-950/40 to-zinc-950" :
           "border-zinc-700 bg-gradient-to-br from-zinc-900 to-zinc-950"
         }`}>
           <div className="flex items-start justify-between gap-3 flex-wrap">
             <div className="min-w-0">
               <div className="flex items-center gap-2 mb-1">
-                <span className={`text-xs font-bold tracking-widest uppercase ${
-                  verdict === "WIN" ? "text-green-400" :
-                  verdict === "LOSS" ? "text-red-400" : "text-zinc-400"
-                }`}>
-                  {verdict === "WIN" ? "勝ってる" : verdict === "LOSS" ? "負けてる" : "ほぼトントン"}
+                <span className="text-xs font-semibold text-zinc-400 uppercase tracking-wider">
+                  累計損益
                 </span>
                 <span className="text-[10px] text-zinc-600">
                   BitFlyer全期間 (確定 + 含み)
