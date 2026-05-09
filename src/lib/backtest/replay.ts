@@ -149,7 +149,7 @@ export function runBacktest(config: BacktestConfig): BacktestResult {
       reason += ` | ${mtf.reason}`;
     }
     if (action !== "HOLD") {
-      const edge = checkEdge(scoring.confidence, takeProfitPercent, 2.0);
+      const edge = checkEdge(scoring.confidence, takeProfitPercent, stopLossPercent);
       if (!edge.passed) action = "HOLD";
     }
 
