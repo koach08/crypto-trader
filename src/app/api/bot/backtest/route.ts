@@ -60,8 +60,10 @@ async function fetchFngHistory(): Promise<Map<string, number>> {
 export async function GET(req: NextRequest) {
   const url = new URL(req.url);
   const pair = url.searchParams.get("pair") ?? "BTC/JPY";
-  const range = url.searchParams.get("range") ?? "1y"; // 1y / 2y / 5y
+  const range = url.searchParams.get("range") ?? "1y";
   const initialCapital = Number(url.searchParams.get("capital") ?? "100000");
+  const tp = Number(url.searchParams.get("tp") ?? "10");
+  const sl = Number(url.searchParams.get("sl") ?? "2");
   const symbol = YAHOO_SYMBOLS[pair];
   if (!symbol) {
     return NextResponse.json({ error: `Unknown pair: ${pair}` }, { status: 400 });
@@ -86,6 +88,8 @@ export async function GET(req: NextRequest) {
       slippagePercent: 0.1,
       feePercent: 0.15,
       warmupBars: 50,
+      takeProfitPercent: tp,
+      stopLossPercent: sl,
     });
     // 出力サイズ削減: equity curve は均等サンプリング 100点
     const sampleStep = Math.max(1, Math.floor(result.equityCurve.length / 100));

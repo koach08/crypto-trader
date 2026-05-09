@@ -26,6 +26,7 @@ export interface BacktestConfig {
   warmupBars?: number;
   emergencyLossPercent?: number;
   takeProfitPercent?: number;
+  stopLossPercent?: number;
 }
 
 export interface SimTrade {
@@ -90,6 +91,7 @@ export function runBacktest(config: BacktestConfig): BacktestResult {
     warmupBars = 50,
     emergencyLossPercent = 5.0,
     takeProfitPercent = 10.0,
+    stopLossPercent = 2.0,
   } = config;
 
   if (bars.length < warmupBars + 5) {
@@ -195,8 +197,8 @@ export function runBacktest(config: BacktestConfig): BacktestResult {
         });
         position = null;
       }
-      // SL ガード (固定 -2%)
-      else if (currentChange <= -2.0) {
+      // SL ガード (config 指定)
+      else if (currentChange <= -stopLossPercent) {
         const fillPrice = nextBar.open * (1 - slippagePercent / 100);
         const proceeds = position.amount * fillPrice;
         const fee = proceeds * (feePercent / 100);
