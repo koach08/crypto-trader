@@ -1,8 +1,6 @@
 [build]
-# `npm ci` requires lock-perfect sync, but optional native deps like
-# @emnapi/* are only added to the lock when installing on Linux. Use
-# `npm install` so missing optional deps get fetched at deploy time.
-buildCommand = "npm install --no-audit --no-fund && npm run build"
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
 
 [deploy]
 healthcheckPath = "/api/health"
