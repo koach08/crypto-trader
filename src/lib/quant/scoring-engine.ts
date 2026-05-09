@@ -54,12 +54,12 @@ const WEIGHTS = {
   regime: 0.25,    // レジームを大きめにして「市場の方向に逆らわない」
 };
 
-// 取引閾値: 動かないbot と 負けるbot の中間を狙う
-// - Quant が強い (|score|≥50) なら他ソースの一致無視で単独発火 = STRONG_OVERRIDE
-// - 中程度 (|score|≥18) なら方向のあるソースの2/3以上 で発火
-const MIN_ABS_SCORE = 18;
-const MIN_AGREEMENT = 0.66;          // 方向あり ソースのうち 2/3 以上
-const QUANT_STRONG_OVERRIDE = 50;    // Quant単独でこの閾値超なら一致度無視
+// 取引閾値: 利益を出すには動かないと話にならない、ただし安易な取引はしない
+// - Quant 単独 ≥35 で発火 (RenTech 的な統計エッジ尊重)
+// - 中程度 (|composite|≥12) なら方向ソースの2/3以上 で発火
+const MIN_ABS_SCORE = 12;
+const MIN_AGREEMENT = 0.66;
+const QUANT_STRONG_OVERRIDE = 35;
 
 /** AI判断をスコアに変換 */
 function aiToScore(action: CryptoAction, confidence: number): number {
