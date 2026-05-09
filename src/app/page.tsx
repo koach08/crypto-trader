@@ -652,20 +652,27 @@ export default function Dashboard() {
         </div>
         {lifetime ? (
           <>
-            <div className="grid grid-cols-2 gap-2 mb-3">
+            <div className="grid grid-cols-3 gap-2 mb-3">
               <div className="bg-zinc-950/40 rounded-lg p-3">
-                <div className="text-[10px] text-zinc-500">確定損益（手数料控除後）</div>
-                <div className={`text-xl font-bold font-mono ${lifetime.summary.netRealizedPnL >= 0 ? "text-green-400" : "text-red-400"}`}>
-                  ¥{Math.round(lifetime.summary.netRealizedPnL).toLocaleString()}
+                <div className="text-[10px] text-zinc-500">確定損益 (決済済み)</div>
+                <div className={`text-lg font-bold font-mono ${lifetime.summary.netRealizedPnL >= 0 ? "text-green-400" : "text-red-400"}`}>
+                  {lifetime.summary.netRealizedPnL >= 0 ? "+" : ""}¥{Math.round(lifetime.summary.netRealizedPnL).toLocaleString()}
                 </div>
                 <div className="text-[10px] text-zinc-500">
                   決済 {lifetime.summary.closedTrades}回 (<span className="text-green-400">{lifetime.summary.wins}W</span> <span className="text-red-400">{lifetime.summary.losses}L</span>) WR {lifetime.summary.winRate.toFixed(0)}%
                 </div>
               </div>
               <div className="bg-zinc-950/40 rounded-lg p-3">
-                <div className="text-[10px] text-zinc-500">総売買代金 / 手数料</div>
-                <div className="text-base font-mono text-zinc-200">
-                  ¥{Math.round(lifetime.summary.totalBuyVolumeJPY + lifetime.summary.totalSellVolumeJPY).toLocaleString()}
+                <div className="text-[10px] text-zinc-500">含み損益 (残在庫)</div>
+                <div className={`text-lg font-bold font-mono ${lifetimeUnrealized >= 0 ? "text-green-400" : "text-red-400"}`}>
+                  {lifetimeUnrealized >= 0 ? "+" : ""}¥{Math.round(lifetimeUnrealized).toLocaleString()}
+                </div>
+                <div className="text-[10px] text-zinc-500">現在価格で評価</div>
+              </div>
+              <div className="bg-zinc-950/40 rounded-lg p-3">
+                <div className="text-[10px] text-zinc-500">合計 (確定+含み)</div>
+                <div className={`text-lg font-bold font-mono ${lifetimeTotalPnL >= 0 ? "text-green-400" : "text-red-400"}`}>
+                  {lifetimeTotalPnL >= 0 ? "+" : ""}¥{Math.round(lifetimeTotalPnL).toLocaleString()}
                 </div>
                 <div className="text-[10px] text-zinc-500">
                   手数料 ¥{Math.round(lifetime.summary.totalFees).toLocaleString()} / 約定 {lifetime.summary.executionCount}件
@@ -674,16 +681,30 @@ export default function Dashboard() {
             </div>
             {lifetime.summary.byPair.length > 0 && (
               <div className="space-y-1">
-                {lifetime.summary.byPair.map((p) => (
-                  <div key={p.pair} className="flex items-center justify-between text-xs bg-zinc-950/40 rounded px-3 py-1.5">
-                    <span className="font-medium text-zinc-300 w-20">{p.pair.split("/")[0]}</span>
-                    <span className="text-zinc-500 w-28 text-right">{p.closedTrades}回 ({p.wins}W{p.losses}L)</span>
-                    <span className="text-zinc-600 text-[10px] w-32 text-right">残在庫 {p.remainingInventory.toFixed(4)}</span>
-                    <span className={`font-mono font-bold w-24 text-right ${p.realizedPnL >= 0 ? "text-green-400" : "text-red-400"}`}>
-                      ¥{Math.round(p.realizedPnL).toLocaleString()}
-                    </span>
-                  </div>
-                ))}
+                {lifetime.summary.byPair.map((p) => {
+                  const t = tickers[p.pair];
+                  const unrealized = t && p.remainingInventory > 0 && p.averageBuyPrice > 0
+                    ? (t.price - p.averageBuyPrice) * p.remainingInventory
+                    : 0;
+                  return (
+                    <div key={p.pair} className="flex items-center justify-between text-xs bg-zinc-950/40 rounded px-3 py-1.5 gap-2">
+                      <span className="font-medium text-zinc-300 w-12 shrink-0">{p.pair.split("/")[0]}</span>
+                      <span className="text-zinc-500 text-[10px] w-20 shrink-0">{p.closedTrades}回 ({p.wins}W{p.losses}L)</span>
+                      <span className="text-zinc-600 text-[10px] flex-1 text-right">
+                        残 {p.remainingInventory.toFixed(4)} @ avg ¥{Math.round(p.averageBuyPrice).toLocaleString()}
+                        {t && p.remainingInventory > 0 && (
+                          <span className="ml-1 text-zinc-500">→ 現在 ¥{Math.round(t.price).toLocaleString()}</span>
+                        )}
+                      </span>
+                      <span className={`font-mono w-20 text-right text-[11px] ${p.realizedPnL >= 0 ? "text-green-400" : "text-red-400"}`}>
+                        確定 {p.realizedPnL >= 0 ? "+" : ""}{Math.round(p.realizedPnL).toLocaleString()}
+                      </span>
+                      <span className={`font-mono w-20 text-right text-[11px] ${unrealized >= 0 ? "text-green-400" : "text-red-400"}`}>
+                        含み {unrealized >= 0 ? "+" : ""}{Math.round(unrealized).toLocaleString()}
+                      </span>
+                    </div>
+                  );
+                })}
               </div>
             )}
             <div className="text-[10px] text-zinc-700 mt-2">
