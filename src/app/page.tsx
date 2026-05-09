@@ -91,6 +91,7 @@ interface NavSnapshot {
   jpy: number;
   cryptoValueJPY: number;
   total: number;
+  positions?: Record<string, { amount: number; price: number; valueJPY: number }>;
 }
 
 interface NavDelta {
@@ -325,17 +326,19 @@ export default function Dashboard() {
   const cum = data?.cumulativePnL;
   const status = data?.status;
 
-  // ポートフォリオ構成データ
-  const balanceData = Object.entries(tickers)
-    .filter(([, t]) => t.price > 0)
-    .map(([pair, t]) => {
-      const pos = data?.positions?.find(p => p.pair === pair);
-      const value = pos ? pos.amount * t.price : 0;
-      return { name: pair.split("/")[0], value: Math.round(value) };
-    })
-    .filter(d => d.value > 0);
-  const jpyFree = pnl?.startCapitalJPY ? pnl.startCapitalJPY - balanceData.reduce((s, d) => s + d.value, 0) : 0;
-  if (jpyFree > 0) balanceData.unshift({ name: "JPY", value: Math.round(jpyFree) });
+  // ポートフォリオ構成データ: NAV API (全currency集計済み) から構築。
+  // 旧コードは state.livePositions (state.pairs限定) しか出してなかった
+  const balanceData: { name: string; value: number }[] = [];
+  if (nav?.current) {
+    if (nav.current.jpy > 0) {
+      balanceData.push({ name: "JPY", value: Math.round(nav.current.jpy) });
+    }
+    for (const [pair, p] of Object.entries(nav.current.positions ?? {})) {
+      if (p.valueJPY > 0.01) {
+        balanceData.push({ name: pair.split("/")[0], value: Math.round(p.valueJPY) });
+      }
+    }
+  }
 
   // 価格チャート用データ
   const chartBars = (priceHistory[activePair] || []).map(b => ({
