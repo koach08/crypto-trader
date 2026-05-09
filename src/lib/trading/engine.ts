@@ -35,6 +35,12 @@ const DCA_ENABLED = false;
 const DCA_AMOUNT_JPY = 0;
 const DCA_INTERVAL_CYCLES = 999;
 
+// === Profit-First モード ===
+// crypto は手数料 0.30% 往復なので TP/SL は株より広めに
+const PROFIT_FIRST_TP_PERCENT = 2.0;
+const PROFIT_FIRST_SL_PERCENT = 1.0;
+const DAILY_TARGET_PERCENT = 0.3; // 元金の 0.3%/日 = ¥230 (¥77K想定)
+
 // ライブポジション追跡（エントリー価格・SL/TPを保持）
 interface LivePositionEntry {
   pair: string;
@@ -339,6 +345,13 @@ async function runCycleForPair(pair: string): Promise<void> {
 
     // BUY判断
     if (decision.action === "BUY" && decision.confidence >= LIVE_CONFIDENCE_THRESHOLD) {
+      // Profit-First: 日次目標達成済みなら新規エントリー停止 (利益を守る)
+      const dailyPnL = state.riskManager.getDailyPnL();
+      const dailyTargetJPY = (dailyPnL.startCapitalJPY * DAILY_TARGET_PERCENT) / 100;
+      if (dailyPnL.realizedPnL >= dailyTargetJPY && dailyTargetJPY > 0) {
+        console.log(`[${pair}] BUY見送り: 本日目標達成 ¥${Math.round(dailyPnL.realizedPnL).toLocaleString()} ≥ ¥${Math.round(dailyTargetJPY).toLocaleString()}`);
+        return;
+      }
       const balance = await liveExchange.getBalance();
       const jpyFree = balance.find(b => b.currency === "JPY")?.free ?? 0;
       const tradeAmount = state.riskManager.calculatePositionSizeJPY(
@@ -369,24 +382,23 @@ async function runCycleForPair(pair: string): Promise<void> {
           state.recentTrades.push(trade);
           state.liveTrades.push(trade);
 
-          // ポジション追跡（平均取得単価を計算）
+          // ポジション追跡（Profit-First TP/SL を強制採用）
           const existing = state.livePositions.get(pair);
           if (existing) {
             const totalAmount = existing.amount + order.amount;
             const avgPrice = (existing.entryPrice * existing.amount + order.price * order.amount) / totalAmount;
             existing.entryPrice = avgPrice;
             existing.amount = totalAmount;
-            // SL は緩めない（既存がトレーリング中なら既存を保持、新提案の方が厳しければ採用）
-            existing.stopLossPercent = Math.min(existing.stopLossPercent, decision.suggestedStopLossPercent);
-            existing.takeProfitPercent = decision.suggestedTakeProfitPercent;
+            existing.stopLossPercent = PROFIT_FIRST_SL_PERCENT;
+            existing.takeProfitPercent = PROFIT_FIRST_TP_PERCENT;
           } else {
             state.livePositions.set(pair, {
               pair,
               entryPrice: order.price,
               amount: order.amount,
               entryTimestamp: new Date().toISOString(),
-              stopLossPercent: decision.suggestedStopLossPercent,
-              takeProfitPercent: decision.suggestedTakeProfitPercent,
+              stopLossPercent: PROFIT_FIRST_SL_PERCENT,
+              takeProfitPercent: PROFIT_FIRST_TP_PERCENT,
             });
           }
 
