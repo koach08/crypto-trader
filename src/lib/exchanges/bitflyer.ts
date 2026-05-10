@@ -111,7 +111,7 @@ export class BitFlyerExchange implements IExchange {
       if (attempt === 0) await new Promise(r => setTimeout(r, 1000));
     }
 
-    // Fallback: CoinGecko simple price (returns minimal data but prevents RSI=100 / zero values)
+    // Fallback 1: CoinGecko (Railway IPはレート制限されやすい)
     try {
       const cgId = base === "BTC" ? "bitcoin" : base === "ETH" ? "ethereum" : base === "XRP" ? "ripple" : base.toLowerCase();
       const cgQuote = quote.toLowerCase();
@@ -119,21 +119,58 @@ export class BitFlyerExchange implements IExchange {
         `https://api.coingecko.com/api/v3/coins/${cgId}/ohlc?vs_currency=${cgQuote}&days=4`,
         { signal: AbortSignal.timeout(15000) }
       );
-      if (!resp.ok) return []; // Throttled or error - silently return empty
-      const ohlc = await resp.json();
-      if (Array.isArray(ohlc) && ohlc.length > 0) {
-        return ohlc.slice(-limit).map((bar: number[]) => ({
-          time: Math.floor(bar[0] / 1000),
-          open: bar[1],
-          high: bar[2],
-          low: bar[3],
-          close: bar[4],
-          volumefrom: 0,
-        }));
+      if (resp.ok) {
+        const ohlc = await resp.json();
+        if (Array.isArray(ohlc) && ohlc.length > 0) {
+          return ohlc.slice(-limit).map((bar: number[]) => ({
+            time: Math.floor(bar[0] / 1000),
+            open: bar[1],
+            high: bar[2],
+            low: bar[3],
+            close: bar[4],
+            volumefrom: 0,
+          }));
+        }
       }
-    } catch {
-      // CoinGecko throttle - silent fail, not critical
-    }
+    } catch { /* fall through */ }
+
+    // Fallback 2: Yahoo Finance (Railway IPで動作確認済み)
+    try {
+      const symbol = `${base}-${quote}`;
+      const range = "1mo";
+      const interval = "1h";
+      const resp = await fetch(
+        `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=${range}&interval=${interval}`,
+        {
+          signal: AbortSignal.timeout(15000),
+          headers: { "User-Agent": "Mozilla/5.0 crypto-trader" },
+        }
+      );
+      if (!resp.ok) return [];
+      const json = await resp.json();
+      const r = json?.chart?.result?.[0];
+      if (!r) return [];
+      const ts: number[] = r.timestamp ?? [];
+      const q = r.indicators?.quote?.[0];
+      if (!q) return [];
+      const bars: { time: number; open: number; high: number; low: number; close: number; volumefrom: number }[] = [];
+      for (let i = 0; i < ts.length; i++) {
+        const close = q.close?.[i];
+        if (close == null) continue;
+        bars.push({
+          time: ts[i],
+          open: q.open?.[i] ?? close,
+          high: q.high?.[i] ?? close,
+          low: q.low?.[i] ?? close,
+          close,
+          volumefrom: q.volume?.[i] ?? 0,
+        });
+      }
+      if (bars.length > 0) {
+        console.log(`[bitflyer] Yahoo fallback for ${base}/${quote}: ${bars.length} bars`);
+        return bars.slice(-limit);
+      }
+    } catch { /* return empty */ }
 
     return [];
   }
