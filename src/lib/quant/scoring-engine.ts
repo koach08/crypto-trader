@@ -54,11 +54,11 @@ const WEIGHTS = {
   regime: 0.25,    // レジームを大きめにして「市場の方向に逆らわない」
 };
 
-// 取引閾値: backtest で 1-4回/年と少なすぎたので機会拾える設定に
-// MTF/EV/SL/緊急ロスカット が下流で働くので入口は広めに。
-const MIN_ABS_SCORE = 10;
-const MIN_AGREEMENT = 0.51;          // 過半数 (50%超)
-const QUANT_STRONG_OVERRIDE = 25;    // Quant 単独 ≥25 で発火
+// 取引閾値: 「動かない bot は人間以下」。動く方向で全面緩和。
+// 負け筋ガード = TP/SL/緊急ロスカット/MTF/EV が下流で効くので入口は広めに。
+const MIN_ABS_SCORE = 8;
+const MIN_AGREEMENT = 0.51;          // 過半数
+const QUANT_STRONG_OVERRIDE = 15;    // Quant 単独 ≥15 で発火
 
 /** AI判断をスコアに変換 */
 function aiToScore(action: CryptoAction, confidence: number): number {

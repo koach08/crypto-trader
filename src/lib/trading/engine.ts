@@ -225,22 +225,10 @@ async function runCycleForPair(pair: string): Promise<void> {
     }
   }
 
-  // 1.5. F&G 中立帯フィルタ: 中程度シグナル時のみ適用 (Quant 強気=単独でトレンドフォロー)
-  // Quant 単独で強力な時 (|score|≥25) は F&G を無視してトレンドフォロー
+  // 1.5. F&G フィルタは無効化 (本番運用で「動かない bot」原因の主因だった)
+  // F&G 値は audit log に残すが、エントリー gating には使わない
   if (decision.action !== "HOLD") {
-    const quantStrong = Math.abs(quantAnalysis.compositeScore) >= 25;
-    if (quantStrong) {
-      disciplineNotes.push(`[F&G] スキップ (Quant単独 ${quantAnalysis.compositeScore}pt 強い、トレンドフォローモード)`);
-    } else {
-      const sentiment = checkSentimentEdge(fearGreed.value, decision.action);
-      if (!sentiment.passed) {
-        disciplineNotes.push(`[F&G] ${sentiment.reason}`);
-        decision.action = "HOLD";
-        decision.confidence = Math.min(decision.confidence, 40);
-      } else {
-        disciplineNotes.push(`[F&G] ${sentiment.reason}`);
-      }
-    }
+    disciplineNotes.push(`[F&G] ${fearGreed.value} ${fearGreed.label} (フィルタOFF)`);
   }
 
   // 2. マルチタイムフレーム整合性: h1の判断がh4トレンドと逆なら見送り

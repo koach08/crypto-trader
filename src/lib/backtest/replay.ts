@@ -27,6 +27,12 @@ export interface BacktestConfig {
   emergencyLossPercent?: number;
   takeProfitPercent?: number;
   stopLossPercent?: number;
+  // フィルタ調整 (override 用)
+  fngBuyThreshold?: number;       // 例: 35 (≤これで BUY 通す)、999 で実質無効
+  fngSellThreshold?: number;      // 例: 65 (≥これで SELL 通す)、0 で実質無効
+  quantOverrideThreshold?: number; // 例: 25 (|quant|≥これで F&G スキップ)
+  skipMTF?: boolean;
+  skipEV?: boolean;
 }
 
 export interface SimTrade {
@@ -92,6 +98,11 @@ export function runBacktest(config: BacktestConfig): BacktestResult {
     emergencyLossPercent = 5.0,
     takeProfitPercent = 10.0,
     stopLossPercent = 2.0,
+    fngBuyThreshold = 35,
+    fngSellThreshold = 65,
+    quantOverrideThreshold = 25,
+    skipMTF = false,
+    skipEV = false,
   } = config;
 
   if (bars.length < warmupBars + 5) {
