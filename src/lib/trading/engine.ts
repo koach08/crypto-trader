@@ -125,8 +125,18 @@ ensureDataLoaded();
 async function runCycleForPair(pair: string): Promise<void> {
   const STEP = (n: string) => console.log(`[${pair}] step:${n}`);
   STEP("0-start");
-  const exchange = getExchange();
-  await exchange.connect();
+  let exchange;
+  try {
+    exchange = getExchange();
+    STEP("0a-got-exchange");
+    await exchange.connect();
+    STEP("0b-connected-success");
+  } catch (e) {
+    const err = e instanceof Error ? e : new Error(String(e));
+    console.error(`[${pair}] CONNECT 失敗: ${err.name}: ${err.message}`);
+    console.error(`CONNECT_STACK: ${err.stack}`);
+    throw e;
+  }
   STEP("1-connected");
 
   // Check circuit breaker
