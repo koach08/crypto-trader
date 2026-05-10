@@ -123,8 +123,11 @@ async function ensureDataLoaded(): Promise<void> {
 ensureDataLoaded();
 
 async function runCycleForPair(pair: string): Promise<void> {
+  const STEP = (n: string) => console.log(`[${pair}] step:${n}`);
+  STEP("0-start");
   const exchange = getExchange();
   await exchange.connect();
+  STEP("1-connected");
 
   // Check circuit breaker
   if (state.riskManager.isCircuitBroken()) {
@@ -133,6 +136,7 @@ async function runCycleForPair(pair: string): Promise<void> {
   }
 
   // Fetch data
+  STEP("2-fetch-start");
   const [ticker, bars, balance, position, fearGreed] = await Promise.all([
     exchange.getTicker(pair),
     exchange.getOHLCV(pair, "1h", 100),
@@ -140,10 +144,12 @@ async function runCycleForPair(pair: string): Promise<void> {
     exchange.getPosition(pair),
     getFearGreedIndex(),
   ]);
+  STEP(`3-fetched price=${ticker?.price} bars=${bars?.length} fng=${fearGreed?.value}`);
 
   // === 緊急ロスカット番兵: pipeline 前に独立判定 ===
   // AI 判断・規律フィルタ・確信度閾値とは無関係に、含み損が閾値超えたら強制売却
   if (!state.paperMode) {
+    STEP("4a-emergency-check");
     const cut = await emergencyLossCut(pair, ticker.price);
     if (cut) {
       console.log(`[${pair}] 緊急ロスカット後はサイクル終了`);
@@ -152,10 +158,13 @@ async function runCycleForPair(pair: string): Promise<void> {
   }
 
   // Technical analysis
+  STEP("5-tech-signal");
   const signal = generateCryptoSignal(bars);
 
   // レジーム検出（相場タイプ判定）
+  STEP("6-regime");
   const regime = detectRegime(bars);
+  STEP(`7-regime-done ${regime}`);
 
   // Recent decisions for this pair (anti flip-flop)
   const recentForPair = state.decisions
