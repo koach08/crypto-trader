@@ -640,7 +640,9 @@ async function runCycle(): Promise<void> {
     try {
       await runCycleForPair(pair);
     } catch (e) {
-      console.error(`[${pair}] サイクルエラー:`, e);
+      const err = e instanceof Error ? e : new Error(String(e));
+      console.error(`[${pair}] サイクルエラー: ${err.name}: ${err.message}`);
+      console.error(`STACK: ${err.stack}`);
     }
   }
 
