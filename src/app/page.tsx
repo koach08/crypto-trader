@@ -342,7 +342,7 @@ export default function Dashboard() {
 
   // 価格チャート用データ
   const chartBars = (priceHistory[activePair] || []).map(b => ({
-    time: new Date(b.timestamp).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }),
+    time: new Date(b.timestamp).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Tokyo" }),
     price: b.close,
     volume: b.volume,
   }));
@@ -351,7 +351,7 @@ export default function Dashboard() {
   const tradeChartData = trades
     .filter(t => t.side === "sell" && t.pnl !== undefined)
     .map(t => ({
-      time: new Date(t.timestamp).toLocaleDateString("ja-JP", { month: "short", day: "numeric" }),
+      time: new Date(t.timestamp).toLocaleDateString("ja-JP", { month: "short", day: "numeric", timeZone: "Asia/Tokyo" }),
       pnl: Math.round(t.pnl ?? 0),
     }));
 
@@ -579,7 +579,7 @@ export default function Dashboard() {
           {pnlHistory.length > 0 ? (
             <ResponsiveContainer width="100%" height={120}>
               <LineChart data={pnlHistory.map(p => ({
-                time: new Date(p.timestamp).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }),
+                time: new Date(p.timestamp).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Tokyo" }),
                 pnl: Math.round(p.totalPnL),
               }))}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
@@ -788,7 +788,7 @@ export default function Dashboard() {
             {diagnostics.sample.slice(0, 6).map((d, i) => (
               <div key={i} className="flex items-start gap-2 text-[11px] bg-zinc-950/30 rounded px-2 py-1">
                 <span className="text-zinc-600 shrink-0 font-mono">
-                  {d.timestamp.slice(11, 16)}
+                  {new Date(d.timestamp).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Tokyo" })}
                 </span>
                 <span className="text-zinc-400 shrink-0 w-12">{d.pair.split("/")[0]}</span>
                 <span
