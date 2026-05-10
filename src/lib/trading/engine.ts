@@ -156,6 +156,12 @@ async function runCycleForPair(pair: string): Promise<void> {
   ]);
   STEP(`3-fetched price=${ticker?.price} bars=${bars?.length} fng=${fearGreed?.value}`);
 
+  // バー数不足は判断不能 → サイクルスキップ (CryptoCompare等の障害対策)
+  if (!bars || bars.length < 50) {
+    console.log(`[${pair}] bars 不足 (${bars?.length ?? 0}本)、サイクルスキップ`);
+    return;
+  }
+
   // === 緊急ロスカット番兵: pipeline 前に独立判定 ===
   // AI 判断・規律フィルタ・確信度閾値とは無関係に、含み損が閾値超えたら強制売却
   if (!state.paperMode) {

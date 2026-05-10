@@ -36,7 +36,7 @@ function rsiMeanReversion(bars: OHLCVBar[]): QuantSignal {
   const current = rsiVals[rsiVals.length - 1];
   const prev = rsiVals[rsiVals.length - 2];
 
-  if (current === null || prev === null) {
+  if (current == null || prev == null) {
     return { name: "RSI平均回帰", score: 0, confidence: 0, reason: "データ不足", factors: {} };
   }
 
@@ -288,7 +288,7 @@ function atrBreakout(bars: OHLCVBar[]): QuantSignal {
   const currentATR = atrVals[atrVals.length - 1];
   const price = closes[closes.length - 1];
 
-  if (currentATR === null || closes.length < 21 || price <= 0) {
+  if (currentATR == null || closes.length < 21 || price == null || price <= 0) {
     return { name: "ATRブレイクアウト", score: 0, confidence: 0, reason: "データ不足", factors: {} };
   }
 
