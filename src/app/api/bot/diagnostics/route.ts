@@ -1,11 +1,19 @@
 import { NextResponse } from "next/server";
 import { loadData } from "@/lib/data";
-import type { AIDecision } from "@/lib/types";
+import type { AIDecision, TradeRecord } from "@/lib/types";
 import { getExchange } from "@/lib/exchanges/factory";
 
 export async function GET() {
   const decisions = await loadData<AIDecision[]>("decisions", []);
   const recent = decisions.slice(-100);
+  const liveTrades = await loadData<TradeRecord[]>("live-trades", []);
+  const recentTradesMs = Date.now() - 24 * 60 * 60 * 1000;
+  const recentSells = liveTrades.filter(
+    (t) => t.side === "sell" && new Date(t.timestamp).getTime() >= recentTradesMs,
+  );
+  const tpSlCount = recentSells.filter((t) => t.type === "take_profit" || t.type === "stop_loss").length;
+  const tpCount = recentSells.filter((t) => t.type === "take_profit").length;
+  const slCount = recentSells.filter((t) => t.type === "stop_loss").length;
 
   const total = recent.length;
   const byAction = {
@@ -48,6 +56,8 @@ export async function GET() {
   return NextResponse.json({
     window: total,
     byAction,
+    /** 24h 以内に実際に発火した TP/SL exit (decisions ログには出ない) */
+    autoExits24h: { total: tpSlCount, takeProfit: tpCount, stopLoss: slCount },
     filters: {
       rejectedByMTF,
       rejectedByEV,

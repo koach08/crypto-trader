@@ -113,6 +113,7 @@ interface NavResponse {
 interface DiagnosticsResponse {
   window: number;
   byAction: { BUY: number; SELL: number; HOLD: number };
+  autoExits24h?: { total: number; takeProfit: number; stopLoss: number };
   filters: { rejectedByMTF: number; rejectedByEV: number; calibrationApplied: number };
   byPair: Record<string, { total: number; buy: number; sell: number; hold: number }>;
   hasOpenPosition?: boolean;
@@ -549,14 +550,16 @@ export default function Dashboard() {
           </div>
         </div>
         <div className="bg-zinc-900 rounded-xl p-3 border border-zinc-800">
-          <div className="text-[10px] text-zinc-500 uppercase tracking-wider">本日損益</div>
+          <div className="text-[10px] text-zinc-500 uppercase tracking-wider">本日損益 <span className="text-zinc-600 normal-case">(含み込)</span></div>
           <div className={`text-lg font-bold font-mono ${(pnl?.totalPnL ?? 0) >= 0 ? "text-green-400" : "text-red-400"}`}>
             ¥{(pnl?.totalPnL ?? 0).toLocaleString(undefined, { maximumFractionDigits: 0 })}
           </div>
-          <div className="text-[10px] text-zinc-500">{pnl?.wins ?? 0}W {pnl?.losses ?? 0}L</div>
+          <div className="text-[10px] text-zinc-500">
+            確定 ¥{(pnl?.realizedPnL ?? 0).toLocaleString(undefined, { maximumFractionDigits: 0 })} / {pnl?.wins ?? 0}W {pnl?.losses ?? 0}L
+          </div>
         </div>
         <div className="bg-zinc-900 rounded-xl p-3 border border-zinc-800">
-          <div className="text-[10px] text-zinc-500 uppercase tracking-wider">累計損益</div>
+          <div className="text-[10px] text-zinc-500 uppercase tracking-wider">セッション損益 <span className="text-zinc-600 normal-case">(再起動でリセット)</span></div>
           <div className={`text-lg font-bold font-mono ${(cum?.totalPnL ?? 0) >= 0 ? "text-green-400" : "text-red-400"}`}>
             ¥{(cum?.totalPnL ?? 0).toLocaleString(undefined, { maximumFractionDigits: 0 })}
           </div>
@@ -806,6 +809,14 @@ export default function Dashboard() {
             </div>
           </div>
           <div className="text-[11px] text-zinc-500 space-y-1 mb-3">
+            {diagnostics.autoExits24h && (
+              <div className="flex justify-between">
+                <span>TP/SL 自動売却 (24h)</span>
+                <span className="font-mono text-blue-300">
+                  {diagnostics.autoExits24h.total}回 (TP {diagnostics.autoExits24h.takeProfit} / SL {diagnostics.autoExits24h.stopLoss})
+                </span>
+              </div>
+            )}
             <div className="flex justify-between">
               <span>MTFフィルタで HOLD化</span>
               <span className="font-mono text-yellow-400">{diagnostics.filters.rejectedByMTF}回</span>
@@ -819,9 +830,14 @@ export default function Dashboard() {
               <span className="font-mono text-zinc-400">{diagnostics.filters.calibrationApplied}回</span>
             </div>
           </div>
-          {diagnostics.byAction.SELL === 0 && diagnostics.byAction.HOLD > 10 && diagnostics.hasOpenPosition && (
+          {diagnostics.byAction.SELL === 0 && diagnostics.byAction.HOLD > 10 && diagnostics.hasOpenPosition && (diagnostics.autoExits24h?.total ?? 0) === 0 && (
             <div className="text-[10px] text-yellow-300/80 bg-yellow-950/20 border border-yellow-800/30 rounded p-2 mb-2">
-              ⚠️ ポジション保有中なのに SELL 判断ゼロ。緊急ロスカット番兵 (-5%) のみ売却の可能性あり。
+              ⚠️ ポジション保有中なのに SELL 判断 + TP/SL 自動売却ゼロ。緊急ロスカット番兵 (-5%) のみの可能性あり。
+            </div>
+          )}
+          {diagnostics.byAction.SELL === 0 && (diagnostics.autoExits24h?.total ?? 0) > 0 && (
+            <div className="text-[10px] text-blue-300/80 bg-blue-950/20 border border-blue-800/30 rounded p-2 mb-2">
+              ℹ️ AI判断でのSELLはゼロですが、TP/SL自動売却が機能してます (24h で {diagnostics.autoExits24h?.total}回)。これは仕様通り。
             </div>
           )}
           {diagnostics.byAction.SELL === 0 && diagnostics.byAction.HOLD > 10 && !diagnostics.hasOpenPosition && (
@@ -1033,7 +1049,7 @@ export default function Dashboard() {
       {/* アクティブポジション */}
       {data?.positions && data.positions.length > 0 && (
         <div>
-          <h2 className="text-sm font-medium text-zinc-400 mb-2">ポジション</h2>
+          <h2 className="text-sm font-medium text-zinc-400 mb-2">ポジション <span className="text-[10px] text-zinc-500">(評価額 / 含み損益)</span></h2>
           <div className="space-y-1.5">
             {data.positions.map(pos => (
               <div key={pos.pair} className="bg-zinc-900 rounded-lg px-3 py-2 border border-zinc-800 flex justify-between items-center">
@@ -1041,8 +1057,13 @@ export default function Dashboard() {
                   <span className="font-medium text-sm">{pos.pair.split("/")[0]}</span>
                   <span className="text-xs text-zinc-500 ml-2">{pos.amount.toFixed(6)}</span>
                 </div>
-                <div className={`font-mono text-sm ${pos.unrealizedPnL >= 0 ? "text-green-400" : "text-red-400"}`}>
-                  ¥{pos.unrealizedPnL.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                <div className="text-right">
+                  <div className="font-mono text-sm text-zinc-300">
+                    ¥{Math.round(pos.valueJPY ?? pos.amount * pos.currentPrice).toLocaleString()}
+                  </div>
+                  <div className={`font-mono text-[10px] ${pos.unrealizedPnL >= 0 ? "text-green-400" : "text-red-400"}`}>
+                    {pos.unrealizedPnL >= 0 ? "+" : ""}¥{pos.unrealizedPnL.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                  </div>
                 </div>
               </div>
             ))}
