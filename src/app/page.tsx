@@ -446,16 +446,19 @@ export default function Dashboard() {
             const startDateStr = nav.first ? new Date(nav.first.timestamp).toLocaleDateString("ja-JP", { month: "numeric", day: "numeric", timeZone: "Asia/Tokyo" }) : "-";
             return (
               <div className={`mt-4 pt-4 border-t-2 ${lifetimeUp ? "border-green-700/60" : "border-red-700/60"}`}>
-                <div className="text-[10px] text-zinc-400 uppercase tracking-wider mb-2 font-bold">📊 総資産推移 (このボットが利益を出してるか)</div>
+                <div className="text-[10px] text-zinc-400 uppercase tracking-wider mb-2 font-bold">📊 総資産推移 (参考)</div>
                 <div className="flex items-baseline gap-2 flex-wrap mb-1">
-                  <span className="text-3xl font-bold font-mono text-zinc-100">
+                  <span className="text-2xl font-bold font-mono text-zinc-100">
                     ¥{Math.round(nav.current.total).toLocaleString()}
                   </span>
                   {lifetime && (
-                    <span className={`text-lg font-bold font-mono ${lifetimeUp ? "text-green-400" : "text-red-400"}`}>
+                    <span className={`text-sm font-mono ${lifetimeUp ? "text-green-400/70" : "text-red-400/70"}`}>
                       {lifetimeUp ? "▲+" : "▼"}¥{Math.round(lifetime.total).toLocaleString()} ({lifetimeUp ? "+" : ""}{lifetime.percent.toFixed(1)}%)
                     </span>
                   )}
+                </div>
+                <div className="text-[10px] text-amber-500/70 mb-2 leading-snug">
+                  ⚠ この差額は <strong>入金/出金 + 暗号通貨の値動き + bot 取引</strong> の合計。bot 単体成績は上の「累計損益」を見る。
                 </div>
                 {nav.first && (
                   <div className="text-[11px] text-zinc-500 mb-2">

@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { loadData } from "@/lib/data";
+import { loadData, saveData } from "@/lib/data";
 
 interface NavSnapshot {
   timestamp: string;
@@ -89,4 +89,10 @@ export async function GET() {
   };
 
   return NextResponse.json(response);
+}
+
+/** NAV 履歴をリセット (初回スナップショットが過小だった等の理由で再ベースラインしたい時) */
+export async function DELETE() {
+  await saveData("nav-history", []);
+  return NextResponse.json({ ok: true, message: "nav-history reset. Next bot cycle will become the new baseline." });
 }

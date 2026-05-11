@@ -22,7 +22,7 @@ if [ "$AUTO_START_LIVE" = "true" ]; then
   (
     sleep 5
     PAIRS=${TRADING_PAIRS:-"ETH/JPY,XRP/JPY"}
-    INTERVAL=${BOT_INTERVAL_SECONDS:-900}
+    INTERVAL=${BOT_INTERVAL_SECONDS:-300}
     PAIRS_JSON=$(echo "$PAIRS" | sed 's/,/","/g' | sed 's/^/["/' | sed 's/$/"]/')
     echo "[start.sh] Starting live bot: pairs=$PAIRS interval=${INTERVAL}s"
     node -e "
