@@ -435,54 +435,96 @@ export default function Dashboard() {
             </div>
           </div>
 
-          {/* 総資産推移 */}
-          {nav?.current && (
-            <div className="mt-4 pt-4 border-t border-zinc-800/60">
-              <div className="flex items-baseline justify-between flex-wrap gap-3 mb-2">
-                <div>
-                  <span className="text-[10px] text-zinc-500 uppercase tracking-wider mr-2">総資産</span>
-                  <span className="text-2xl font-bold font-mono text-zinc-100">
+          {/* 総資産推移 — このアプリが意味あるかどうかの最重要指標 */}
+          {nav?.current && (() => {
+            const lifetime = nav.deltaLifetime;
+            const lifetimeUp = (lifetime?.total ?? 0) >= 0;
+            const navChartData = (nav.history ?? []).map((h) => ({
+              t: new Date(h.timestamp).toLocaleString("ja-JP", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", timeZone: "Asia/Tokyo" }),
+              total: Math.round(h.total),
+            }));
+            const startDateStr = nav.first ? new Date(nav.first.timestamp).toLocaleDateString("ja-JP", { month: "numeric", day: "numeric", timeZone: "Asia/Tokyo" }) : "-";
+            return (
+              <div className={`mt-4 pt-4 border-t-2 ${lifetimeUp ? "border-green-700/60" : "border-red-700/60"}`}>
+                <div className="text-[10px] text-zinc-400 uppercase tracking-wider mb-2 font-bold">📊 総資産推移 (このボットが利益を出してるか)</div>
+                <div className="flex items-baseline gap-2 flex-wrap mb-1">
+                  <span className="text-3xl font-bold font-mono text-zinc-100">
                     ¥{Math.round(nav.current.total).toLocaleString()}
                   </span>
-                  <span className="text-[10px] text-zinc-600 ml-2">
-                    JPY ¥{Math.round(nav.current.jpy).toLocaleString()} + 暗号通貨 ¥{Math.round(nav.current.cryptoValueJPY).toLocaleString()}
-                  </span>
+                  {lifetime && (
+                    <span className={`text-lg font-bold font-mono ${lifetimeUp ? "text-green-400" : "text-red-400"}`}>
+                      {lifetimeUp ? "▲+" : "▼"}¥{Math.round(lifetime.total).toLocaleString()} ({lifetimeUp ? "+" : ""}{lifetime.percent.toFixed(1)}%)
+                    </span>
+                  )}
                 </div>
-              </div>
-              <div className="flex gap-2 flex-wrap">
-                {[
-                  { key: "delta24h", label: "24h", d: nav.delta24h },
-                  { key: "delta7d", label: "7日", d: nav.delta7d },
-                  { key: "delta30d", label: "30日", d: nav.delta30d },
-                  { key: "deltaLifetime", label: "全期間", d: nav.deltaLifetime },
-                ].map(({ key, label, d }) => {
-                  if (!d) {
+                {nav.first && (
+                  <div className="text-[11px] text-zinc-500 mb-2">
+                    開始 {startDateStr} ¥{Math.round(nav.first.total).toLocaleString()} → 現在 ¥{Math.round(nav.current.total).toLocaleString()}
+                    <span className="text-zinc-600 ml-2">
+                      (JPY ¥{Math.round(nav.current.jpy).toLocaleString()} + 暗号通貨 ¥{Math.round(nav.current.cryptoValueJPY).toLocaleString()})
+                    </span>
+                  </div>
+                )}
+                {navChartData.length >= 2 && (
+                  <div className="h-24 mb-3 -mx-1">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <AreaChart data={navChartData} margin={{ top: 4, right: 4, left: 4, bottom: 0 }}>
+                        <defs>
+                          <linearGradient id="navGrad" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="0%" stopColor={lifetimeUp ? "#22c55e" : "#ef4444"} stopOpacity={0.5} />
+                            <stop offset="100%" stopColor={lifetimeUp ? "#22c55e" : "#ef4444"} stopOpacity={0} />
+                          </linearGradient>
+                        </defs>
+                        <YAxis hide domain={["dataMin - 100", "dataMax + 100"]} />
+                        <Tooltip
+                          contentStyle={{ background: "#18181b", border: "1px solid #3f3f46", borderRadius: 6, fontSize: 11 }}
+                          labelStyle={{ color: "#a1a1aa" }}
+                          formatter={(v) => [`¥${Number(v).toLocaleString()}`, "総資産"]}
+                        />
+                        {nav.first && (
+                          <CartesianGrid strokeDasharray="2 4" stroke="#52525b" vertical={false} horizontalCoordinatesGenerator={() => []} />
+                        )}
+                        <Line type="monotone" dataKey="total" stroke={lifetimeUp ? "#22c55e" : "#ef4444"} strokeWidth={1.5} dot={false} />
+                        <Area type="monotone" dataKey="total" stroke="none" fill="url(#navGrad)" />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </div>
+                )}
+                <div className="flex gap-2 flex-wrap">
+                  {[
+                    { key: "delta24h", label: "24h", d: nav.delta24h },
+                    { key: "delta7d", label: "7日", d: nav.delta7d },
+                    { key: "delta30d", label: "30日", d: nav.delta30d },
+                    { key: "deltaLifetime", label: "全期間", d: nav.deltaLifetime },
+                  ].map(({ key, label, d }) => {
+                    if (!d) {
+                      return (
+                        <div key={key} className="px-2 py-1 rounded bg-zinc-900/60 border border-zinc-800 text-[10px] text-zinc-600">
+                          {label}: 履歴不足
+                        </div>
+                      );
+                    }
+                    const up = d.total >= 0;
                     return (
-                      <div key={key} className="px-2 py-1 rounded bg-zinc-900/60 border border-zinc-800 text-[10px] text-zinc-600">
-                        {label}: 履歴不足
+                      <div
+                        key={key}
+                        className={`px-2.5 py-1 rounded border text-xs font-mono flex items-center gap-1 ${
+                          up
+                            ? "border-green-500/30 bg-green-950/30 text-green-300"
+                            : "border-red-500/30 bg-red-950/30 text-red-300"
+                        }`}
+                      >
+                        <span className="text-[10px] opacity-70">{label}</span>
+                        <span>{up ? "▲" : "▼"}</span>
+                        <span className="font-semibold">{up ? "+" : ""}¥{Math.round(d.total).toLocaleString()}</span>
+                        <span className="opacity-70">({up ? "+" : ""}{d.percent.toFixed(2)}%)</span>
                       </div>
                     );
-                  }
-                  const up = d.total >= 0;
-                  return (
-                    <div
-                      key={key}
-                      className={`px-2.5 py-1 rounded border text-xs font-mono flex items-center gap-1 ${
-                        up
-                          ? "border-green-500/30 bg-green-950/30 text-green-300"
-                          : "border-red-500/30 bg-red-950/30 text-red-300"
-                      }`}
-                    >
-                      <span className="text-[10px] opacity-70">{label}</span>
-                      <span>{up ? "▲" : "▼"}</span>
-                      <span className="font-semibold">{up ? "+" : ""}¥{Math.round(d.total).toLocaleString()}</span>
-                      <span className="opacity-70">({up ? "+" : ""}{d.percent.toFixed(2)}%)</span>
-                    </div>
-                  );
-                })}
+                  })}
+                </div>
               </div>
-            </div>
-          )}
+            );
+          })()}
         </div>
       ) : (
         <div className="rounded-2xl p-5 border-2 border-zinc-800 bg-zinc-950/40 text-center text-zinc-500 text-sm">
