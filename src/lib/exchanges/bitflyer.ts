@@ -2,6 +2,10 @@ import ccxt, { type Exchange as CcxtExchange } from "ccxt";
 import type { IExchange, ExecutionRecord } from "./types";
 import type { TickerData, OHLCVBar, Balance, OrderResult, ExchangeConfig } from "../types";
 
+const MIN_BASE_AMOUNT: Record<string, number> = {
+  BTC: 0.001, ETH: 0.01, XRP: 0.1, XLM: 0.1, MONA: 0.1,
+};
+
 export class BitFlyerExchange implements IExchange {
   id = "bitflyer";
   private exchange: CcxtExchange;
@@ -210,14 +214,18 @@ export class BitFlyerExchange implements IExchange {
     const precisionMap: Record<string, number> = {
       BTC: 8, ETH: 7, XRP: 6, XLM: 6, MONA: 6,
     };
-    const minAmountMap: Record<string, number> = {
-      BTC: 0.001, ETH: 0.01, XRP: 0.1, XLM: 0.1, MONA: 0.1,
-    };
     const precision = precisionMap[base] ?? 8;
-    const minAmount = minAmountMap[base] ?? 0.001;
+    const minAmount = MIN_BASE_AMOUNT[base] ?? 0.001;
     const factor = Math.pow(10, precision);
     const rounded = Math.floor(amount * factor) / factor;
     return rounded >= minAmount ? rounded : 0;
+  }
+
+  /** ペアと現在価格から「実際に発注可能な最小JPY額」を返す。10% バッファ込み */
+  getMinOrderJPY(pair: string, price: number): number {
+    const base = pair.split("/")[0];
+    const minAmount = MIN_BASE_AMOUNT[base] ?? 0.001;
+    return Math.ceil(minAmount * price * 1.1);
   }
 
   async marketBuy(pair: string, amountQuote: number): Promise<OrderResult> {
@@ -247,10 +255,7 @@ export class BitFlyerExchange implements IExchange {
     // BitFlyer は free 残高をピタリ送ると内部精度ズレで "Insufficient funds" を返すことがある。
     // 段階的に buffer を増やしてリトライ: 0.5% → 1% → 2% → 5%
     const base = pair.split("/")[0];
-    const minAmountMap: Record<string, number> = {
-      BTC: 0.001, ETH: 0.01, XRP: 0.1, XLM: 0.1, MONA: 0.1,
-    };
-    const minAmount = minAmountMap[base] ?? 0.001;
+    const minAmount = MIN_BASE_AMOUNT[base] ?? 0.001;
 
     const buffers = [0.995, 0.99, 0.98, 0.95];
     let lastError: unknown = null;

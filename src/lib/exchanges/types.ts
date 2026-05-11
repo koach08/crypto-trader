@@ -23,4 +23,6 @@ export interface IExchange {
   getOpenOrders(pair: string): Promise<OrderResult[]>;
   /** 取引所側の全約定履歴を取得（ページング考慮）。sinceMs より古い分は返さない */
   fetchExecutions?(pair: string, sinceMs?: number): Promise<ExecutionRecord[]>;
+  /** ペアと現在価格から「実際に発注可能な最小JPY額」を返す */
+  getMinOrderJPY?(pair: string, price: number): number;
 }

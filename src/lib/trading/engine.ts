@@ -353,8 +353,26 @@ async function runCycleForPair(pair: string): Promise<void> {
     // === ライブモード実行 ===
     const liveExchange = getExchange();
     const realPosition = await liveExchange.getPosition(pair);
-    const livePos = state.livePositions.get(pair);
+    let livePos = state.livePositions.get(pair);
     const currentPositionJPY = realPosition.amount * ticker.price;
+
+    // 残高はあるが livePos が無い (前回データ消失や手動買い付け等) → 現価で再構築。
+    // 真の avg を知らないので「今の価格をエントリーとみなす」最小限の対応。
+    // これにより TP/SL ロジックが発火するようになる (未対応だと緊急 -5% カットしか動かない)。
+    if (!livePos && realPosition.amount > 0 && ticker.price > 0) {
+      const reconstructed: LivePositionEntry = {
+        pair,
+        entryPrice: ticker.price,
+        amount: realPosition.amount,
+        entryTimestamp: new Date().toISOString(),
+        stopLossPercent: PROFIT_FIRST_SL_PERCENT,
+        takeProfitPercent: PROFIT_FIRST_TP_PERCENT,
+      };
+      state.livePositions.set(pair, reconstructed);
+      livePos = reconstructed;
+      await saveData("live-positions", Array.from(state.livePositions.values()));
+      console.log(`[${pair}] livePos 再構築: ${realPosition.amount} @ ¥${ticker.price.toFixed(0)} (TP${PROFIT_FIRST_TP_PERCENT}% / SL${PROFIT_FIRST_SL_PERCENT}%)`);
+    }
 
     // BUY判断
     if (decision.action === "BUY" && decision.confidence >= LIVE_CONFIDENCE_THRESHOLD) {
@@ -374,7 +392,14 @@ async function runCycleForPair(pair: string): Promise<void> {
         LIVE_MAX_POSITION_JPY,
       );
 
-      if (tradeAmount >= LIVE_MIN_TRADE_JPY && jpyFree >= tradeAmount) {
+      // ペア固有の最小発注額 (BitFlyer: ETH 0.01, BTC 0.001, etc) を尊重
+      const perPairMin = liveExchange.getMinOrderJPY?.(pair, ticker.price) ?? LIVE_MIN_TRADE_JPY;
+      const minRequired = Math.max(LIVE_MIN_TRADE_JPY, perPairMin);
+      if (tradeAmount < minRequired) {
+        console.log(`[${pair}] BUY見送り: 注文額 ¥${Math.round(tradeAmount)} < 最小 ¥${minRequired}`);
+        return;
+      }
+      if (tradeAmount >= minRequired && jpyFree >= tradeAmount) {
         try {
           const order = await liveExchange.marketBuy(pair, tradeAmount);
           const trade: TradeRecord = {
