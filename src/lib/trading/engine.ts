@@ -41,6 +41,47 @@ const PROFIT_FIRST_TP_PERCENT = 2.0;
 const PROFIT_FIRST_SL_PERCENT = 1.0;
 const DAILY_TARGET_PERCENT = 0.3; // 元金の 0.3%/日 = ¥230 (¥77K想定)
 
+/**
+ * レジーム適応 TP/SL: 相場タイプで利確/損切幅を変える。
+ * - TRENDING_UP: 利を伸ばす (TP 広め, SL 標準)
+ * - TRENDING_DOWN: 警戒 (TP 浅め, SL 浅め)
+ * - VOLATILE: SL 広めにしないとノイズで切られる
+ * - RANGING: scalp (TP 浅め, SL 浅め) — 何度も拾う
+ */
+function regimeAdjustedTpSl(regime: MarketRegime): { tp: number; sl: number } {
+  switch (regime) {
+    case "TRENDING_UP":   return { tp: 3.0, sl: 1.0 };
+    case "TRENDING_DOWN": return { tp: 1.5, sl: 1.0 };
+    case "VOLATILE":      return { tp: 2.5, sl: 2.0 };
+    case "RANGING":       return { tp: 1.2, sl: 0.6 };
+  }
+}
+
+/**
+ * Volatility-targeted position sizing.
+ * 高ボラ (大きな ATR/価格比) なら小さく、低ボラなら標準サイズ。
+ * Carver "Systematic Trading" の vol targeting を簡易化。
+ * targetVolPercent: 1取引あたり想定 1% リスクを目安
+ */
+function volScalingFactor(atr: number, price: number, targetVolPercent: number = 1.0): number {
+  if (!atr || !price || price <= 0) return 1.0;
+  const atrPercent = (atr / price) * 100;
+  if (atrPercent <= 0) return 1.0;
+  // 比率 = target / atrPercent。例: target 1%, atr 2% → 0.5x。target 1%, atr 0.5% → 2.0x (上限あり)
+  const factor = targetVolPercent / atrPercent;
+  return Math.max(0.3, Math.min(1.5, factor)); // 0.3x〜1.5x の範囲
+}
+
+/**
+ * Time-of-day フィルタ: 流動性低い時間帯は新規 BUY 控える。
+ * crypto 24h だが、JST 深夜 + 早朝 (3-7時) は BTC/ETH 出来高薄、スプレッド広い。
+ * (CoinGecko/Kaiko レポートで観測されてる傾向)
+ */
+function isLowLiquidityHourJST(): boolean {
+  const hour = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Tokyo" })).getHours();
+  return hour >= 3 && hour < 7;
+}
+
 // ライブポジション追跡（エントリー価格・SL/TPを保持）
 interface LivePositionEntry {
   pair: string;
@@ -372,6 +413,16 @@ async function runCycleForPair(pair: string): Promise<void> {
     let livePos = state.livePositions.get(pair);
     const currentPositionJPY = realPosition.amount * ticker.price;
 
+    // 現サイクルの ATR を計算 (vol scaling / regime SL の根拠に使う)
+    const atrValsForBuy = atrIndicator(
+      bars.map(b => b.high),
+      bars.map(b => b.low),
+      bars.map(b => b.close),
+      14,
+    );
+    const lastATR = atrValsForBuy.filter((v): v is number => v !== null).slice(-1)[0] ?? 0;
+    const regimeTpSl = regimeAdjustedTpSl(regime);
+
     // 残高はあるが livePos が無い (前回データ消失や手動買い付け等) → 現価で再構築。
     // 真の avg を知らないので「今の価格をエントリーとみなす」最小限の対応。
     // これにより TP/SL ロジックが発火するようになる (未対応だと緊急 -5% カットしか動かない)。
@@ -381,13 +432,13 @@ async function runCycleForPair(pair: string): Promise<void> {
         entryPrice: ticker.price,
         amount: realPosition.amount,
         entryTimestamp: new Date().toISOString(),
-        stopLossPercent: PROFIT_FIRST_SL_PERCENT,
-        takeProfitPercent: PROFIT_FIRST_TP_PERCENT,
+        stopLossPercent: regimeTpSl.sl,
+        takeProfitPercent: regimeTpSl.tp,
       };
       state.livePositions.set(pair, reconstructed);
       livePos = reconstructed;
       await saveData("live-positions", Array.from(state.livePositions.values()));
-      console.log(`[${pair}] livePos 再構築: ${realPosition.amount} @ ¥${ticker.price.toFixed(0)} (TP${PROFIT_FIRST_TP_PERCENT}% / SL${PROFIT_FIRST_SL_PERCENT}%)`);
+      console.log(`[${pair}] livePos 再構築: ${realPosition.amount} @ ¥${ticker.price.toFixed(0)} (regime ${regime} → TP${regimeTpSl.tp}% / SL${regimeTpSl.sl}%)`);
     }
 
     // BUY判断
@@ -399,6 +450,11 @@ async function runCycleForPair(pair: string): Promise<void> {
         console.log(`[${pair}] BUY見送り: クールダウン中 (残り ${remainMin} 分)`);
         return;
       }
+      // Time-of-day フィルタ: JST 3-7時は流動性低い (深夜) → スプレッド広くスリッページ大
+      if (isLowLiquidityHourJST()) {
+        console.log(`[${pair}] BUY見送り: 低流動性時間帯 (JST 3-7時)`);
+        return;
+      }
       // Profit-First: 日次目標達成済みなら新規エントリー停止 (利益を守る)
       const dailyPnL = state.riskManager.getDailyPnL();
       const dailyTargetJPY = (dailyPnL.startCapitalJPY * DAILY_TARGET_PERCENT) / 100;
@@ -408,12 +464,18 @@ async function runCycleForPair(pair: string): Promise<void> {
       }
       const balance = await liveExchange.getBalance();
       const jpyFree = balance.find(b => b.currency === "JPY")?.free ?? 0;
-      const tradeAmount = state.riskManager.calculatePositionSizeJPY(
+      const baseTradeAmount = state.riskManager.calculatePositionSizeJPY(
         decision.confidence,
         jpyFree + currentPositionJPY,
         currentPositionJPY,
         LIVE_MAX_POSITION_JPY,
       );
+      // Volatility-targeted sizing: 高ボラなら小さく、低ボラなら標準
+      const volFactor = volScalingFactor(lastATR, ticker.price, 1.0);
+      const tradeAmount = Math.round(baseTradeAmount * volFactor);
+      if (volFactor !== 1.0) {
+        console.log(`[${pair}] vol scaling: ATR/price=${((lastATR / ticker.price) * 100).toFixed(2)}% → factor ${volFactor.toFixed(2)}x (¥${Math.round(baseTradeAmount)} → ¥${tradeAmount})`);
+      }
 
       // ペア固有の最小発注額 (BitFlyer: ETH 0.01, BTC 0.001, etc) を尊重
       const perPairMin = liveExchange.getMinOrderJPY?.(pair, ticker.price) ?? LIVE_MIN_TRADE_JPY;
@@ -450,18 +512,19 @@ async function runCycleForPair(pair: string): Promise<void> {
             const avgPrice = (existing.entryPrice * existing.amount + order.price * order.amount) / totalAmount;
             existing.entryPrice = avgPrice;
             existing.amount = totalAmount;
-            existing.stopLossPercent = PROFIT_FIRST_SL_PERCENT;
-            existing.takeProfitPercent = PROFIT_FIRST_TP_PERCENT;
+            existing.stopLossPercent = regimeTpSl.sl;
+            existing.takeProfitPercent = regimeTpSl.tp;
           } else {
             state.livePositions.set(pair, {
               pair,
               entryPrice: order.price,
               amount: order.amount,
               entryTimestamp: new Date().toISOString(),
-              stopLossPercent: PROFIT_FIRST_SL_PERCENT,
-              takeProfitPercent: PROFIT_FIRST_TP_PERCENT,
+              stopLossPercent: regimeTpSl.sl,
+              takeProfitPercent: regimeTpSl.tp,
             });
           }
+          console.log(`[${pair}] LIVE BUY ${regime} → TP${regimeTpSl.tp}% / SL${regimeTpSl.sl}% 設定`);
 
           await saveData("live-trades", state.liveTrades.slice(-200));
           await saveData("live-positions", Array.from(state.livePositions.values()));
