@@ -65,6 +65,8 @@ interface EngineState {
   recentTrades: TradeRecord[];
   livePositions: Map<string, LivePositionEntry>;
   liveTrades: TradeRecord[];
+  /** SL/負け確定後のクールダウン (pair → unix ms。それまで BUY 禁止) */
+  cooldownUntil: Map<string, number>;
 }
 
 const state: EngineState = {
@@ -81,7 +83,11 @@ const state: EngineState = {
   recentTrades: [],
   livePositions: new Map(),
   liveTrades: [],
+  cooldownUntil: new Map(),
 };
+
+// 連敗ガード: SL や負け確定後、同じペアを 30 分間 BUY 禁止 (リベンジ買い防止)
+const COOLDOWN_MS_AFTER_LOSS = 30 * 60 * 1000;
 
 // Eagerly load saved data so the API can return history before the bot starts
 let _initPromise: Promise<void> | null = null;
@@ -116,9 +122,19 @@ async function ensureDataLoaded(): Promise<void> {
         if (typeof p.takeProfitPercent !== "number") p.takeProfitPercent = 3.0;
         state.livePositions.set(p.pair, p);
       }
+      // 連敗クールダウンを復元 (期限切れは捨てる)
+      const savedCooldowns = await loadData<Array<[string, number]>>("cooldowns", []);
+      const now = Date.now();
+      for (const [pair, until] of savedCooldowns) {
+        if (until > now) state.cooldownUntil.set(pair, until);
+      }
     })();
   }
   return _initPromise;
+}
+
+async function persistCooldowns(): Promise<void> {
+  await saveData("cooldowns", Array.from(state.cooldownUntil.entries()));
 }
 ensureDataLoaded();
 
@@ -376,6 +392,13 @@ async function runCycleForPair(pair: string): Promise<void> {
 
     // BUY判断
     if (decision.action === "BUY" && decision.confidence >= LIVE_CONFIDENCE_THRESHOLD) {
+      // Cooldown: 直近 SL や負け確定があったペアはしばらく BUY 禁止 (リベンジ買い防止)
+      const cdUntil = state.cooldownUntil.get(pair) ?? 0;
+      if (Date.now() < cdUntil) {
+        const remainMin = Math.ceil((cdUntil - Date.now()) / 60000);
+        console.log(`[${pair}] BUY見送り: クールダウン中 (残り ${remainMin} 分)`);
+        return;
+      }
       // Profit-First: 日次目標達成済みなら新規エントリー停止 (利益を守る)
       const dailyPnL = state.riskManager.getDailyPnL();
       const dailyTargetJPY = (dailyPnL.startCapitalJPY * DAILY_TARGET_PERCENT) / 100;
@@ -478,6 +501,11 @@ async function runCycleForPair(pair: string): Promise<void> {
         state.liveTrades.push(trade);
         state.riskManager.recordTrade(pnl);
         state.livePositions.delete(pair);
+        if (pnl < 0) {
+          state.cooldownUntil.set(pair, Date.now() + COOLDOWN_MS_AFTER_LOSS);
+          await persistCooldowns();
+          console.log(`[${pair}] 負け確定 → クールダウン ${COOLDOWN_MS_AFTER_LOSS / 60000}分セット`);
+        }
 
         await saveData("live-trades", state.liveTrades.slice(-200));
         await saveData("live-positions", Array.from(state.livePositions.values()));
@@ -555,6 +583,11 @@ async function runCycleForPair(pair: string): Promise<void> {
           state.liveTrades.push(trade);
           state.riskManager.recordTrade(pnl);
           state.livePositions.delete(pair);
+          if (triggerType === "stop_loss" || pnl < 0) {
+            state.cooldownUntil.set(pair, Date.now() + COOLDOWN_MS_AFTER_LOSS);
+            await persistCooldowns();
+            console.log(`[${pair}] SL/負け確定 → クールダウン ${COOLDOWN_MS_AFTER_LOSS / 60000}分セット`);
+          }
 
           await saveData("live-trades", state.liveTrades.slice(-200));
           await saveData("live-positions", Array.from(state.livePositions.values()));
@@ -851,6 +884,10 @@ async function emergencyLossCut(pair: string, currentPrice: number): Promise<boo
     state.liveTrades.push(trade);
     state.riskManager.recordTrade(pnl);
     state.livePositions.delete(pair);
+    // 緊急ロスカットは強い負けシグナル → クールダウン長め (60分)
+    state.cooldownUntil.set(pair, Date.now() + COOLDOWN_MS_AFTER_LOSS * 2);
+    await persistCooldowns();
+    console.log(`[${pair}] 緊急ロスカット → クールダウン ${(COOLDOWN_MS_AFTER_LOSS * 2) / 60000}分セット`);
     await saveData("live-trades", state.liveTrades.slice(-200));
     await saveData("live-positions", Array.from(state.livePositions.values()));
     await recordOutcome(pair, fillPrice, pnl, pnlPercent).catch(() => {});
