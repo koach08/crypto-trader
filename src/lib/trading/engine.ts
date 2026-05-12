@@ -53,9 +53,7 @@ function regimeAdjustedTpSl(regime: MarketRegime): { tp: number; sl: number } {
     case "TRENDING_UP":   return { tp: 3.0, sl: 1.0 };
     case "TRENDING_DOWN": return { tp: 1.5, sl: 1.0 };
     case "VOLATILE":      return { tp: 2.5, sl: 2.0 };
-    // RANGING: maker 手数料 0% を前提にスキャル設計
-    // R:R 2:1 維持、頻度で稼ぐ。1取引利益 0.4% × ¥30K = ¥120
-    case "RANGING":       return { tp: 0.4, sl: 0.2 };
+    case "RANGING":       return { tp: 1.2, sl: 0.6 };
   }
 }
 
@@ -327,8 +325,6 @@ async function runCycleForPair(pair: string): Promise<void> {
 
   // === クオンツ分析 + スコアリングエンジン ===
   // LLMの判断を「アドバイザーの1人」として、統計的シグナルと合議で最終判断
-  // RANGING + maker-only なら scalp mode で頻度優先
-  const isScalpRegime = regime === "RANGING" && USE_MAKER_ONLY;
   const quantAnalysis = runQuantAnalysis(bars);
   const scoringResult = calculateFinalDecision({
     pair,
@@ -340,7 +336,6 @@ async function runCycleForPair(pair: string): Promise<void> {
     technicalScore: signal.score,
     regime,
     fearGreedIndex: fearGreed.value,
-    scalpMode: isScalpRegime,
   });
 
   // スコアリングエンジンの結果でdecisionを上書き
