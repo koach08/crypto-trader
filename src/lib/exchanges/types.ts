@@ -25,4 +25,8 @@ export interface IExchange {
   fetchExecutions?(pair: string, sinceMs?: number): Promise<ExecutionRecord[]>;
   /** ペアと現在価格から「実際に発注可能な最小JPY額」を返す */
   getMinOrderJPY?(pair: string, price: number): number;
+  /** Maker-only 指値 BUY (手数料 0%)。約定なければ null */
+  limitBuyMakerOnly?(pair: string, amountQuoteJPY: number, timeoutMs?: number): Promise<OrderResult | null>;
+  /** Maker-only 指値 SELL (手数料 0%)。約定なければ null */
+  limitSellMakerOnly?(pair: string, amountBase: number, timeoutMs?: number): Promise<OrderResult | null>;
 }

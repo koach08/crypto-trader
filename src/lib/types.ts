@@ -24,6 +24,9 @@ export interface TickerData {
   volume24h: number;
   changePercent24h: number;
   timestamp: number;
+  /** maker 指値配置に必要 */
+  bid?: number;
+  ask?: number;
 }
 
 export interface OHLCVBar {

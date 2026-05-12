@@ -57,6 +57,8 @@ export class BitFlyerExchange implements IExchange {
       volume24h: ticker.baseVolume ?? 0,
       changePercent24h,
       timestamp: ticker.timestamp ?? Date.now(),
+      bid: ticker.bid ?? undefined,
+      ask: ticker.ask ?? undefined,
     };
   }
 
@@ -299,6 +301,113 @@ export class BitFlyerExchange implements IExchange {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Maker-only 指値 BUY: best bid に置いて maker 約定 (手数料 0%) を狙う。
+   * timeoutMs 内に約定しなければキャンセルして null を返す (呼び側でフォールバック判定)。
+   */
+  async limitBuyMakerOnly(pair: string, amountQuoteJPY: number, timeoutMs = 30000): Promise<OrderResult | null> {
+    const ticker = await this.getTicker(pair);
+    const bid = ticker.bid ?? ticker.price;
+    if (!bid || bid <= 0) {
+      throw new Error(`${pair}: bid 取得不可`);
+    }
+    const limitPrice = bid; // best bid に並ぶ = maker
+    const rawAmount = amountQuoteJPY / limitPrice;
+    const amount = this.roundAmount(pair, rawAmount);
+    if (amount <= 0) {
+      throw new Error(`${pair}: 指値発注額が最小取引単位未満 (¥${amountQuoteJPY.toLocaleString()})`);
+    }
+
+    console.log(`[bitflyer] limitBuy maker ${pair}: ${amount} @ ¥${limitPrice} (¥${Math.round(amount * limitPrice).toLocaleString()})`);
+    const order = await this.exchange.createLimitBuyOrder(pair, amount, limitPrice);
+    const orderId = order.id;
+
+    const startTime = Date.now();
+    const POLL_MS = 3000;
+    while (Date.now() - startTime < timeoutMs) {
+      await new Promise(r => setTimeout(r, POLL_MS));
+      try {
+        const status = await this.exchange.fetchOrder(orderId, pair);
+        if (status.status === "closed" && (status.filled ?? 0) > 0) {
+          console.log(`[bitflyer] maker BUY 約定 ${pair}: ${status.filled} @ ¥${status.average ?? limitPrice}`);
+          return {
+            id: orderId,
+            pair,
+            side: "buy",
+            type: "limit",
+            amount: status.filled ?? amount,
+            price: status.average ?? limitPrice,
+            status: "closed",
+            timestamp: status.timestamp ?? Date.now(),
+            fee: status.fee?.cost ?? 0,
+          };
+        }
+      } catch { /* continue polling */ }
+    }
+
+    // Timeout: cancel and return null (caller decides fallback)
+    try {
+      await this.exchange.cancelOrder(orderId, pair);
+      console.log(`[bitflyer] maker BUY ${pair}: ${timeoutMs / 1000}s 内に約定せず → キャンセル`);
+    } catch { /* already filled or gone */ }
+    return null;
+  }
+
+  /**
+   * Maker-only 指値 SELL: best ask に置いて maker 約定 (手数料 0%) を狙う。
+   * timeoutMs 内に約定しなければキャンセルして null を返す (呼び側でフォールバック判定)。
+   */
+  async limitSellMakerOnly(pair: string, amountBase: number, timeoutMs = 30000): Promise<OrderResult | null> {
+    const base = pair.split("/")[0];
+    const minAmount = MIN_BASE_AMOUNT[base] ?? 0.001;
+    const safeAmount = Math.max(amountBase * 0.995, minAmount);
+    const amount = this.roundAmount(pair, safeAmount);
+    if (amount <= 0) {
+      throw new Error(`${pair}: 指値売却量が最小単位未満 (要求 ${amountBase})`);
+    }
+
+    const ticker = await this.getTicker(pair);
+    const ask = ticker.ask ?? ticker.price;
+    if (!ask || ask <= 0) {
+      throw new Error(`${pair}: ask 取得不可`);
+    }
+    const limitPrice = ask; // best ask に並ぶ = maker
+
+    console.log(`[bitflyer] limitSell maker ${pair}: ${amount} @ ¥${limitPrice} (¥${Math.round(amount * limitPrice).toLocaleString()})`);
+    const order = await this.exchange.createLimitSellOrder(pair, amount, limitPrice);
+    const orderId = order.id;
+
+    const startTime = Date.now();
+    const POLL_MS = 3000;
+    while (Date.now() - startTime < timeoutMs) {
+      await new Promise(r => setTimeout(r, POLL_MS));
+      try {
+        const status = await this.exchange.fetchOrder(orderId, pair);
+        if (status.status === "closed" && (status.filled ?? 0) > 0) {
+          console.log(`[bitflyer] maker SELL 約定 ${pair}: ${status.filled} @ ¥${status.average ?? limitPrice}`);
+          return {
+            id: orderId,
+            pair,
+            side: "sell",
+            type: "limit",
+            amount: status.filled ?? amount,
+            price: status.average ?? limitPrice,
+            status: "closed",
+            timestamp: status.timestamp ?? Date.now(),
+            fee: status.fee?.cost ?? 0,
+          };
+        }
+      } catch { /* continue polling */ }
+    }
+
+    // Timeout: cancel
+    try {
+      await this.exchange.cancelOrder(orderId, pair);
+      console.log(`[bitflyer] maker SELL ${pair}: ${timeoutMs / 1000}s 内に約定せず → キャンセル`);
+    } catch { /* already filled or gone */ }
+    return null;
   }
 
   /**

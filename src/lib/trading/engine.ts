@@ -130,6 +130,47 @@ const state: EngineState = {
 // 連敗ガード: SL や負け確定後、同じペアを 30 分間 BUY 禁止 (リベンジ買い防止)
 const COOLDOWN_MS_AFTER_LOSS = 30 * 60 * 1000;
 
+// Maker-only 指値モード: 約定すれば手数料 0%。timeout で成行フォールバック
+const USE_MAKER_ONLY = process.env.USE_MAKER_ONLY !== "false";  // default true
+const MAKER_TIMEOUT_MS = Number(process.env.MAKER_TIMEOUT_MS ?? "30000");
+
+/**
+ * BUY 実行ヘルパー: maker 指値を試し、timeout なら成行にフォールバック。
+ * 既存の戦略コードを変えずに「実行レイヤーだけ手数料 0% 化」する。
+ */
+async function executeBuy(
+  exchange: import("../exchanges/types").IExchange,
+  pair: string,
+  amountJPY: number,
+): Promise<{ order: import("../types").OrderResult; viaMaker: boolean }> {
+  if (USE_MAKER_ONLY && exchange.limitBuyMakerOnly) {
+    const makerOrder = await exchange.limitBuyMakerOnly(pair, amountJPY, MAKER_TIMEOUT_MS);
+    if (makerOrder) return { order: makerOrder, viaMaker: true };
+    console.log(`[${pair}] maker BUY timeout → 成行フォールバック`);
+  }
+  const order = await exchange.marketBuy(pair, amountJPY);
+  return { order, viaMaker: false };
+}
+
+/**
+ * SELL 実行ヘルパー: maker 指値を試し、timeout なら成行にフォールバック。
+ * TP/SL/緊急ロスカット 全部から呼ぶ。
+ */
+async function executeSell(
+  exchange: import("../exchanges/types").IExchange,
+  pair: string,
+  amountBase: number,
+  forceMarket = false,
+): Promise<{ order: import("../types").OrderResult; viaMaker: boolean }> {
+  if (!forceMarket && USE_MAKER_ONLY && exchange.limitSellMakerOnly) {
+    const makerOrder = await exchange.limitSellMakerOnly(pair, amountBase, MAKER_TIMEOUT_MS);
+    if (makerOrder) return { order: makerOrder, viaMaker: true };
+    console.log(`[${pair}] maker SELL timeout → 成行フォールバック`);
+  }
+  const order = await exchange.marketSell(pair, amountBase);
+  return { order, viaMaker: false };
+}
+
 // Eagerly load saved data so the API can return history before the bot starts
 let _initPromise: Promise<void> | null = null;
 export async function ensureReady(): Promise<void> {
@@ -450,9 +491,10 @@ async function runCycleForPair(pair: string): Promise<void> {
         console.log(`[${pair}] BUY見送り: クールダウン中 (残り ${remainMin} 分)`);
         return;
       }
-      // Time-of-day フィルタ: JST 3-7時は流動性低い (深夜) → スプレッド広くスリッページ大
-      if (isLowLiquidityHourJST()) {
-        console.log(`[${pair}] BUY見送り: 低流動性時間帯 (JST 3-7時)`);
+      // Time-of-day フィルタ: maker-only 指値の場合はスリッページ無関係なので skip 不要。
+      // taker fallback の場合のみ低流動性時間帯を回避。
+      if (!USE_MAKER_ONLY && isLowLiquidityHourJST()) {
+        console.log(`[${pair}] BUY見送り: 低流動性時間帯 (JST 3-7時, taker mode)`);
         return;
       }
       // Profit-First: 日次目標達成済みなら新規エントリー停止 (利益を守る)
@@ -486,14 +528,14 @@ async function runCycleForPair(pair: string): Promise<void> {
       }
       if (tradeAmount >= minRequired && jpyFree >= tradeAmount) {
         try {
-          const order = await liveExchange.marketBuy(pair, tradeAmount);
+          const { order, viaMaker } = await executeBuy(liveExchange, pair, tradeAmount);
           const trade: TradeRecord = {
             id: `live-${Date.now()}`,
             timestamp: new Date().toISOString(),
             exchange: "bitflyer",
             pair,
             side: "buy",
-            type: "market",
+            type: viaMaker ? "limit" : "market",
             amount: order.amount,
             price: order.price,
             valueJPY: tradeAmount,
@@ -537,7 +579,7 @@ async function runCycleForPair(pair: string): Promise<void> {
     // SELL判断
     else if (decision.action === "SELL" && decision.confidence >= LIVE_CONFIDENCE_THRESHOLD && realPosition.free > 0) {
       try {
-        const order = await liveExchange.marketSell(pair, realPosition.free);
+        const { order } = await executeSell(liveExchange, pair, realPosition.free);
         const fillPrice = order.price > 0 ? order.price : ticker.price;
         const entryPrice = livePos?.entryPrice ?? 0;
         const pnl = entryPrice > 0 ? (fillPrice - entryPrice) * order.amount : 0;
@@ -620,7 +662,9 @@ async function runCycleForPair(pair: string): Promise<void> {
 
       if (triggerType) {
         try {
-          const order = await liveExchange.marketSell(pair, realPosition.free);
+          // SL は緊急性高い → maker timeout を短く (10s)、TP は通常 (30s)
+          // ただし TP/SL 両方とも maker 試行 → timeout で成行フォールバック
+          const { order } = await executeSell(liveExchange, pair, realPosition.free, triggerType === "stop_loss");
           // BitFlyer (ccxt) は order.average を 0 で返すことがある。ticker.price で代替。
           const fillPrice = order.price > 0 ? order.price : ticker.price;
           const pnl = (fillPrice - livePos.entryPrice) * order.amount;
@@ -678,7 +722,7 @@ async function runCycleForPair(pair: string): Promise<void> {
 
       if (jpyFree >= dcaAmount && currentPositionJPY < LIVE_MAX_POSITION_JPY) {
         try {
-          const order = await liveExchange.marketBuy(pair, dcaAmount);
+          const { order } = await executeBuy(liveExchange, pair, dcaAmount);
           const trade: TradeRecord = {
             id: `dca-${Date.now()}`,
             timestamp: new Date().toISOString(),
