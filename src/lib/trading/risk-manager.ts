@@ -137,6 +137,7 @@ export class RiskManager {
   recordTrade(pnl: number): void {
     this.dailyPnL.trades++;
     this.dailyPnL.realizedPnL += pnl;
+    this.dailyPnL.currentCapitalJPY = this.dailyPnL.startCapitalJPY + this.dailyPnL.realizedPnL;
     this.dailyPnL.totalPnL = this.dailyPnL.realizedPnL + this.dailyPnL.unrealizedPnL;
     if (this.dailyPnL.startCapitalJPY > 0) {
       this.dailyPnL.totalPnLPercent = (this.dailyPnL.totalPnL / this.dailyPnL.startCapitalJPY) * 100;

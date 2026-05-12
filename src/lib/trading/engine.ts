@@ -473,13 +473,29 @@ async function runCycleForPair(pair: string): Promise<void> {
     const lastATR = atrValsForBuy.filter((v): v is number => v !== null).slice(-1)[0] ?? 0;
     const regimeTpSl = regimeAdjustedTpSl(regime);
 
-    // 残高はあるが livePos が無い (前回データ消失や手動買い付け等) → 現価で再構築。
-    // 真の avg を知らないので「今の価格をエントリーとみなす」最小限の対応。
-    // これにより TP/SL ロジックが発火するようになる (未対応だと緊急 -5% カットしか動かない)。
+    // 残高はあるが livePos が無い → BitFlyer 約定履歴から FIFO で真の avg を計算
+    // (旧実装は ticker.price を fake entry にしていて、TP/SL が経済実態と乖離してた)
     if (!livePos && realPosition.amount > 0 && ticker.price > 0) {
+      let trueAvgPrice = ticker.price; // フォールバック
+      try {
+        if (liveExchange.fetchExecutions) {
+          const executions = await liveExchange.fetchExecutions(pair);
+          const summary = computeLifetimePnL(executions);
+          const pairData = summary.byPair.find(p => p.pair === pair);
+          if (pairData && pairData.averageBuyPrice > 0 && pairData.remainingInventory > 0) {
+            trueAvgPrice = pairData.averageBuyPrice;
+            console.log(`[${pair}] FIFO avg 取得成功: ¥${trueAvgPrice.toFixed(2)} (残在庫 ${pairData.remainingInventory})`);
+          } else {
+            console.log(`[${pair}] FIFO avg 取得失敗 → ticker.price フォールバック ¥${ticker.price.toFixed(0)}`);
+          }
+        }
+      } catch (e) {
+        console.log(`[${pair}] FIFO 計算エラー (${e instanceof Error ? e.message : "unknown"}) → ticker.price フォールバック`);
+      }
+
       const reconstructed: LivePositionEntry = {
         pair,
-        entryPrice: ticker.price,
+        entryPrice: trueAvgPrice,
         amount: realPosition.amount,
         entryTimestamp: new Date().toISOString(),
         stopLossPercent: regimeTpSl.sl,
@@ -488,7 +504,26 @@ async function runCycleForPair(pair: string): Promise<void> {
       state.livePositions.set(pair, reconstructed);
       livePos = reconstructed;
       await saveData("live-positions", Array.from(state.livePositions.values()));
-      console.log(`[${pair}] livePos 再構築: ${realPosition.amount} @ ¥${ticker.price.toFixed(0)} (regime ${regime} → TP${regimeTpSl.tp}% / SL${regimeTpSl.sl}%)`);
+      console.log(`[${pair}] livePos 再構築: ${realPosition.amount} @ ¥${trueAvgPrice.toFixed(0)} (FIFO avg, regime ${regime} → TP${regimeTpSl.tp}% / SL${regimeTpSl.sl}%)`);
+    }
+
+    // livePos.amount と realPosition.amount のズレ検知 + 同期
+    // 外部買い付けや手動取引で実残高が増えた場合、FIFO avg を取り直して同期
+    if (livePos && realPosition.amount > 0 && Math.abs(realPosition.amount - livePos.amount) / Math.max(realPosition.amount, livePos.amount) > 0.01) {
+      console.log(`[${pair}] livePos.amount ${livePos.amount} ≠ realPosition.amount ${realPosition.amount} → FIFO 再計算`);
+      try {
+        if (liveExchange.fetchExecutions) {
+          const executions = await liveExchange.fetchExecutions(pair);
+          const summary = computeLifetimePnL(executions);
+          const pairData = summary.byPair.find(p => p.pair === pair);
+          if (pairData && pairData.averageBuyPrice > 0 && pairData.remainingInventory > 0) {
+            livePos.entryPrice = pairData.averageBuyPrice;
+            livePos.amount = realPosition.amount;
+            await saveData("live-positions", Array.from(state.livePositions.values()));
+            console.log(`[${pair}] 同期完了: ${realPosition.amount} @ ¥${pairData.averageBuyPrice.toFixed(2)}`);
+          }
+        }
+      } catch { /* keep current */ }
     }
 
     // BUY判断
