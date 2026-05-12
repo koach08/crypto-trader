@@ -36,6 +36,9 @@ interface ScoringInput {
 
   // Fear & Greed
   fearGreedIndex: number;
+
+  /** スキャル mode: RANGING で頻度優先、閾値半減 */
+  scalpMode?: boolean;
 }
 
 interface ScoringResult {
@@ -59,6 +62,11 @@ const WEIGHTS = {
 const MIN_ABS_SCORE = 8;
 const MIN_AGREEMENT = 0.51;          // 過半数
 const QUANT_STRONG_OVERRIDE = 15;    // Quant 単独 ≥15 で発火
+
+// スキャル mode (RANGING + maker手数料0%): 頻度で稼ぐので閾値半減
+const SCALP_MIN_ABS_SCORE = 4;
+const SCALP_MIN_AGREEMENT = 0.51;    // 一致度は変えない (品質維持)
+const SCALP_QUANT_OVERRIDE = 8;
 
 /** AI判断をスコアに変換 */
 function aiToScore(action: CryptoAction, confidence: number): number {
@@ -123,11 +131,16 @@ export function calculateFinalDecision(input: ScoringInput): ScoringResult {
   const absScore = Math.abs(compositeScore);
   const absQuant = Math.abs(quantScore);
 
-  // STRONG_OVERRIDE: Quant単独で十分強い (絶対値≥50) なら一致度無視で発火
+  // スキャル mode (RANGING + maker 0%) は閾値を半減して頻度優先
+  const minScore = input.scalpMode ? SCALP_MIN_ABS_SCORE : MIN_ABS_SCORE;
+  const minAgreement = input.scalpMode ? SCALP_MIN_AGREEMENT : MIN_AGREEMENT;
+  const quantOverride = input.scalpMode ? SCALP_QUANT_OVERRIDE : QUANT_STRONG_OVERRIDE;
+
+  // STRONG_OVERRIDE: Quant単独で十分強ければ一致度無視で発火
   // (RenTech 的な統計ベース。「他ソースが追いついてないだけ」の場合の機会)
-  if (absQuant >= QUANT_STRONG_OVERRIDE) {
+  if (absQuant >= quantOverride) {
     action = quantScore > 0 ? "BUY" : "SELL";
-  } else if (absScore < MIN_ABS_SCORE || agreement < MIN_AGREEMENT) {
+  } else if (absScore < minScore || agreement < minAgreement) {
     // 中程度以下: スコア弱いか、方向ソース間で意見割れ → HOLD
     action = "HOLD";
   } else if (compositeScore > 0) {

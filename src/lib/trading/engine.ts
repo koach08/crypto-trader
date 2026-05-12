@@ -53,7 +53,9 @@ function regimeAdjustedTpSl(regime: MarketRegime): { tp: number; sl: number } {
     case "TRENDING_UP":   return { tp: 3.0, sl: 1.0 };
     case "TRENDING_DOWN": return { tp: 1.5, sl: 1.0 };
     case "VOLATILE":      return { tp: 2.5, sl: 2.0 };
-    case "RANGING":       return { tp: 1.2, sl: 0.6 };
+    // RANGING: maker 手数料 0% を前提にスキャル設計
+    // R:R 2:1 維持、頻度で稼ぐ。1取引利益 0.4% × ¥30K = ¥120
+    case "RANGING":       return { tp: 0.4, sl: 0.2 };
   }
 }
 
@@ -127,8 +129,17 @@ const state: EngineState = {
   cooldownUntil: new Map(),
 };
 
-// 連敗ガード: SL や負け確定後、同じペアを 30 分間 BUY 禁止 (リベンジ買い防止)
-const COOLDOWN_MS_AFTER_LOSS = 30 * 60 * 1000;
+// 連敗ガード: SL や負け確定後、同じペアを一定時間 BUY 禁止 (リベンジ買い防止)
+// 損失額に比例: 小さい損 = 短い cooldown (scalp 対応)、大きい損 = 長い cooldown
+const COOLDOWN_MS_AFTER_LOSS = 30 * 60 * 1000; // 通常 30分
+
+function adaptiveCooldownMs(pnlPercent: number): number {
+  const absPnl = Math.abs(pnlPercent);
+  if (absPnl < 0.5) return 5 * 60 * 1000;   // <0.5% → 5分 (scalp 対応)
+  if (absPnl < 1.5) return 15 * 60 * 1000;  // <1.5% → 15分
+  if (absPnl < 3.0) return 30 * 60 * 1000;  // <3% → 30分
+  return 60 * 60 * 1000;                     // >=3% → 60分
+}
 
 // Maker-only 指値モード: 約定すれば手数料 0%。timeout で成行フォールバック
 const USE_MAKER_ONLY = process.env.USE_MAKER_ONLY !== "false";  // default true
@@ -316,6 +327,8 @@ async function runCycleForPair(pair: string): Promise<void> {
 
   // === クオンツ分析 + スコアリングエンジン ===
   // LLMの判断を「アドバイザーの1人」として、統計的シグナルと合議で最終判断
+  // RANGING + maker-only なら scalp mode で頻度優先
+  const isScalpRegime = regime === "RANGING" && USE_MAKER_ONLY;
   const quantAnalysis = runQuantAnalysis(bars);
   const scoringResult = calculateFinalDecision({
     pair,
@@ -327,6 +340,7 @@ async function runCycleForPair(pair: string): Promise<void> {
     technicalScore: signal.score,
     regime,
     fearGreedIndex: fearGreed.value,
+    scalpMode: isScalpRegime,
   });
 
   // スコアリングエンジンの結果でdecisionを上書き
@@ -607,9 +621,10 @@ async function runCycleForPair(pair: string): Promise<void> {
         state.riskManager.recordTrade(pnl);
         state.livePositions.delete(pair);
         if (pnl < 0) {
-          state.cooldownUntil.set(pair, Date.now() + COOLDOWN_MS_AFTER_LOSS);
+          const cdMs = adaptiveCooldownMs(pnlPercent);
+          state.cooldownUntil.set(pair, Date.now() + cdMs);
           await persistCooldowns();
-          console.log(`[${pair}] 負け確定 → クールダウン ${COOLDOWN_MS_AFTER_LOSS / 60000}分セット`);
+          console.log(`[${pair}] 負け確定 (${pnlPercent.toFixed(2)}%) → クールダウン ${cdMs / 60000}分セット`);
         }
 
         await saveData("live-trades", state.liveTrades.slice(-200));
@@ -691,9 +706,10 @@ async function runCycleForPair(pair: string): Promise<void> {
           state.riskManager.recordTrade(pnl);
           state.livePositions.delete(pair);
           if (triggerType === "stop_loss" || pnl < 0) {
-            state.cooldownUntil.set(pair, Date.now() + COOLDOWN_MS_AFTER_LOSS);
+            const cdMs = adaptiveCooldownMs(pnlPercent);
+            state.cooldownUntil.set(pair, Date.now() + cdMs);
             await persistCooldowns();
-            console.log(`[${pair}] SL/負け確定 → クールダウン ${COOLDOWN_MS_AFTER_LOSS / 60000}分セット`);
+            console.log(`[${pair}] SL/負け確定 (${pnlPercent.toFixed(2)}%) → クールダウン ${cdMs / 60000}分セット`);
           }
 
           await saveData("live-trades", state.liveTrades.slice(-200));
