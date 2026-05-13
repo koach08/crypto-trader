@@ -18,6 +18,8 @@ import { computeLifetimePnL } from "./lifetime";
 import { fetchExternalBias } from "../external/investment-app";
 import { detectBottomOpportunity, detectTopOpportunity } from "../quant/timing";
 import { tryOpenFXLong, checkFXPositionExit } from "./fx-engine";
+import { reflectOnLoss } from "../quant/reflection";
+import { getActiveLessons, matchLessons, rebuildLessonsFromReflections } from "../quant/lessons";
 
 // 緊急ロスカット閾値（pipelineと無関係に発火）
 const EMERGENCY_LOSS_PERCENT = 5.0;
@@ -145,6 +147,29 @@ function adaptiveCooldownMs(pnlPercent: number): number {
 // Maker-only 指値モード: 約定すれば手数料 0%。timeout で成行フォールバック
 const USE_MAKER_ONLY = process.env.USE_MAKER_ONLY !== "false";  // default true
 const MAKER_TIMEOUT_MS = Number(process.env.MAKER_TIMEOUT_MS ?? "30000");
+
+/** 負けトレード後の AI 振り返り → ルール化。失敗しても黙って続行 */
+async function triggerLossReflection(
+  pair: string,
+  pnl: number,
+  pnlPercent: number,
+  exitPrice: number,
+  exitReason: string,
+): Promise<void> {
+  if (pnl >= 0) return; // 勝ちトレードは反省不要
+  try {
+    const recentAudits = await getAudits(20);
+    const audit = recentAudits.reverse().find(a => a.pair === pair && (a.finalAction === "BUY" || a.finalAction === "SELL"));
+    if (!audit) return;
+    await reflectOnLoss(audit, { pnl, pnlPercent, exitPrice, exitReason });
+    // 5 取引ごとに lessons 再構築 (重い処理ではないので頻度高め)
+    if (state.cycleCount % 5 === 0) {
+      await rebuildLessonsFromReflections();
+    }
+  } catch (e) {
+    console.warn("[reflection] トリガー失敗:", e instanceof Error ? e.message : e);
+  }
+}
 
 /**
  * BUY 実行ヘルパー: maker 指値を試し、timeout なら成行にフォールバック。
@@ -601,6 +626,35 @@ async function runCycleForPair(pair: string): Promise<void> {
         console.log(`[${pair}] BUY見送り: ${externalBias.pauseReason}`);
         return;
       }
+      // Lessons learned: 過去同じパターンで複数回負けてたら BUY 見送り
+      try {
+        const activeLessons = await getActiveLessons();
+        if (activeLessons.length > 0) {
+          const rsiVals = (await import("../indicators")).rsi(bars.map(b => b.close), 14);
+          const lastRSI = rsiVals.filter((v): v is number => v != null).slice(-1)[0];
+          const check = matchLessons(
+            {
+              action: "BUY",
+              pair,
+              regime,
+              fearGreed: fearGreed.value,
+              rsi: lastRSI,
+              composite: scoringResult.audit.votes.reduce((s, v) => s + v.score * v.weight, 0),
+              confidence: decision.confidence,
+            },
+            activeLessons,
+          );
+          if (check.blocked) {
+            console.log(`[${pair}] BUY見送り: 学習ルール ${check.matched.length}件 hit`);
+            for (const m of check.matched) {
+              console.log(`  → ${m.rule.slice(0, 80)} (${m.reason})`);
+            }
+            return;
+          }
+        }
+      } catch (e) {
+        console.warn(`[${pair}] lessons チェック失敗:`, e instanceof Error ? e.message : e);
+      }
       // Profit-First: 日次目標達成済みなら新規エントリー停止 (利益を守る)
       const dailyPnL = state.riskManager.getDailyPnL();
       const dailyTargetJPY = (dailyPnL.startCapitalJPY * DAILY_TARGET_PERCENT) / 100;
@@ -722,6 +776,8 @@ async function runCycleForPair(pair: string): Promise<void> {
         console.log(`[${pair}] LIVE SELL: 損益 ¥${pnl.toLocaleString()} (${pnlPercent.toFixed(1)}%)`);
         // 監査ログに結果を記録（改善ループ用）
         await recordOutcome(pair, fillPrice, pnl, pnlPercent).catch(() => {});
+        // 負けトレードなら AI 振り返り → ルール抽出
+        triggerLossReflection(pair, pnl, pnlPercent, fillPrice, "AI_SELL").catch(() => {});
       } catch (e) {
         console.error(`[${pair}] LIVE SELL 失敗:`, e);
       }
@@ -806,6 +862,8 @@ async function runCycleForPair(pair: string): Promise<void> {
           await saveData("live-positions", Array.from(state.livePositions.values()));
           console.log(`[${pair}] LIVE ${triggerType.toUpperCase()}: 損益 ¥${pnl.toLocaleString()} (${pnlPercent.toFixed(1)}%)`);
           await recordOutcome(pair, fillPrice, pnl, pnlPercent).catch(() => {});
+          // 負けトレードなら AI 振り返り → ルール抽出
+          triggerLossReflection(pair, pnl, pnlPercent, fillPrice, triggerType).catch(() => {});
         } catch (e) {
           console.error(`[${pair}] LIVE ${triggerType.toUpperCase()} 失敗:`, e);
         }
@@ -1104,6 +1162,7 @@ async function emergencyLossCut(pair: string, currentPrice: number): Promise<boo
     await saveData("live-trades", state.liveTrades.slice(-200));
     await saveData("live-positions", Array.from(state.livePositions.values()));
     await recordOutcome(pair, fillPrice, pnl, pnlPercent).catch(() => {});
+    triggerLossReflection(pair, pnl, pnlPercent, fillPrice, "EMERGENCY").catch(() => {});
     console.log(`[${pair}] 緊急ロスカット執行: 損益 ¥${Math.round(pnl).toLocaleString()} (${pnlPercent.toFixed(1)}%)`);
     return true;
   } catch (e) {
