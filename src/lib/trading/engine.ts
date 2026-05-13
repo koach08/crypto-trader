@@ -16,6 +16,7 @@ import { checkMTFAlignment, checkEdge, calibrateConfidence, computeTrailingStop,
 import { atr as atrIndicator } from "../indicators";
 import { computeLifetimePnL } from "./lifetime";
 import { fetchExternalBias } from "../external/investment-app";
+import { detectBottomOpportunity, detectTopOpportunity } from "../quant/timing";
 
 // 緊急ロスカット閾値（pipelineと無関係に発火）
 const EMERGENCY_LOSS_PERCENT = 5.0;
@@ -357,6 +358,31 @@ async function runCycleForPair(pair: string): Promise<void> {
   decision.action = scoringResult.action;
   decision.confidence = scoringResult.confidence;
   decision.reason = scoringResult.reason;
+
+  // === タイミング検出 override (底打ち / 天井) ===
+  // 通常の scoring engine は trend-follow 寄り。マルチソースで「ここが底」と
+  // 判定できれば、regime を無視して BUY override (押し目買い)。同様に天井で
+  // SELL override (利確)。3/4 条件揃わないと発火しない (過剰反応防止)。
+  const timingInput = {
+    bars,
+    cryptoFearGreed: fearGreed.value,
+    externalBias,
+    price: ticker.price,
+  };
+  const bottomOp = detectBottomOpportunity(timingInput);
+  const topOp = detectTopOpportunity(timingInput);
+
+  if (bottomOp.fire && decision.action !== "BUY") {
+    console.log(`[${pair}] 🔻 底打ち検出 → BUY override (${bottomOp.confidence}% 確信): ${bottomOp.conditions.join(" / ")}`);
+    decision.action = "BUY";
+    decision.confidence = bottomOp.confidence;
+    decision.reason = `[底打ちoverride ${bottomOp.confidence}%] ${bottomOp.conditions.join(" / ")}`;
+  } else if (topOp.fire && decision.action !== "SELL") {
+    console.log(`[${pair}] 🔺 天井検出 → SELL override (${topOp.confidence}% 確信): ${topOp.conditions.join(" / ")}`);
+    decision.action = "SELL";
+    decision.confidence = topOp.confidence;
+    decision.reason = `[天井override ${topOp.confidence}%] ${topOp.conditions.join(" / ")}`;
+  }
 
   // === 取引規律フィルタ群（Alpha Arena 教訓） ===
   // 勝ち取引の率を上げるため、期待値マイナスの取引を排除する
