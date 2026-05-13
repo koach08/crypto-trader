@@ -15,6 +15,7 @@ import { computeLearnedWeights } from "../quant/signal-learning";
 import { checkMTFAlignment, checkEdge, calibrateConfidence, computeTrailingStop, checkSentimentEdge } from "./discipline";
 import { atr as atrIndicator } from "../indicators";
 import { computeLifetimePnL } from "./lifetime";
+import { fetchExternalBias } from "../external/investment-app";
 
 // 緊急ロスカット閾値（pipelineと無関係に発火）
 const EMERGENCY_LOSS_PERCENT = 5.0;
@@ -324,6 +325,16 @@ async function runCycleForPair(pair: string): Promise<void> {
   }
 
   // === クオンツ分析 + スコアリングエンジン ===
+  // 外部マルチソース bias (investment-app: news/macro/fed-tone/F&G)
+  // 各 API はキャッシュ付き、サイクル毎の呼出しはほぼ無料
+  let externalBias: Awaited<ReturnType<typeof fetchExternalBias>> | null = null;
+  try {
+    const baseSym = pair.split("/")[0].toLowerCase();
+    externalBias = await fetchExternalBias([baseSym, "crypto", "暗号"]);
+  } catch (e) {
+    console.warn(`[${pair}] external bias 取得失敗:`, e instanceof Error ? e.message : e);
+  }
+
   // LLMの判断を「アドバイザーの1人」として、統計的シグナルと合議で最終判断
   const quantAnalysis = runQuantAnalysis(bars);
   const scoringResult = calculateFinalDecision({
@@ -336,6 +347,10 @@ async function runCycleForPair(pair: string): Promise<void> {
     technicalScore: signal.score,
     regime,
     fearGreedIndex: fearGreed.value,
+    externalBias: externalBias ? {
+      score: externalBias.score,
+      reason: externalBias.components.map(c => c.name).join(","),
+    } : null,
   });
 
   // スコアリングエンジンの結果でdecisionを上書き
@@ -539,6 +554,11 @@ async function runCycleForPair(pair: string): Promise<void> {
       // taker fallback の場合のみ低流動性時間帯を回避。
       if (!USE_MAKER_ONLY && isLowLiquidityHourJST()) {
         console.log(`[${pair}] BUY見送り: 低流動性時間帯 (JST 3-7時, taker mode)`);
+        return;
+      }
+      // 重要経済指標 6h 以内 → 取引控える (FOMC/雇用統計などで暴騰暴落リスク)
+      if (externalBias?.pause) {
+        console.log(`[${pair}] BUY見送り: ${externalBias.pauseReason}`);
         return;
       }
       // Profit-First: 日次目標達成済みなら新規エントリー停止 (利益を守る)

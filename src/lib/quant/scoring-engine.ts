@@ -39,6 +39,9 @@ interface ScoringInput {
 
   /** スキャル mode: RANGING で頻度優先、閾値半減 */
   scalpMode?: boolean;
+
+  /** investment-app からのマルチソース bias (-100 〜 +100) */
+  externalBias?: { score: number; reason: string } | null;
 }
 
 interface ScoringResult {
@@ -49,12 +52,13 @@ interface ScoringResult {
 }
 
 // ソースごとの重み（合計100%）
-// Alpha Arena 教訓を反映: AI ウェイトを 25% → 10% に下げ、quant/regime を強化
+// 投資app マルチソース統合: 各ソースの依存度を分散
 const WEIGHTS = {
-  quant: 0.45,
-  ai: 0.10,        // AI は veto 寄り、メインドライバーから外す
-  technical: 0.20,
-  regime: 0.25,    // レジームを大きめにして「市場の方向に逆らわない」
+  quant: 0.35,        // 0.45 → 0.35
+  ai: 0.10,
+  technical: 0.15,    // 0.20 → 0.15
+  regime: 0.20,       // 0.25 → 0.20
+  external: 0.20,     // ★新規: investment-app news/macro/fed-tone/F&G 統合
 };
 
 // 取引閾値: 「動かない bot は人間以下」。動く方向で全面緩和。
@@ -98,13 +102,15 @@ export function calculateFinalDecision(input: ScoringInput): ScoringResult {
   const aiScore = aiToScore(input.aiAction, input.aiConfidence);
   const techScore = normalizeTechnical(input.technicalScore);
   const regimeResult = regimeToScore(input.regime);
+  const externalScore = input.externalBias?.score ?? 0;
 
   // 加重平均スコア
   const compositeScore =
     quantScore * WEIGHTS.quant +
     aiScore * WEIGHTS.ai +
     techScore * WEIGHTS.technical +
-    regimeResult.score * WEIGHTS.regime;
+    regimeResult.score * WEIGHTS.regime +
+    externalScore * WEIGHTS.external;
 
   // 各ソースの一致度チェック: 「方向のあるソース」のみカウント (HOLD/0は除外)
   const directions = [
@@ -112,6 +118,7 @@ export function calculateFinalDecision(input: ScoringInput): ScoringResult {
     Math.sign(aiScore),
     Math.sign(techScore),
     Math.sign(regimeResult.score),
+    Math.sign(externalScore),
   ];
   const directional = directions.filter((d) => d !== 0);
   const buyVotes = directional.filter((d) => d > 0).length;
@@ -161,6 +168,9 @@ export function calculateFinalDecision(input: ScoringInput): ScoringResult {
     reasons.push(`テクニカル: ${techScore > 0 ? "買い" : "売り"} (${input.technicalScore})`);
   }
   reasons.push(`レジーム: ${regimeResult.reason}`);
+  if (input.externalBias && Math.abs(externalScore) >= 10) {
+    reasons.push(`外部: ${externalScore > 0 ? "買い" : "売り"}寄り (${externalScore.toFixed(0)}pt) ${input.externalBias.reason}`);
+  }
 
   const reason = `[総合${compositeScore.toFixed(0)}pt, 一致${(agreement * 100).toFixed(0)}%] ${reasons.join(" | ")}`;
 
@@ -202,6 +212,14 @@ export function calculateFinalDecision(input: ScoringInput): ScoringResult {
         confidence: 75,
         weight: WEIGHTS.regime,
         reasons: [regimeResult.reason],
+      },
+      {
+        source: "external",
+        action: externalScore > 15 ? "BUY" : externalScore < -15 ? "SELL" : "HOLD",
+        score: externalScore,
+        confidence: input.externalBias ? 70 : 0,
+        weight: WEIGHTS.external,
+        reasons: input.externalBias ? [input.externalBias.reason] : ["external 取得失敗"],
       },
     ],
     marketState: {
