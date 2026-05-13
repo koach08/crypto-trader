@@ -17,6 +17,7 @@ import { atr as atrIndicator } from "../indicators";
 import { computeLifetimePnL } from "./lifetime";
 import { fetchExternalBias } from "../external/investment-app";
 import { detectBottomOpportunity, detectTopOpportunity } from "../quant/timing";
+import { tryOpenFXLong, checkFXPositionExit } from "./fx-engine";
 
 // 緊急ロスカット閾値（pipelineと無関係に発火）
 const EMERGENCY_LOSS_PERCENT = 5.0;
@@ -382,6 +383,19 @@ async function runCycleForPair(pair: string): Promise<void> {
     decision.action = "SELL";
     decision.confidence = topOp.confidence;
     decision.reason = `[天井override ${topOp.confidence}%] ${topOp.conditions.join(" / ")}`;
+  }
+
+  // === FX レバ (BTC/JPY のみ): 高確信底打ちで LONG エントリー、毎サイクル TP/SL チェック ===
+  if (pair === "BTC/JPY") {
+    // 既存ポジションの TP/SL チェック
+    await checkFXPositionExit(ticker.price).catch(e => console.warn("[fx] check 失敗:", e));
+    // 高確信 BOTTOM_BUY 検出時のみエントリー (USE_FX_LEVERAGE が true でないと内部で skip)
+    if (bottomOp.fire && bottomOp.confidence >= 80) {
+      await tryOpenFXLong({
+        confidence: bottomOp.confidence,
+        source: `底打ち ${bottomOp.conditions.join(",")}`,
+      }).catch(e => console.warn("[fx] open 失敗:", e));
+    }
   }
 
   // === 取引規律フィルタ群（Alpha Arena 教訓） ===
