@@ -20,6 +20,7 @@ import { detectBottomOpportunity, detectTopOpportunity } from "../quant/timing";
 import { tryOpenFXLong, checkFXPositionExit } from "./fx-engine";
 import { reflectOnLoss } from "../quant/reflection";
 import { getActiveLessons, matchLessons, rebuildLessonsFromReflections } from "../quant/lessons";
+import { computeAllocations, type ForwardSignal, type PairAllocation } from "./capital-allocator";
 
 // 緊急ロスカット閾値（pipelineと無関係に発火）
 const EMERGENCY_LOSS_PERCENT = 5.0;
@@ -113,6 +114,10 @@ interface EngineState {
   liveTrades: TradeRecord[];
   /** SL/負け確定後のクールダウン (pair → unix ms。それまで BUY 禁止) */
   cooldownUntil: Map<string, number>;
+  /** 動的配分: ペア → 最大ポジション JPY (毎サイクル更新) */
+  pairAllocations: Map<string, number>;
+  /** 直近の配分計算結果 (dashboard 表示用) */
+  lastAllocationDetails: PairAllocation[];
 }
 
 const state: EngineState = {
@@ -130,6 +135,8 @@ const state: EngineState = {
   livePositions: new Map(),
   liveTrades: [],
   cooldownUntil: new Map(),
+  pairAllocations: new Map(),
+  lastAllocationDetails: [],
 };
 
 // 連敗ガード: SL や負け確定後、同じペアを一定時間 BUY 禁止 (リベンジ買い防止)
@@ -664,11 +671,13 @@ async function runCycleForPair(pair: string): Promise<void> {
       }
       const balance = await liveExchange.getBalance();
       const jpyFree = balance.find(b => b.currency === "JPY")?.free ?? 0;
+      // 動的配分: 既定値ではなく、capital-allocator が決めた pair 別上限を使う
+      const dynamicMax = state.pairAllocations.get(pair) ?? LIVE_MAX_POSITION_JPY;
       const baseTradeAmount = state.riskManager.calculatePositionSizeJPY(
         decision.confidence,
         jpyFree + currentPositionJPY,
         currentPositionJPY,
-        LIVE_MAX_POSITION_JPY,
+        dynamicMax,
       );
       // Volatility-targeted sizing: 高ボラなら小さく、低ボラなら標準
       const volFactor = volScalingFactor(lastATR, ticker.price, 1.0);
@@ -979,6 +988,41 @@ async function runCycle(): Promise<void> {
     }
   } catch (e) {
     console.error("日付ロールオーバー失敗:", e);
+  }
+
+  // === 動的資金配分: 全ペア軽量スキャン → 配分決定 ===
+  // 各ペアの過去成績 + forward signal (現在の quant edge) で配分。
+  // この前段で「どこに資金集中すべきか」を毎サイクル決める。
+  try {
+    const totalCapital = state.riskManager.getDailyPnL().startCapitalJPY || 50000;
+    const forwardSignals: ForwardSignal[] = [];
+    if (!state.paperMode) {
+      const liveExchange = getExchange();
+      for (const pair of state.pairs) {
+        try {
+          const bars = await liveExchange.getOHLCV(pair, "1h", 100);
+          if (!bars || bars.length < 50) continue;
+          const qa = runQuantAnalysis(bars);
+          forwardSignals.push({
+            pair,
+            edgeScore: qa.compositeScore, // -100 〜 +100
+            reason: `composite ${qa.compositeScore}, conf ${qa.compositeConfidence}`,
+          });
+        } catch {/* スキャン失敗時はそのペアをスキップ */}
+      }
+    }
+    const allocations = computeAllocations(totalCapital, state.pairs, state.liveTrades, forwardSignals);
+    state.lastAllocationDetails = allocations;
+    state.pairAllocations.clear();
+    for (const a of allocations) state.pairAllocations.set(a.pair, a.maxJPY);
+    if (state.cycleCount % 6 === 0 && allocations.length > 0) {
+      console.log("[配分] 動的資金配分:");
+      for (const a of allocations) {
+        console.log(`  ${a.pair}: ¥${a.maxJPY.toLocaleString()} (${a.multiplier.toFixed(2)}x) — ${a.reason}`);
+      }
+    }
+  } catch (e) {
+    console.warn("[配分] 計算失敗:", e instanceof Error ? e.message : e);
   }
 
   for (const pair of state.pairs) {
@@ -1340,6 +1384,10 @@ export function getPositions() {
 
 export function getDailyPnL() {
   return state.riskManager.getDailyPnL();
+}
+
+export async function getEngineAllocations() {
+  return state.lastAllocationDetails;
 }
 
 export function getCumulativePnL() {
