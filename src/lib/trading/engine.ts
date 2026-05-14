@@ -17,6 +17,7 @@ import { atr as atrIndicator } from "../indicators";
 import { computeLifetimePnL } from "./lifetime";
 import { fetchExternalBias } from "../external/investment-app";
 import { detectBottomOpportunity, detectTopOpportunity } from "../quant/timing";
+import { analyzeMultiTimeframe } from "../quant/timeframe-analyzer";
 import { tryOpenFXLong, checkFXPositionExit } from "./fx-engine";
 import { reflectOnLoss } from "../quant/reflection";
 import { getActiveLessons, matchLessons, rebuildLessonsFromReflections } from "../quant/lessons";
@@ -288,16 +289,19 @@ async function runCycleForPair(pair: string): Promise<void> {
     return;
   }
 
-  // Fetch data
+  // Fetch data (短期 1h + 中期 4h + 長期 1d を並列取得)
   STEP("2-fetch-start");
-  const [ticker, bars, balance, position, fearGreed] = await Promise.all([
+  const emptyBars: import("../types").OHLCVBar[] = [];
+  const [ticker, bars, fourHourBars, dailyBars, balance, position, fearGreed] = await Promise.all([
     exchange.getTicker(pair),
     exchange.getOHLCV(pair, "1h", 100),
+    exchange.getOHLCV(pair, "4h", 100).catch(() => emptyBars),
+    exchange.getOHLCV(pair, "1d", 100).catch(() => emptyBars),
     exchange.getBalance(),
     exchange.getPosition(pair),
     getFearGreedIndex(),
   ]);
-  STEP(`3-fetched price=${ticker?.price} bars=${bars?.length} fng=${fearGreed?.value}`);
+  STEP(`3-fetched price=${ticker?.price} bars=${bars?.length}/4h:${fourHourBars?.length}/1d:${dailyBars?.length} fng=${fearGreed?.value}`);
 
   // バー数不足は判断不能 → サイクルスキップ (CryptoCompare等の障害対策)
   if (!bars || bars.length < 50) {
@@ -416,6 +420,31 @@ async function runCycleForPair(pair: string): Promise<void> {
     decision.action = "SELL";
     decision.confidence = topOp.confidence;
     decision.reason = `[天井override ${topOp.confidence}%] ${topOp.conditions.join(" / ")}`;
+  }
+
+  // === MTF 短期/中期/長期 マルチタイムフレーム合議 ===
+  // 「歴史的に安い + 反転兆候 + 短期確認」が揃ったら底値仕込みで強制 BUY
+  // 逆に「歴史的に高い + 失速」なら強制 SELL
+  if (fourHourBars && fourHourBars.length >= 50 && dailyBars && dailyBars.length >= 50) {
+    const mtf = analyzeMultiTimeframe({
+      hourlyBars: bars,
+      fourHourBars,
+      dailyBars,
+    });
+    if (state.cycleCount % 6 === 0) {
+      console.log(`[${pair}] MTF: ${mtf.reason}`);
+    }
+    if (mtf.bottomFishing && decision.action !== "BUY") {
+      console.log(`[${pair}] 🎯 MTF 底値仕込み → BUY override: ${mtf.reason}`);
+      decision.action = "BUY";
+      decision.confidence = 80;
+      decision.reason = `[MTF底値 ${mtf.consensus}] 短${mtf.short.label} 中${mtf.medium.label} 長${mtf.long.label}`;
+    } else if (mtf.topTaking && decision.action !== "SELL") {
+      console.log(`[${pair}] 🔝 MTF 天井利確 → SELL override: ${mtf.reason}`);
+      decision.action = "SELL";
+      decision.confidence = 80;
+      decision.reason = `[MTF天井 ${mtf.consensus}] 短${mtf.short.label} 中${mtf.medium.label} 長${mtf.long.label}`;
+    }
   }
 
   // === FX レバ (BTC/JPY のみ): 高確信底打ちで LONG エントリー、毎サイクル TP/SL チェック ===

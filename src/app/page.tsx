@@ -558,13 +558,7 @@ export default function Dashboard() {
             確定 ¥{(pnl?.realizedPnL ?? 0).toLocaleString(undefined, { maximumFractionDigits: 0 })} / {pnl?.wins ?? 0}W {pnl?.losses ?? 0}L
           </div>
         </div>
-        <div className="bg-zinc-900 rounded-xl p-3 border border-zinc-800">
-          <div className="text-[10px] text-zinc-500 uppercase tracking-wider">セッション損益 <span className="text-zinc-600 normal-case">(再起動でリセット)</span></div>
-          <div className={`text-lg font-bold font-mono ${(cum?.totalPnL ?? 0) >= 0 ? "text-green-400" : "text-red-400"}`}>
-            ¥{(cum?.totalPnL ?? 0).toLocaleString(undefined, { maximumFractionDigits: 0 })}
-          </div>
-          <div className="text-[10px] text-zinc-500">{cum?.closedTrades ?? 0}回決済 WR{(cum?.winRate ?? 0).toFixed(0)}%</div>
-        </div>
+        {/* セッション損益カード削除 (累計損益と混同するため) */}
         <div className="bg-zinc-900 rounded-xl p-3 border border-zinc-800">
           <div className="text-[10px] text-zinc-500 uppercase tracking-wider">運用資金</div>
           <div className="text-lg font-bold font-mono">
