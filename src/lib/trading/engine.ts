@@ -21,6 +21,7 @@ import { tryOpenFXLong, checkFXPositionExit } from "./fx-engine";
 import { reflectOnLoss } from "../quant/reflection";
 import { getActiveLessons, matchLessons, rebuildLessonsFromReflections } from "../quant/lessons";
 import { computeAllocations, type ForwardSignal, type PairAllocation } from "./capital-allocator";
+import { analyzeLossPatterns } from "../quant/loss-analyzer";
 
 // 緊急ロスカット閾値（pipelineと無関係に発火）
 const EMERGENCY_LOSS_PERCENT = 5.0;
@@ -990,6 +991,22 @@ async function runCycle(): Promise<void> {
     console.error("日付ロールオーバー失敗:", e);
   }
 
+  // === 損失パターン分析 → 「ヤバいペア」を penalty 化 ===
+  let lossAnalysis: ReturnType<typeof analyzeLossPatterns> | null = null;
+  try {
+    const auditsForAnalysis = await getAudits(500);
+    lossAnalysis = analyzeLossPatterns(state.liveTrades, auditsForAnalysis);
+    if (state.cycleCount % 6 === 0 && lossAnalysis.patterns.length > 0) {
+      console.log("[損失分析] 検知パターン:");
+      for (const p of lossAnalysis.patterns.slice(0, 3)) {
+        console.log(`  [${p.category}] ${p.finding}`);
+        console.log(`     → ${p.suggestion}`);
+      }
+    }
+  } catch (e) {
+    console.warn("[損失分析] エラー:", e instanceof Error ? e.message : e);
+  }
+
   // === 動的資金配分: 全ペア軽量スキャン → 配分決定 ===
   // 各ペアの過去成績 + forward signal (現在の quant edge) で配分。
   // この前段で「どこに資金集中すべきか」を毎サイクル決める。
@@ -1012,6 +1029,14 @@ async function runCycle(): Promise<void> {
       }
     }
     const allocations = computeAllocations(totalCapital, state.pairs, state.liveTrades, forwardSignals);
+    // 損失分析の topPair (一番損失出してるペア) には penalty (50% 縮小)
+    if (lossAnalysis?.topPair && lossAnalysis.topPair.totalLoss < -300) {
+      const target = allocations.find(a => a.pair === lossAnalysis!.topPair!.pair);
+      if (target) {
+        target.maxJPY = Math.round(target.maxJPY * 0.5);
+        target.reason += ` | 🔻 損失集中ペナルティ 50% (累計 ¥${Math.round(lossAnalysis.topPair.totalLoss)})`;
+      }
+    }
     state.lastAllocationDetails = allocations;
     state.pairAllocations.clear();
     for (const a of allocations) state.pairAllocations.set(a.pair, a.maxJPY);
