@@ -23,6 +23,7 @@ import { reflectOnLoss } from "../quant/reflection";
 import { getActiveLessons, matchLessons, rebuildLessonsFromReflections } from "../quant/lessons";
 import { computeAllocations, type ForwardSignal, type PairAllocation } from "./capital-allocator";
 import { analyzeLossPatterns } from "../quant/loss-analyzer";
+import { getActiveOverrides, runStrategicRetrospective } from "../quant/retrospective";
 
 // 緊急ロスカット閾値（pipelineと無関係に発火）
 const EMERGENCY_LOSS_PERCENT = 5.0;
@@ -174,6 +175,12 @@ async function triggerLossReflection(
     // 5 取引ごとに lessons 再構築 (重い処理ではないので頻度高め)
     if (state.cycleCount % 5 === 0) {
       await rebuildLessonsFromReflections();
+    }
+    // 20 取引ごとに 戦略リトロスペクティブ (AI が全 trade 見直し → SL/TP/conf 倍率提案)
+    const tradeCount = state.liveTrades.filter(t => t.side === "sell" && t.pnl !== undefined).length;
+    if (tradeCount > 0 && tradeCount % 20 === 0) {
+      const audits = await getAudits(200);
+      await runStrategicRetrospective(state.liveTrades, audits, tradeCount).catch(() => null);
     }
   } catch (e) {
     console.warn("[reflection] トリガー失敗:", e instanceof Error ? e.message : e);
@@ -588,7 +595,18 @@ async function runCycleForPair(pair: string): Promise<void> {
       14,
     );
     const lastATR = atrValsForBuy.filter((v): v is number => v !== null).slice(-1)[0] ?? 0;
-    const regimeTpSl = regimeAdjustedTpSl(regime);
+    // 戦略 override 適用 (リトロスペクティブで AI が決めた SL/TP/conf 倍率)
+    const overrides = await getActiveOverrides();
+    const baseTpSl = regimeAdjustedTpSl(regime);
+    const regimeTpSl = {
+      tp: baseTpSl.tp * overrides.tpMultiplier,
+      sl: baseTpSl.sl * overrides.slMultiplier,
+    };
+    // 除外ペアチェック (リトロスペクティブで「やめろ」と判断されたペア)
+    if (overrides.excludePairs.includes(pair)) {
+      console.log(`[${pair}] 戦略除外中 (リトロスペクティブ判断: ${overrides.reasoning.slice(0, 50)}) → サイクル skip`);
+      return;
+    }
 
     // 残高はあるが livePos が無い → BitFlyer 約定履歴から FIFO で真の avg を計算
     // (旧実装は ticker.price を fake entry にしていて、TP/SL が経済実態と乖離してた)
@@ -644,7 +662,9 @@ async function runCycleForPair(pair: string): Promise<void> {
     }
 
     // BUY判断
-    if (decision.action === "BUY" && decision.confidence >= LIVE_CONFIDENCE_THRESHOLD) {
+    // リトロスペクティブで決まった confidence 加算を適用 (+ で厳しく、- で緩く)
+    const effectiveThreshold = LIVE_CONFIDENCE_THRESHOLD + overrides.confidenceBonus;
+    if (decision.action === "BUY" && decision.confidence >= effectiveThreshold) {
       // Cooldown: 直近 SL や負け確定があったペアはしばらく BUY 禁止 (リベンジ買い防止)
       const cdUntil = state.cooldownUntil.get(pair) ?? 0;
       if (Date.now() < cdUntil) {
