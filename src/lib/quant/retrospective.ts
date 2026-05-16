@@ -16,6 +16,19 @@ import type { TradeRecord } from "../types";
 import type { DecisionAudit } from "./audit-log";
 import { loadData, saveData } from "../data";
 
+export interface PairOverride {
+  /** このペア専用 SL multiplier */
+  slMultiplier: number;
+  /** このペア専用 TP multiplier */
+  tpMultiplier: number;
+  /** このペア専用 confidence 加算 */
+  confidenceBonus: number;
+  /** このペアの戦略タイプ */
+  style: "scalp" | "swing" | "position" | "hold-only";
+  /** AI 判断の根拠 */
+  reasoning: string;
+}
+
 export interface StrategyOverrides {
   /** 全体 SL multiplier (0.5 = 半分, 2.0 = 倍) */
   slMultiplier: number;
@@ -23,8 +36,10 @@ export interface StrategyOverrides {
   tpMultiplier: number;
   /** 全体 confidence threshold 加算 (例: +5 で閾値厳しく) */
   confidenceBonus: number;
-  /** ペアごとの取引除外フラグ */
+  /** ペアごとの取引除外フラグ — 最後の手段 (なるべく使わない) */
   excludePairs: string[];
+  /** ペアごとの専用戦略 (これが本命) */
+  perPair: Record<string, PairOverride>;
   /** 信頼度高い好みパターン (UI 表示用) */
   preferredPatterns: string[];
   /** 避けるべきパターン (UI 表示用) */
@@ -45,6 +60,7 @@ const DEFAULT_OVERRIDES: StrategyOverrides = {
   tpMultiplier: 1.0,
   confidenceBonus: 0,
   excludePairs: [],
+  perPair: {},
   preferredPatterns: [],
   avoidPatterns: [],
   reasoning: "初期値 (調整なし)",
@@ -52,13 +68,33 @@ const DEFAULT_OVERRIDES: StrategyOverrides = {
   basedOnTrades: 0,
 };
 
+function clampPairOverride(o: Partial<PairOverride>): PairOverride {
+  const style = (["scalp", "swing", "position", "hold-only"] as const).includes(o.style as never)
+    ? (o.style as PairOverride["style"])
+    : "swing";
+  return {
+    slMultiplier: Math.max(0.3, Math.min(3.0, o.slMultiplier ?? 1.0)),
+    tpMultiplier: Math.max(0.3, Math.min(3.0, o.tpMultiplier ?? 1.0)),
+    confidenceBonus: Math.max(-15, Math.min(25, o.confidenceBonus ?? 0)),
+    style,
+    reasoning: String(o.reasoning ?? "").slice(0, 300),
+  };
+}
+
 /** 安全範囲に強制 clamp */
 function clampOverrides(o: Partial<StrategyOverrides>): StrategyOverrides {
+  const perPair: Record<string, PairOverride> = {};
+  for (const [pair, override] of Object.entries(o.perPair ?? {})) {
+    if (typeof override === "object" && override !== null) {
+      perPair[pair] = clampPairOverride(override as Partial<PairOverride>);
+    }
+  }
   return {
     slMultiplier: Math.max(0.5, Math.min(2.0, o.slMultiplier ?? 1.0)),
     tpMultiplier: Math.max(0.5, Math.min(2.5, o.tpMultiplier ?? 1.0)),
     confidenceBonus: Math.max(-15, Math.min(20, o.confidenceBonus ?? 0)),
-    excludePairs: (o.excludePairs ?? []).slice(0, 3), // 最大 3 ペア除外
+    excludePairs: (o.excludePairs ?? []).slice(0, 3),
+    perPair,
     preferredPatterns: (o.preferredPatterns ?? []).slice(0, 5),
     avoidPatterns: (o.avoidPatterns ?? []).slice(0, 5),
     reasoning: String(o.reasoning ?? "").slice(0, 1000),
@@ -145,42 +181,58 @@ export async function runStrategicRetrospective(
     .map(([p, d]) => `  ${p}: ${d.count}件 WR${(d.wins / d.count * 100).toFixed(0)}% PnL¥${d.pnl.toFixed(0)}`)
     .join("\n");
 
-  const prompt = `あなたは crypto bot トレーダーのストラテジスト. 直近 ${enriched.length} 取引のデータを見て、戦略の調整を JSON で提案してください.
+  const prompt = `あなたは crypto bot トレーダーのストラテジスト. 直近 ${enriched.length} 取引のデータを見て、戦略を JSON で提案してください.
 
-## 集計
+**重要**: 「負けてるペアを除外する」は最終手段です. まず「**ペアごとに合った戦略**」を提案してください.
+例えば XRP は値動き小さい銀行系銘柄なので、ETH 用の TP/SL では機能しないことが多いです.
+各ペアの特性に合わせた tp/sl/confidence を per-pair で出してください.
+
+## 全体集計
 - 総取引: ${enriched.length}
 - 勝率: ${(winRate * 100).toFixed(1)}% (W${wins.length} / L${losses.length})
 - 累計損益: ¥${totalPnL.toFixed(0)}
 - 平均勝ち: ¥${avgWin.toFixed(0)}
 - 平均負け: ¥${avgLoss.toFixed(0)}
-- R:R 実績: ${avgLoss !== 0 ? Math.abs(avgWin / avgLoss).toFixed(2) : "N/A"}
 
 ## ペア別
 ${pairSummary}
 
-## 取引履歴 (新しい順)
+## 取引履歴 (新しい順 50件まで)
 ${tradeRows}
 
-## 質問
-次の戦略パラメータをどう調整すべきか、JSON で返してください:
+## 期待する JSON 形式
+
 {
-  "slMultiplier": <0.5-2.0 の数値、現在の SL を倍率調整。例 0.7 = SL 30%厳しく>,
-  "tpMultiplier": <0.5-2.5 の数値、現在の TP を倍率調整。例 1.5 = TP 50%広く>,
-  "confidenceBonus": <-15 〜 +20 の数値、確信度閾値の加算。+ で厳しく>,
-  "excludePairs": [<取引から完全除外すべきペア>], 最大 3 つ,
-  "preferredPatterns": [<勝ちやすいパターン>], 短文で 3 個,
-  "avoidPatterns": [<避けるべきパターン>], 短文で 3 個,
-  "reasoning": "<3-4 行で根拠説明>"
+  "slMultiplier": <0.5-2.0、全体 SL 倍率>,
+  "tpMultiplier": <0.5-2.5、全体 TP 倍率>,
+  "confidenceBonus": <-15..+20、全体閾値加算>,
+  "excludePairs": [],  // 原則空。ペア別 perPair で適応する事を推奨
+  "perPair": {
+    "XRP/JPY": {
+      "slMultiplier": <例: XRP のボラに合わせ 0.5 = SL タイト>,
+      "tpMultiplier": <例: 1.5 = TP 広げて少ない頻度で大きく取る>,
+      "confidenceBonus": <例: +10 = この pair はノイズ多いから厳しめ>,
+      "style": "scalp" | "swing" | "position" | "hold-only",
+      "reasoning": "短く根拠"
+    },
+    "ETH/JPY": { ... },
+    "BTC/JPY": { ... }
+  },
+  "preferredPatterns": [<勝ちやすいパターン 3つ>],
+  "avoidPatterns": [<避けるべきパターン 3つ>],
+  "reasoning": "<全体戦略 4-5 行>"
 }
 
-提案の方針:
-- WR 50% 未満なら閾値厳しく (confidenceBonus +5〜+10)
-- 平均負け > 平均勝ち なら SL タイト化 (slMultiplier 0.7)
-- 1ペアの WR 著しく低い (<30%) ならそのペアを exclude
-- WR 60%超え + R:R 良好なら TP 広く (tpMultiplier 1.3-1.5)
-- 何も顕著でなければ全部 1.0 (微調整不要)
+## ガイドライン
+- **負けてるペアこそ「ペア別戦略を立てる」**. 除外は最後の手段
+- 値動き小さいペア (XRP, XLM) → scalp 不向き. swing or position 向き. TP/SL 広く
+- 値動き大きいペア (ETH, MONA) → scalp 向きの可能性. TP/SL 通常
+- 大型流動性ペア (BTC) → 中速 swing 向き
+- WR 30% 以下なら style 変更を必須 (例: scalp → position)
+- "hold-only" は「新規 BUY 止めて含み益待ち」モード
+- excludePairs は完全に手に負えない場合の最終手段
 
-JSON のみ返答 (前後の解説不要)`;
+JSON のみ返答`;
 
   try {
     const resp = await ai.messages.create({
@@ -207,7 +259,10 @@ JSON のみ返答 (前後の解説不要)`;
     logs.push(overrides);
     await saveData(RETRO_LOG_FILE, logs.slice(-30));
 
-    console.log(`[retrospective] 戦略更新: SL×${overrides.slMultiplier} TP×${overrides.tpMultiplier} conf+${overrides.confidenceBonus} 除外[${overrides.excludePairs.join(",")}]`);
+    console.log(`[retrospective] 全体: SL×${overrides.slMultiplier} TP×${overrides.tpMultiplier} conf+${overrides.confidenceBonus}`);
+    for (const [pair, p] of Object.entries(overrides.perPair)) {
+      console.log(`[retrospective] ${pair}: SL×${p.slMultiplier} TP×${p.tpMultiplier} conf+${p.confidenceBonus} [${p.style}] — ${p.reasoning}`);
+    }
     console.log(`[retrospective] 根拠: ${overrides.reasoning}`);
     return overrides;
   } catch (e) {

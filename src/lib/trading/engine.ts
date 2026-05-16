@@ -595,18 +595,24 @@ async function runCycleForPair(pair: string): Promise<void> {
       14,
     );
     const lastATR = atrValsForBuy.filter((v): v is number => v !== null).slice(-1)[0] ?? 0;
-    // 戦略 override 適用 (リトロスペクティブで AI が決めた SL/TP/conf 倍率)
+    // 戦略 override 適用: 全体 + ペア別 (perPair 優先)
     const overrides = await getActiveOverrides();
+    const pairOverride = overrides.perPair[pair];
+    // ペア別倍率 > 全体倍率の順で適用
+    const effectiveSlMul = pairOverride?.slMultiplier ?? overrides.slMultiplier;
+    const effectiveTpMul = pairOverride?.tpMultiplier ?? overrides.tpMultiplier;
     const baseTpSl = regimeAdjustedTpSl(regime);
     const regimeTpSl = {
-      tp: baseTpSl.tp * overrides.tpMultiplier,
-      sl: baseTpSl.sl * overrides.slMultiplier,
+      tp: baseTpSl.tp * effectiveTpMul,
+      sl: baseTpSl.sl * effectiveSlMul,
     };
-    // 除外ペアチェック (リトロスペクティブで「やめろ」と判断されたペア)
+    // 除外ペア (最終手段)
     if (overrides.excludePairs.includes(pair)) {
-      console.log(`[${pair}] 戦略除外中 (リトロスペクティブ判断: ${overrides.reasoning.slice(0, 50)}) → サイクル skip`);
+      console.log(`[${pair}] 戦略除外中 → サイクル skip`);
       return;
     }
+    // hold-only モード: 新規 BUY 止めて既存ポジの含み益待ち
+    const isHoldOnly = pairOverride?.style === "hold-only";
 
     // 残高はあるが livePos が無い → BitFlyer 約定履歴から FIFO で真の avg を計算
     // (旧実装は ticker.price を fake entry にしていて、TP/SL が経済実態と乖離してた)
@@ -662,8 +668,14 @@ async function runCycleForPair(pair: string): Promise<void> {
     }
 
     // BUY判断
-    // リトロスペクティブで決まった confidence 加算を適用 (+ で厳しく、- で緩く)
-    const effectiveThreshold = LIVE_CONFIDENCE_THRESHOLD + overrides.confidenceBonus;
+    // リトロスペクティブで決まった confidence 加算を適用 (ペア別 > 全体)
+    const effectiveConfBonus = pairOverride?.confidenceBonus ?? overrides.confidenceBonus;
+    const effectiveThreshold = LIVE_CONFIDENCE_THRESHOLD + effectiveConfBonus;
+    // hold-only モード時は BUY 完全停止 (TP/SL は通常動作)
+    if (isHoldOnly && decision.action === "BUY") {
+      console.log(`[${pair}] hold-only モード: 新規 BUY 停止 (${pairOverride?.reasoning ?? ""})`);
+      return;
+    }
     if (decision.action === "BUY" && decision.confidence >= effectiveThreshold) {
       // Cooldown: 直近 SL や負け確定があったペアはしばらく BUY 禁止 (リベンジ買い防止)
       const cdUntil = state.cooldownUntil.get(pair) ?? 0;
