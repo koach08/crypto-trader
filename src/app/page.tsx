@@ -579,12 +579,12 @@ export default function Dashboard() {
 
       {/* 価格チャート */}
       <div className="bg-zinc-900 rounded-xl p-4 border border-zinc-800">
-        <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
           <h2 className="text-sm font-medium text-zinc-400">価格推移 (48h)</h2>
-          <div className="flex gap-1">
-            {["ETH/JPY", "XRP/JPY"].map(p => (
+          <div className="flex gap-1 flex-wrap">
+            {BITFLYER_PAIRS.map(p => (
               <button key={p} onClick={() => setActivePair(p)}
-                className={`px-2 py-0.5 rounded text-xs font-medium ${activePair === p ? "bg-blue-600 text-white" : "bg-zinc-800 text-zinc-400"}`}>
+                className={`px-2 py-0.5 rounded text-xs font-medium ${activePair === p ? "bg-blue-600 text-white" : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700"}`}>
                 {p.split("/")[0]}
               </button>
             ))}
