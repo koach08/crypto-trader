@@ -249,7 +249,9 @@ JSON のみ返答`;
       console.warn("[retrospective] JSON 抽出失敗");
       return null;
     }
-    const parsed = JSON.parse(jsonMatch[0]);
+    // Claude が "+8" と書く事がある (JSON spec 外) → "+" を除去
+    const sanitized = jsonMatch[0].replace(/:\s*\+(\d)/g, ": $1");
+    const parsed = JSON.parse(sanitized);
     const overrides = clampOverrides({ ...parsed, basedOnTrades: totalTradeCount });
 
     // 永続化
