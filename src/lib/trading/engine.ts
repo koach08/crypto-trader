@@ -16,7 +16,7 @@ import { checkMTFAlignment, checkEdge, calibrateConfidence, computeTrailingStop,
 import { atr as atrIndicator } from "../indicators";
 import { computeLifetimePnL } from "./lifetime";
 import { fetchExternalBias } from "../external/investment-app";
-import { detectBottomOpportunity, detectTopOpportunity } from "../quant/timing";
+import { detectBottomOpportunity, detectTopOpportunity, detectAggressiveReversal } from "../quant/timing";
 import { analyzeMultiTimeframe } from "../quant/timeframe-analyzer";
 import { tryOpenFXLong, checkFXPositionExit } from "./fx-engine";
 import { reflectOnLoss } from "../quant/reflection";
@@ -417,11 +417,20 @@ async function runCycleForPair(pair: string): Promise<void> {
   const bottomOp = detectBottomOpportunity(timingInput);
   const topOp = detectTopOpportunity(timingInput);
 
+  // 積極反転検出 (extreme 条件不要、段階的)
+  const reversalOp = detectAggressiveReversal(timingInput);
+
   if (bottomOp.fire && decision.action !== "BUY") {
     console.log(`[${pair}] 🔻 底打ち検出 → BUY override (${bottomOp.confidence}% 確信): ${bottomOp.conditions.join(" / ")}`);
     decision.action = "BUY";
     decision.confidence = bottomOp.confidence;
     decision.reason = `[底打ちoverride ${bottomOp.confidence}%] ${bottomOp.conditions.join(" / ")}`;
+  } else if (reversalOp.fire && decision.action !== "BUY") {
+    // 積極反転: 条件少ない代わりに confidence 段階 (65/78/88)
+    console.log(`[${pair}] 📈 反転検出 → BUY override (${reversalOp.confidence}% 確信): ${reversalOp.conditions.join(" / ")}`);
+    decision.action = "BUY";
+    decision.confidence = reversalOp.confidence;
+    decision.reason = `[反転 ${reversalOp.confidence}%] ${reversalOp.conditions.join(" / ")}`;
   } else if (topOp.fire && decision.action !== "SELL") {
     console.log(`[${pair}] 🔺 天井検出 → SELL override (${topOp.confidence}% 確信): ${topOp.conditions.join(" / ")}`);
     decision.action = "SELL";

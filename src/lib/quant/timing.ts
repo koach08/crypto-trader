@@ -35,6 +35,99 @@ interface DetectInput {
 const NULL_OPPORTUNITY: TimingOpportunity = { fire: false, type: null, confidence: 0, conditions: [], missing: [] };
 
 /**
+ * 段階的 反転検出 (積極版).
+ * 既存 detectBottomOpportunity は extreme 条件 (F&G≤25 必須等) で厳しすぎ。
+ * これは「下げ止まり初期サイン」を低い閾値で検出して entry チャンス増やす。
+ *
+ * 5 条件 多段判定:
+ *  1. 直近 6本 で -1.5% 以上の下落あった (底候補形成)
+ *  2. 直近 3本 のうち 1+ 陽線、または最後の low が前 low より高い (higher low)
+ *  3. 直近 1本 の volume が直近 10本平均の 1.2倍以上 (反発出来高)
+ *  4. RSI が直近 6本でボトムから 5pt 以上回復 (反発兆候)
+ *  5. 価格が直近 6本の安値の +1.5% 以内 (まだ底圏)
+ *
+ *  3/5 → confidence 65 (小さく試す)
+ *  4/5 → confidence 78 (通常)
+ *  5/5 → confidence 88 (確信)
+ */
+export function detectAggressiveReversal(input: DetectInput): TimingOpportunity {
+  const { bars, price } = input;
+  if (bars.length < 30) return NULL_OPPORTUNITY;
+
+  const conditions: string[] = [];
+  const missing: string[] = [];
+
+  const last6 = bars.slice(-6);
+  const last3 = bars.slice(-3);
+
+  // 条件1: 直近 6本 で -1.5% 以上下落あった
+  const high6 = Math.max(...last6.map(b => b.high));
+  const low6 = Math.min(...last6.map(b => b.low));
+  const drop6 = high6 > 0 ? ((high6 - low6) / high6) * 100 : 0;
+  if (drop6 >= 1.5) {
+    conditions.push(`直近6本で -${drop6.toFixed(1)}% 下落 (底候補)`);
+  } else {
+    missing.push(`下落 ${drop6.toFixed(1)}% < 1.5%`);
+  }
+
+  // 条件2: higher low or 陽線
+  const greenBars3 = last3.filter(b => b.close > b.open).length;
+  const lastLow = last3[last3.length - 1].low;
+  const prevLow = last3.length >= 2 ? last3[last3.length - 2].low : lastLow;
+  const isHigherLow = lastLow > prevLow;
+  if (greenBars3 >= 1 || isHigherLow) {
+    conditions.push(`反発: ${greenBars3 >= 1 ? `陽線 ${greenBars3}/3` : `higher low`}`);
+  } else {
+    missing.push(`陽線 ${greenBars3}/3 + 安値更新`);
+  }
+
+  // 条件3: 直近1本の volume が平均の 1.2倍以上 (反発出来高)
+  const last10Volume = bars.slice(-10).map(b => b.volume).filter(v => v > 0);
+  const avgVol = last10Volume.length > 0 ? last10Volume.reduce((s, v) => s + v, 0) / last10Volume.length : 0;
+  const lastVol = bars[bars.length - 1].volume;
+  if (avgVol > 0 && lastVol > avgVol * 1.2) {
+    conditions.push(`出来高 ${(lastVol / avgVol).toFixed(1)}x (反発確認)`);
+  } else {
+    missing.push(`出来高 ${avgVol > 0 ? (lastVol / avgVol).toFixed(1) : "0"}x < 1.2x`);
+  }
+
+  // 条件4: RSI 反発
+  const rsiVals = rsi(bars.map(b => b.close), 14).filter((v): v is number => v != null);
+  if (rsiVals.length >= 6) {
+    const recent6Rsi = rsiVals.slice(-6);
+    const minRsi = Math.min(...recent6Rsi);
+    const lastRsi = recent6Rsi[recent6Rsi.length - 1];
+    if (lastRsi - minRsi >= 5) {
+      conditions.push(`RSI ${minRsi.toFixed(0)} → ${lastRsi.toFixed(0)} 反発`);
+    } else {
+      missing.push(`RSI 反発 ${(lastRsi - minRsi).toFixed(1)}pt < 5pt`);
+    }
+  }
+
+  // 条件5: まだ底圏 (安値から +1.5% 以内)
+  if (price > 0 && low6 > 0 && (price - low6) / low6 < 0.015) {
+    conditions.push(`底圏 +${(((price - low6) / low6) * 100).toFixed(1)}% (低値から近い)`);
+  } else {
+    missing.push(`底圏外 +${low6 > 0 ? (((price - low6) / low6) * 100).toFixed(1) : "?"}% > 1.5%`);
+  }
+
+  const hits = conditions.length;
+  let fire = false;
+  let confidence = 0;
+  if (hits >= 5) { fire = true; confidence = 88; }
+  else if (hits >= 4) { fire = true; confidence = 78; }
+  else if (hits >= 3) { fire = true; confidence = 65; }
+
+  return {
+    fire,
+    type: fire ? "BOTTOM_BUY" : null,
+    confidence,
+    conditions,
+    missing,
+  };
+}
+
+/**
  * 底打ち検出: 売られすぎが複数ソースで確認できたら BUY 強制発火
  *
  * 4 条件中 3 つ以上 揃えば発火 (1-2 つだと過剰反応リスク)
