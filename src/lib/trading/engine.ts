@@ -18,7 +18,8 @@ import { computeLifetimePnL } from "./lifetime";
 import { fetchExternalBias } from "../external/investment-app";
 import { getAggregatedIntel } from "../intel/aggregator";
 import { detectBottomOpportunity, detectTopOpportunity, detectAggressiveReversal } from "../quant/timing";
-import { analyzeMultiTimeframe } from "../quant/timeframe-analyzer";
+import { analyzeMultiTimeframe, type MultiTimeframeAnalysis } from "../quant/timeframe-analyzer";
+import { classifyPositionStyle } from "./position-style";
 import { tryOpenFXLong, checkFXPositionExit } from "./fx-engine";
 import { reflectOnLoss } from "../quant/reflection";
 import { getActiveLessons, matchLessons, rebuildLessonsFromReflections } from "../quant/lessons";
@@ -100,6 +101,16 @@ interface LivePositionEntry {
   entryTimestamp: string;
   stopLossPercent: number;
   takeProfitPercent: number;
+  /** Position style: SCALP / SWING / HOLD (デフォルト SCALP 互換) */
+  style?: "SCALP" | "SWING" | "HOLD";
+  /** style 決定理由 */
+  styleReason?: string;
+  /** 部分利確段階 (style 別に定義) */
+  partialTakeProfits?: { triggerPercent: number; sellRatio: number; newSlPercent: number }[];
+  /** 既に発火した PTP の index (次は ptpTriggeredCount から) */
+  ptpTriggeredCount?: number;
+  /** 元の amount (PTP で減ってもこの値で総 P&L 計算可) */
+  originalAmount?: number;
 }
 
 interface EngineState {
@@ -798,26 +809,44 @@ async function runCycleForPair(pair: string): Promise<void> {
           state.recentTrades.push(trade);
           state.liveTrades.push(trade);
 
-          // ポジション追跡（Profit-First TP/SL を強制採用）
+          // ポジション追跡 — style 分類 (SCALP/SWING/HOLD) で TP/SL + PTP 決定
+          const styleParams = classifyPositionStyle({
+            composite: scoringResult.audit.votes.reduce((s, v) => s + v.score * v.weight, 0),
+            regime,
+            fearGreed: fearGreed.value,
+            mtf: (fourHourBars && fourHourBars.length >= 50 && dailyBars && dailyBars.length >= 50)
+              ? analyzeMultiTimeframe({ hourlyBars: bars, fourHourBars, dailyBars })
+              : null,
+            bottomOp,
+          });
           const existing = state.livePositions.get(pair);
           if (existing) {
             const totalAmount = existing.amount + order.amount;
             const avgPrice = (existing.entryPrice * existing.amount + order.price * order.amount) / totalAmount;
             existing.entryPrice = avgPrice;
             existing.amount = totalAmount;
-            existing.stopLossPercent = regimeTpSl.sl;
-            existing.takeProfitPercent = regimeTpSl.tp;
+            // 追加 BUY: style は既存維持 (途中で SCALP → HOLD に切替は混乱)
+            existing.stopLossPercent = styleParams.style === existing.style ? styleParams.slPercent : existing.stopLossPercent;
+            existing.takeProfitPercent = styleParams.style === existing.style ? styleParams.tpPercent : existing.takeProfitPercent;
           } else {
             state.livePositions.set(pair, {
               pair,
               entryPrice: order.price,
               amount: order.amount,
               entryTimestamp: new Date().toISOString(),
-              stopLossPercent: regimeTpSl.sl,
-              takeProfitPercent: regimeTpSl.tp,
+              stopLossPercent: styleParams.slPercent,
+              takeProfitPercent: styleParams.tpPercent,
+              style: styleParams.style,
+              styleReason: styleParams.reasoning,
+              partialTakeProfits: styleParams.partialTakeProfits,
+              ptpTriggeredCount: 0,
+              originalAmount: order.amount,
             });
           }
-          console.log(`[${pair}] LIVE BUY ${regime} → TP${regimeTpSl.tp}% / SL${regimeTpSl.sl}% 設定`);
+          const ptpInfo = styleParams.partialTakeProfits.length > 0
+            ? ` PTP[${styleParams.partialTakeProfits.map(p => `+${p.triggerPercent}%→${(p.sellRatio * 100).toFixed(0)}%売`).join(",")}]`
+            : "";
+          console.log(`[${pair}] LIVE BUY [${styleParams.style}] TP${styleParams.tpPercent}% / SL${styleParams.slPercent}%${ptpInfo} — ${styleParams.reasoning}`);
 
           await saveData("live-trades", state.liveTrades.slice(-200));
           await saveData("live-positions", Array.from(state.livePositions.values()));
@@ -908,10 +937,63 @@ async function runCycleForPair(pair: string): Promise<void> {
       const changePercent = ((ticker.price - livePos.entryPrice) / livePos.entryPrice) * 100;
       let triggerType: "stop_loss" | "take_profit" | null = null;
 
-      if (changePercent <= -livePos.stopLossPercent) {
-        triggerType = "stop_loss";
-      } else if (changePercent >= livePos.takeProfitPercent) {
-        triggerType = "take_profit";
+      // === Partial Take Profit (PTP) チェック ===
+      // 段階的に部分利確、残りは大きな move を狙う設計
+      if (livePos.partialTakeProfits && livePos.partialTakeProfits.length > 0) {
+        const nextPtpIndex = livePos.ptpTriggeredCount ?? 0;
+        const nextPtp = livePos.partialTakeProfits[nextPtpIndex];
+        if (nextPtp && changePercent >= nextPtp.triggerPercent && realPosition.free > 0) {
+          // 部分売却実行
+          const sellAmount = realPosition.free * nextPtp.sellRatio;
+          try {
+            const { order: ptpOrder } = await executeSell(liveExchange, pair, sellAmount);
+            const fillPrice = ptpOrder.price > 0 ? ptpOrder.price : ticker.price;
+            const partialPnl = (fillPrice - livePos.entryPrice) * ptpOrder.amount;
+            const partialPnlPct = ((fillPrice - livePos.entryPrice) / livePos.entryPrice) * 100;
+            const ptpTrade: TradeRecord = {
+              id: `ptp-${Date.now()}`,
+              timestamp: new Date().toISOString(),
+              exchange: "bitflyer",
+              pair,
+              side: "sell",
+              type: "take_profit",
+              amount: ptpOrder.amount,
+              price: fillPrice,
+              valueJPY: ptpOrder.amount * fillPrice,
+              orderId: ptpOrder.id,
+              fee: ptpOrder.fee ?? 0,
+              pnl: partialPnl,
+              pnlPercent: partialPnlPct,
+              paperTrade: false,
+            };
+            state.recentTrades.push(ptpTrade);
+            state.liveTrades.push(ptpTrade);
+            state.riskManager.recordTrade(partialPnl);
+            // SL を新しい位置に上書き
+            livePos.stopLossPercent = -nextPtp.newSlPercent; // newSlPercent は entry からの +X%
+            livePos.ptpTriggeredCount = nextPtpIndex + 1;
+            await saveData("live-trades", state.liveTrades.slice(-200));
+            await saveData("live-positions", Array.from(state.livePositions.values()));
+            console.log(`[${pair}] 🎯 PTP #${nextPtpIndex + 1}: +${changePercent.toFixed(2)}% で ${(nextPtp.sellRatio * 100).toFixed(0)}% 売却 (¥${Math.round(partialPnl).toLocaleString()})、残り SL を +${nextPtp.newSlPercent}% に移動`);
+            await recordOutcome(pair, fillPrice, partialPnl, partialPnlPct).catch(() => {});
+            // 全 PTP 終わってなければ trigger スキップ (継続保有)
+            triggerType = null;
+          } catch (e) {
+            console.error(`[${pair}] PTP 失敗:`, e instanceof Error ? e.message : e);
+          }
+        }
+      }
+
+      // Final TP/SL チェック (PTP 全消化後 or PTP 無し)
+      if (!triggerType) {
+        if (changePercent <= livePos.stopLossPercent) {
+          // SL は負値で扱う仕様 (PTP で SL を +X% にした時もこれで OK)
+          if (livePos.stopLossPercent < 0 && changePercent <= livePos.stopLossPercent) triggerType = "stop_loss";
+          else if (livePos.stopLossPercent >= 0 && changePercent <= livePos.stopLossPercent) triggerType = "stop_loss";
+        }
+        if (!triggerType && changePercent >= livePos.takeProfitPercent) {
+          triggerType = "take_profit";
+        }
       }
 
       if (triggerType) {
