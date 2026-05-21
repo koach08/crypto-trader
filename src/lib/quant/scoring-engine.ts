@@ -42,6 +42,9 @@ interface ScoringInput {
 
   /** investment-app からのマルチソース bias (-100 〜 +100) */
   externalBias?: { score: number; reason: string } | null;
+
+  /** intel (whale + community + funding) bias (-100 〜 +100) */
+  intelBias?: { score: number; reason: string } | null;
 }
 
 interface ScoringResult {
@@ -52,13 +55,14 @@ interface ScoringResult {
 }
 
 // ソースごとの重み（合計100%）
-// 投資app マルチソース統合: 各ソースの依存度を分散
+// Intel (whale/community/funding) 統合で再分配
 const WEIGHTS = {
-  quant: 0.35,        // 0.45 → 0.35
+  quant: 0.30,        // 0.35 → 0.30
   ai: 0.10,
-  technical: 0.15,    // 0.20 → 0.15
-  regime: 0.20,       // 0.25 → 0.20
-  external: 0.20,     // ★新規: investment-app news/macro/fed-tone/F&G 統合
+  technical: 0.10,    // 0.15 → 0.10
+  regime: 0.20,
+  external: 0.15,     // 0.20 → 0.15
+  intel: 0.15,        // ★新規: on-chain whale + community sentiment + funding rate
 };
 
 // 取引閾値: 「動かない bot は人間以下」。動く方向で全面緩和。
@@ -103,6 +107,7 @@ export function calculateFinalDecision(input: ScoringInput): ScoringResult {
   const techScore = normalizeTechnical(input.technicalScore);
   const regimeResult = regimeToScore(input.regime);
   const externalScore = input.externalBias?.score ?? 0;
+  const intelScore = input.intelBias?.score ?? 0;
 
   // 加重平均スコア
   const compositeScore =
@@ -110,7 +115,8 @@ export function calculateFinalDecision(input: ScoringInput): ScoringResult {
     aiScore * WEIGHTS.ai +
     techScore * WEIGHTS.technical +
     regimeResult.score * WEIGHTS.regime +
-    externalScore * WEIGHTS.external;
+    externalScore * WEIGHTS.external +
+    intelScore * WEIGHTS.intel;
 
   // 各ソースの一致度チェック: 「方向のあるソース」のみカウント (HOLD/0は除外)
   const directions = [
@@ -119,6 +125,7 @@ export function calculateFinalDecision(input: ScoringInput): ScoringResult {
     Math.sign(techScore),
     Math.sign(regimeResult.score),
     Math.sign(externalScore),
+    Math.sign(intelScore),
   ];
   const directional = directions.filter((d) => d !== 0);
   const buyVotes = directional.filter((d) => d > 0).length;
@@ -171,6 +178,9 @@ export function calculateFinalDecision(input: ScoringInput): ScoringResult {
   if (input.externalBias && Math.abs(externalScore) >= 10) {
     reasons.push(`外部: ${externalScore > 0 ? "買い" : "売り"}寄り (${externalScore.toFixed(0)}pt) ${input.externalBias.reason}`);
   }
+  if (input.intelBias && Math.abs(intelScore) >= 10) {
+    reasons.push(`Intel: ${intelScore > 0 ? "買い" : "売り"}寄り (${intelScore.toFixed(0)}pt) ${input.intelBias.reason}`);
+  }
 
   const reason = `[総合${compositeScore.toFixed(0)}pt, 一致${(agreement * 100).toFixed(0)}%] ${reasons.join(" | ")}`;
 
@@ -220,6 +230,14 @@ export function calculateFinalDecision(input: ScoringInput): ScoringResult {
         confidence: input.externalBias ? 70 : 0,
         weight: WEIGHTS.external,
         reasons: input.externalBias ? [input.externalBias.reason] : ["external 取得失敗"],
+      },
+      {
+        source: "intel",
+        action: intelScore > 15 ? "BUY" : intelScore < -15 ? "SELL" : "HOLD",
+        score: intelScore,
+        confidence: input.intelBias ? 70 : 0,
+        weight: WEIGHTS.intel,
+        reasons: input.intelBias ? [input.intelBias.reason] : ["intel 取得失敗"],
       },
     ],
     marketState: {

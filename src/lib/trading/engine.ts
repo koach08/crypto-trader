@@ -16,6 +16,7 @@ import { checkMTFAlignment, checkEdge, calibrateConfidence, computeTrailingStop,
 import { atr as atrIndicator } from "../indicators";
 import { computeLifetimePnL } from "./lifetime";
 import { fetchExternalBias } from "../external/investment-app";
+import { getAggregatedIntel } from "../intel/aggregator";
 import { detectBottomOpportunity, detectTopOpportunity, detectAggressiveReversal } from "../quant/timing";
 import { analyzeMultiTimeframe } from "../quant/timeframe-analyzer";
 import { tryOpenFXLong, checkFXPositionExit } from "./fx-engine";
@@ -381,6 +382,14 @@ async function runCycleForPair(pair: string): Promise<void> {
     console.warn(`[${pair}] external bias 取得失敗:`, e instanceof Error ? e.message : e);
   }
 
+  // Intel: whale flows + Reddit sentiment + funding rate (10 分キャッシュ)
+  let intelBias: Awaited<ReturnType<typeof getAggregatedIntel>> | null = null;
+  try {
+    intelBias = await getAggregatedIntel();
+  } catch (e) {
+    console.warn(`[${pair}] intel 取得失敗:`, e instanceof Error ? e.message : e);
+  }
+
   // LLMの判断を「アドバイザーの1人」として、統計的シグナルと合議で最終判断
   const quantAnalysis = runQuantAnalysis(bars);
   const scoringResult = calculateFinalDecision({
@@ -396,6 +405,10 @@ async function runCycleForPair(pair: string): Promise<void> {
     externalBias: externalBias ? {
       score: externalBias.score,
       reason: externalBias.components.map(c => c.name).join(","),
+    } : null,
+    intelBias: intelBias ? {
+      score: intelBias.totalScore,
+      reason: `${intelBias.verdict} (whale:${intelBias.components.whale.score} fund:${intelBias.components.funding.score} community:${intelBias.components.community.score})`,
     } : null,
   });
 
