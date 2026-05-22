@@ -24,6 +24,7 @@ import { tryOpenFXLong, checkFXPositionExit } from "./fx-engine";
 import { reflectOnLoss } from "../quant/reflection";
 import { getActiveLessons, matchLessons, rebuildLessonsFromReflections } from "../quant/lessons";
 import { computeAllocations, type ForwardSignal, type PairAllocation } from "./capital-allocator";
+import { evaluateTier } from "./capital-policy";
 import { analyzeLossPatterns } from "../quant/loss-analyzer";
 import { getActiveOverrides, runStrategicRetrospective } from "../quant/retrospective";
 
@@ -193,6 +194,8 @@ async function triggerLossReflection(
     if (tradeCount > 0 && tradeCount % 20 === 0) {
       const audits = await getAudits(200);
       await runStrategicRetrospective(state.liveTrades, audits, tradeCount).catch(() => null);
+      // tier 昇進/降格チェック (retrospective 直後に評価し直す)
+      await evaluateTier(state.liveTrades).catch(e => console.warn("[capital-policy] tier 評価失敗:", e));
     }
   } catch (e) {
     console.warn("[reflection] トリガー失敗:", e instanceof Error ? e.message : e);
@@ -1176,10 +1179,28 @@ async function runCycle(): Promise<void> {
   // 各ペアの過去成績 + forward signal (現在の quant edge) で配分。
   // この前段で「どこに資金集中すべきか」を毎サイクル決める。
   try {
-    const totalCapital = state.riskManager.getDailyPnL().startCapitalJPY || 50000;
+    // 「総資産」= NAV = JPY 残高 + 仮想通貨評価額 (含み益も含めた現時点 net asset value)
+    // フォールバック: NAV 取れなければ JPY 残高、それも 0 なら startCapital → 50000
+    let totalCapital = state.riskManager.getDailyPnL().startCapitalJPY || 50000;
     const forwardSignals: ForwardSignal[] = [];
     if (!state.paperMode) {
       const liveExchange = getExchange();
+      try {
+        const balance = await liveExchange.getBalance();
+        const jpy = balance.find(b => b.currency === "JPY")?.total ?? 0;
+        let cryptoValueJPY = 0;
+        for (const bal of balance) {
+          if (bal.currency === "JPY" || bal.total <= 0.0000001) continue;
+          try {
+            const t = await liveExchange.getTicker(`${bal.currency}/JPY`);
+            cryptoValueJPY += bal.total * t.price;
+          } catch {/* ticker 取れないペアはスキップ */}
+        }
+        const nav = jpy + cryptoValueJPY;
+        if (nav > 0) totalCapital = nav;
+      } catch (e) {
+        console.warn("[配分] NAV 取得失敗、startCapital fallback:", e instanceof Error ? e.message : e);
+      }
       for (const pair of state.pairs) {
         try {
           const bars = await liveExchange.getOHLCV(pair, "1h", 100);
@@ -1193,7 +1214,7 @@ async function runCycle(): Promise<void> {
         } catch {/* スキャン失敗時はそのペアをスキップ */}
       }
     }
-    const allocations = computeAllocations(totalCapital, state.pairs, state.liveTrades, forwardSignals);
+    const allocations = await computeAllocations(totalCapital, state.pairs, state.liveTrades, forwardSignals);
     // 損失分析の topPair (一番損失出してるペア) には penalty (50% 縮小)
     if (lossAnalysis?.topPair && lossAnalysis.topPair.totalLoss < -300) {
       const target = allocations.find(a => a.pair === lossAnalysis!.topPair!.pair);
@@ -1245,6 +1266,15 @@ async function runCycle(): Promise<void> {
       await recordNavSnapshot();
     } catch (e) {
       console.error("NAV snapshot 失敗:", e);
+    }
+  }
+
+  // Capital policy: 48サイクル (12時間) ごとに tier 自動評価 (retrospective が未発火でも進級チェック)
+  if (state.cycleCount > 0 && state.cycleCount % 48 === 0) {
+    try {
+      await evaluateTier(state.liveTrades);
+    } catch (e) {
+      console.warn("[capital-policy] 定期 tier 評価失敗:", e instanceof Error ? e.message : e);
     }
   }
 

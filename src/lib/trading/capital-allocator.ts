@@ -4,11 +4,13 @@
  * 哲学:
  * - 勝ってるペアに資金集中、負けてるペアは絞る
  * - ただし統計不足 (取引 5件未満) なら均等配分から触らない
- * - 現金バッファを常時確保 (相場変動時の余力)
- * - 1 ペアの上限 (集中リスク回避)
+ * - 現金バッファは capital-policy (tier 連動) から動的取得
+ * - 1 ペアの上限は tier から取得 (集中リスク回避)
+ * - 強シグナル (高 edgeScore) は convictionBoost で上乗せ
  */
 
 import type { TradeRecord } from "../types";
+import { getCapitalPolicy, limitsFor, type CapitalPolicy } from "./capital-policy";
 
 export interface PairAllocation {
   pair: string;
@@ -26,9 +28,8 @@ interface PairStats {
   avgPnLPerTrade: number;
 }
 
-const CASH_BUFFER_PERCENT = 30;     // 総資金の 30% は現金として確保
-const PER_PAIR_MAX_PERCENT = 50;    // 1 ペアが投資可能総額の 50% を超えない
 const RECENT_TRADE_LOOKBACK = 30;   // 直近 30 取引で評価
+// CASH_BUFFER_PERCENT / PER_PAIR_MAX_PERCENT は capital-policy から動的取得 (tier 連動)
 
 /** 直近の trade 履歴から各ペアの成績を集計 */
 export function computePairStats(trades: TradeRecord[]): Map<string, PairStats> {
@@ -78,17 +79,25 @@ export interface ForwardSignal {
  * @param pairs 取引対象ペア
  * @param trades 直近の取引履歴 (過去成績)
  * @param forwardSignals 各ペアの「今チャンス度」(forward-looking)
+ * @param policy 任意で外部から policy を渡す (テスト/明示). 未指定なら読み込む
  */
-export function computeAllocations(
+export async function computeAllocations(
   totalCapitalJPY: number,
   pairs: string[],
   trades: TradeRecord[],
-  forwardSignals: ForwardSignal[] = []
-): PairAllocation[] {
+  forwardSignals: ForwardSignal[] = [],
+  policy?: CapitalPolicy,
+): Promise<PairAllocation[]> {
+  const pol = policy ?? (await getCapitalPolicy());
+  const limits = limitsFor(pol.tier);
+  const bufferPct = pol.cashBufferPercent;
+  const perPairPct = limits.perPairMaxPercent;
+  const convictionBoost = pol.convictionBoost;
+
   const stats = computePairStats(trades);
-  const investableTotal = totalCapitalJPY * (1 - CASH_BUFFER_PERCENT / 100);
+  const investableTotal = totalCapitalJPY * (1 - bufferPct / 100);
   const baseEqual = pairs.length > 0 ? investableTotal / pairs.length : 0;
-  const perPairCap = investableTotal * (PER_PAIR_MAX_PERCENT / 100);
+  const perPairCap = investableTotal * (perPairPct / 100);
   const forwardMap = new Map(forwardSignals.map(f => [f.pair, f]));
 
   const allocations: PairAllocation[] = [];
@@ -135,9 +144,24 @@ export function computeAllocations(
       else { forwardMult = 0.5; forwardReason = `売り圧 edge${e}`; }
     }
 
-    // 過去 × Forward (両方見る、片方ダメなら配分減る)
-    const multiplier = pastMult * forwardMult;
-    const reason = `[過去] ${pastReason} × [Forward] ${forwardReason} = ${multiplier.toFixed(2)}x`;
+    // === Conviction boost (AI 学習): 強シグナル (edge≥30) かつ過去成績○ で追加倍率 ===
+    // 例) JUNIOR boost=1.0 で何もしない、MASTER boost=2.0 + 強チャンス + 好成績 → さらに 2.0x
+    let convictionMult = 1.0;
+    let convictionReason = "";
+    const strongEdge = forward && forward.edgeScore >= 30;
+    const trackRecord = s && s.trades >= 5 && s.winRate >= 0.5 && s.recentPnL > 0;
+    if (strongEdge && trackRecord && convictionBoost > 1.0) {
+      convictionMult = convictionBoost;
+      convictionReason = ` × [Conviction] boost ${convictionBoost.toFixed(2)}x (強シグナル+実績)`;
+    } else if (strongEdge && convictionBoost > 1.0) {
+      // 実績まだないが強シグナル → boost の半分だけ適用
+      convictionMult = 1 + (convictionBoost - 1) * 0.5;
+      convictionReason = ` × [Conviction] 部分 boost ${convictionMult.toFixed(2)}x (強シグナル、実績不足)`;
+    }
+
+    // 過去 × Forward × Conviction (両方ダメなら配分減る、強好機+実績なら大きく)
+    const multiplier = pastMult * forwardMult * convictionMult;
+    const reason = `[過去] ${pastReason} × [Forward] ${forwardReason}${convictionReason} = ${multiplier.toFixed(2)}x`;
 
     let maxJPY = baseEqual * multiplier;
     if (maxJPY > perPairCap) {

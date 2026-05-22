@@ -15,6 +15,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import type { TradeRecord } from "../types";
 import type { DecisionAudit } from "./audit-log";
 import { loadData, saveData } from "../data";
+import { applyAiPolicyUpdate, getCapitalPolicy, limitsFor } from "../trading/capital-policy";
 
 export interface PairOverride {
   /** このペア専用 SL multiplier */
@@ -181,7 +182,18 @@ export async function runStrategicRetrospective(
     .map(([p, d]) => `  ${p}: ${d.count}件 WR${(d.wins / d.count * 100).toFixed(0)}% PnL¥${d.pnl.toFixed(0)}`)
     .join("\n");
 
-  const prompt = `あなたは crypto bot トレーダーのストラテジスト. 直近 ${enriched.length} 取引のデータを見て、戦略を JSON で提案してください.
+  // === Capital policy 現状 (AI に投入量の裁量を持たせる) ===
+  const currentPolicy = await getCapitalPolicy();
+  const tierLimits = limitsFor(currentPolicy.tier);
+  const policyContext = `## 現在のキャリア tier: ${currentPolicy.tier}
+- 投入可能上限: ${tierLimits.maxDeployPercent}% (バッファ最低 ${100 - tierLimits.maxDeployPercent}%)
+- 現状の cash buffer: ${currentPolicy.cashBufferPercent}% (この tier の許容: ${tierLimits.bufferMinPercent}-${tierLimits.bufferMaxPercent}%)
+- 現状の conviction boost: ${currentPolicy.convictionBoost.toFixed(2)}x (この tier の上限: ${tierLimits.maxConvictionBoost}x)
+- 自動評価メトリクス: ${currentPolicy.metrics.totalTrades}件 WR${(currentPolicy.metrics.winRate * 100).toFixed(0)}% Sharpe${currentPolicy.metrics.sharpe.toFixed(2)} maxDD${currentPolicy.metrics.maxDrawdownPercent.toFixed(1)}%`;
+
+  const prompt = `あなたは crypto bot トレーダーのストラテジスト. 直近 ${enriched.length} 取引のデータを見て、戦略と「投入量」を JSON で提案してください.
+
+${policyContext}
 
 **重要**: 「負けてるペアを除外する」は最終手段です. まず「**ペアごとに合った戦略**」を提案してください.
 例えば XRP は値動き小さい銀行系銘柄なので、ETH 用の TP/SL では機能しないことが多いです.
@@ -218,6 +230,11 @@ ${tradeRows}
     "ETH/JPY": { ... },
     "BTC/JPY": { ... }
   },
+  "capital": {
+    "cashBufferPercent": <数値、現 tier の許容範囲内: ${tierLimits.bufferMinPercent}-${tierLimits.bufferMaxPercent}%>,
+    "convictionBoost": <数値、0.7-${tierLimits.maxConvictionBoost}。強シグナル時の追加倍率>,
+    "reasoning": "<投入量判断の根拠 2-3 行>"
+  },
   "preferredPatterns": [<勝ちやすいパターン 3つ>],
   "avoidPatterns": [<避けるべきパターン 3つ>],
   "reasoning": "<全体戦略 4-5 行>"
@@ -231,6 +248,12 @@ ${tradeRows}
 - WR 30% 以下なら style 変更を必須 (例: scalp → position)
 - "hold-only" は「新規 BUY 止めて含み益待ち」モード
 - excludePairs は完全に手に負えない場合の最終手段
+
+### Capital (投入量) 判断ガイド
+- 直近成績好調 (WR≥55%、累損益+、Sharpe>0.8) → cashBuffer を tier 最低近くまで下げ、convictionBoost を tier 上限近くまで上げる
+- 直近不調 (WR<45% or 累損益マイナス) → cashBuffer を tier 最高近くまで上げ、convictionBoost を 0.8 まで下げる (守りに入る)
+- 中間 → 現状維持か小幅調整
+- ※ tier 自体の上下は別 logic が自動判定するので、ここでは現 tier 枠内で動かす
 
 JSON のみ返答`;
 
@@ -260,6 +283,20 @@ JSON のみ返答`;
     const logs = await loadData<StrategyOverrides[]>(RETRO_LOG_FILE, []);
     logs.push(overrides);
     await saveData(RETRO_LOG_FILE, logs.slice(-30));
+
+    // === Capital policy 更新 (AI 提案、tier 枠内で clamp) ===
+    const cap = parsed && typeof parsed === "object" ? (parsed as { capital?: { cashBufferPercent?: number; convictionBoost?: number; reasoning?: string } }).capital : undefined;
+    if (cap && (typeof cap.cashBufferPercent === "number" || typeof cap.convictionBoost === "number")) {
+      try {
+        await applyAiPolicyUpdate({
+          cashBufferPercent: cap.cashBufferPercent,
+          convictionBoost: cap.convictionBoost,
+          reasoning: cap.reasoning ?? overrides.reasoning,
+        });
+      } catch (e) {
+        console.warn("[retrospective] capital policy 更新失敗:", e instanceof Error ? e.message : e);
+      }
+    }
 
     console.log(`[retrospective] 全体: SL×${overrides.slMultiplier} TP×${overrides.tpMultiplier} conf+${overrides.confidenceBonus}`);
     for (const [pair, p] of Object.entries(overrides.perPair)) {
