@@ -1512,8 +1512,8 @@ async function recordNavSnapshot(): Promise<void> {
     total,
     positions,
   });
-  // 最大2000件保持（1サイクル15分なら約3週間）
-  await saveData("nav-history", history.slice(-2000));
+  // 5分サイクルでも約半年分を保持。全期間チャートはAPI側で均等サンプリングする。
+  await saveData("nav-history", history.slice(-50_000));
 }
 
 // === Public API ===

@@ -104,6 +104,8 @@ interface NavDelta {
 interface NavResponse {
   current: NavSnapshot | null;
   first: NavSnapshot | null;
+  historyCount: number;
+  chartSampled: boolean;
   delta24h: NavDelta | null;
   delta7d: NavDelta | null;
   delta30d: NavDelta | null;
@@ -677,6 +679,9 @@ export default function Dashboard() {
                 </div>
                 <div className="text-[10px] text-amber-500/70 mb-2 leading-snug">
                   ⚠ この差額は <strong>入金/出金 + 暗号通貨の値動き + bot 取引</strong> の合計。bot 単体成績は上の「累計損益」を見る。
+                  <span className="ml-2 text-zinc-500">
+                    全期間 {nav.historyCount ?? nav.history.length}点{nav.chartSampled ? "からサンプリング表示" : "を表示"}
+                  </span>
                 </div>
                 {nav.first && (
                   <div className="text-[11px] text-zinc-500 mb-2">

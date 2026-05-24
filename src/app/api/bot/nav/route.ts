@@ -18,6 +18,8 @@ interface NavDelta {
 interface NavResponse {
   current: NavSnapshot | null;
   first: NavSnapshot | null;
+  historyCount: number;
+  chartSampled: boolean;
   delta24h: NavDelta | null;
   delta7d: NavDelta | null;
   delta30d: NavDelta | null;
@@ -46,12 +48,23 @@ function makeDelta(current: NavSnapshot, base: NavSnapshot | null): NavDelta | n
   return { total, percent, fromTimestamp: base.timestamp };
 }
 
+function sampleFullHistory(history: NavSnapshot[], maxPoints = 1200) {
+  if (history.length <= maxPoints) return history;
+  const step = Math.ceil(history.length / maxPoints);
+  const sampled = history.filter((_, index) => index % step === 0);
+  const last = history[history.length - 1];
+  if (sampled[sampled.length - 1]?.timestamp !== last.timestamp) sampled.push(last);
+  return sampled;
+}
+
 export async function GET() {
   const history = await loadData<NavSnapshot[]>("nav-history", []);
   if (history.length === 0) {
     return NextResponse.json({
       current: null,
       first: null,
+      historyCount: 0,
+      chartSampled: false,
       delta24h: null,
       delta7d: null,
       delta30d: null,
@@ -75,12 +88,14 @@ export async function GET() {
   const response: NavResponse = {
     current,
     first,
+    historyCount: history.length,
+    chartSampled: history.length > 1200,
     delta24h: makeDelta(current, validBase(base24h)),
     delta7d: makeDelta(current, validBase(base7d)),
     delta30d: makeDelta(current, validBase(base30d)),
     deltaLifetime: first.timestamp !== current.timestamp ? makeDelta(current, first) : null,
-    // チャート用に間引き（最新200点まで）
-    history: history.slice(-200).map((s) => ({
+    // チャート用に開始日から現在までを保持し、点数が多い時だけ全期間を均等サンプリングする
+    history: sampleFullHistory(history).map((s) => ({
       timestamp: s.timestamp,
       total: s.total,
       jpy: s.jpy,
