@@ -262,7 +262,10 @@ export class BitFlyerExchange implements IExchange {
     const buffers = [0.995, 0.99, 0.98, 0.95];
     let lastError: unknown = null;
     for (const buffer of buffers) {
-      const safeAmount = Math.max(amountBase * buffer, minAmount);
+      const safeAmount = amountBase * buffer;
+      if (safeAmount < minAmount) {
+        continue;
+      }
       const amount = this.roundAmount(pair, safeAmount);
       if (amount <= 0) continue;
 
@@ -291,7 +294,7 @@ export class BitFlyerExchange implements IExchange {
         throw e;
       }
     }
-    throw lastError ?? new Error(`${pair}: 全bufferで売却失敗`);
+    throw lastError ?? new Error(`${pair}: 売却数量が最小取引単位未満 (${amountBase})`);
   }
 
   async cancelOrder(orderId: string, pair: string): Promise<boolean> {

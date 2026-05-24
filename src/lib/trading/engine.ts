@@ -242,6 +242,17 @@ async function executeSell(
   return { order, viaMaker: false };
 }
 
+function isSellableAmount(
+  exchange: import("../exchanges/types").IExchange,
+  pair: string,
+  amountBase: number,
+  currentPrice: number,
+): boolean {
+  if (amountBase <= 0 || currentPrice <= 0) return false;
+  const minJPY = exchange.getMinOrderJPY?.(pair, currentPrice) ?? 0;
+  return minJPY <= 0 || amountBase * currentPrice >= minJPY * 0.9;
+}
+
 // Eagerly load saved data so the API can return history before the bot starts
 let _initPromise: Promise<void> | null = null;
 export async function ensureReady(): Promise<void> {
@@ -902,7 +913,12 @@ async function runCycleForPair(pair: string): Promise<void> {
       }
     }
     // SELL判断
-    else if (decision.action === "SELL" && decision.confidence >= LIVE_CONFIDENCE_THRESHOLD && realPosition.free > 0) {
+    else if (
+      decision.action === "SELL" &&
+      decision.confidence >= LIVE_CONFIDENCE_THRESHOLD &&
+      realPosition.free > 0 &&
+      isSellableAmount(liveExchange, pair, realPosition.free, ticker.price)
+    ) {
       try {
         const { order } = await executeSell(liveExchange, pair, realPosition.free);
         const fillPrice = order.price > 0 ? order.price : ticker.price;
@@ -951,7 +967,7 @@ async function runCycleForPair(pair: string): Promise<void> {
     }
 
     // ライブ SL/TP チェック（トレーリングストップ込み）
-    if (livePos && realPosition.free > 0) {
+    if (livePos && realPosition.free > 0 && isSellableAmount(liveExchange, pair, realPosition.free, ticker.price)) {
       // トレーリングストップ: 含み益が出たら SL をブレイクイーブン → ATR追従で引き上げ
       const atrVals = atrIndicator(
         bars.map(b => b.high),
@@ -987,7 +1003,7 @@ async function runCycleForPair(pair: string): Promise<void> {
       if (livePos.partialTakeProfits && livePos.partialTakeProfits.length > 0) {
         const nextPtpIndex = livePos.ptpTriggeredCount ?? 0;
         const nextPtp = livePos.partialTakeProfits[nextPtpIndex];
-        if (nextPtp && changePercent >= nextPtp.triggerPercent && realPosition.free > 0) {
+        if (nextPtp && changePercent >= nextPtp.triggerPercent && realPosition.free > 0 && isSellableAmount(liveExchange, pair, realPosition.free, ticker.price)) {
           // 部分売却実行
           const sellAmount = realPosition.free * nextPtp.sellRatio;
           try {
@@ -1493,6 +1509,10 @@ async function emergencyLossCut(pair: string, currentPrice: number): Promise<boo
     const exchange = getExchange();
     const realPos = await exchange.getPosition(pair);
     if (realPos.free <= 0.0000001) return false;
+    if (!isSellableAmount(exchange, pair, realPos.free, currentPrice)) {
+      console.log(`[${pair}] 緊急ロスカット対象だが売却可能数量未満: amount=${realPos.free}`);
+      return false;
+    }
 
     const livePos = state.livePositions.get(pair);
     if (!livePos || livePos.entryPrice <= 0) return false;
