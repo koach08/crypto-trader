@@ -15,7 +15,9 @@ interface WhaleSignal {
   available: boolean;
 }
 
-const ETHERSCAN_API = "https://api.etherscan.io/api";
+// Etherscan V2 (V1 は deprecated). chainid 必須, API key 必須.
+const ETHERSCAN_API = "https://api.etherscan.io/v2/api";
+const CHAIN_ID_ETH_MAINNET = 1;
 
 // 主要 CEX の hot wallet (ETH 上、よく知られたもの)
 // (簡略化、本来は本格的な whale DB が必要)
@@ -36,15 +38,21 @@ interface EtherscanTx {
 }
 
 /** 特定 wallet の最新 N トランザクションから flow 判定 */
-async function fetchWalletFlow(address: string, apiKey?: string): Promise<{ inflows: number; outflows: number; netInflow: number }> {
-  const key = apiKey ?? process.env.ETHERSCAN_API_KEY ?? "";
-  const url = `${ETHERSCAN_API}?module=account&action=txlist&address=${address}&startblock=0&endblock=99999999&page=1&offset=20&sort=desc${key ? `&apikey=${key}` : ""}`;
+async function fetchWalletFlow(address: string, apiKey: string): Promise<{ inflows: number; outflows: number; netInflow: number; error?: string }> {
+  // V2 endpoint: https://api.etherscan.io/v2/api?chainid=1&module=...
+  const url = `${ETHERSCAN_API}?chainid=${CHAIN_ID_ETH_MAINNET}&module=account&action=txlist&address=${address}&startblock=0&endblock=99999999&page=1&offset=20&sort=desc&apikey=${apiKey}`;
 
   try {
     const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
-    if (!res.ok) return { inflows: 0, outflows: 0, netInflow: 0 };
+    if (!res.ok) return { inflows: 0, outflows: 0, netInflow: 0, error: `http-${res.status}` };
     const data = await res.json();
-    if (data.status !== "1") return { inflows: 0, outflows: 0, netInflow: 0 };
+    // V2 でも status "1" = OK, "0" = error/no-result
+    if (data.status !== "1") {
+      const msg = String(data.message ?? data.result ?? "unknown");
+      // "No transactions found" は正常 (新規 wallet 等) なのでエラー扱いしない
+      if (/no transactions found/i.test(msg)) return { inflows: 0, outflows: 0, netInflow: 0 };
+      return { inflows: 0, outflows: 0, netInflow: 0, error: msg.slice(0, 80) };
+    }
     const txs = data.result as EtherscanTx[];
 
     let inflows = 0;
@@ -63,8 +71,8 @@ async function fetchWalletFlow(address: string, apiKey?: string): Promise<{ infl
       }
     }
     return { inflows, outflows, netInflow: inflows - outflows };
-  } catch {
-    return { inflows: 0, outflows: 0, netInflow: 0 };
+  } catch (e) {
+    return { inflows: 0, outflows: 0, netInflow: 0, error: e instanceof Error ? e.message.slice(0, 80) : "fetch failed" };
   }
 }
 
@@ -74,24 +82,32 @@ async function fetchWalletFlow(address: string, apiKey?: string): Promise<{ infl
  * CEX から出ていく = 寒い場所 (cold wallet) へ = accumulation = bullish
  */
 export async function getWhaleSignal(): Promise<WhaleSignal> {
+  const key = process.env.ETHERSCAN_API_KEY;
+  if (!key) {
+    return { score: 0, details: ["ETHERSCAN_API_KEY 未設定 (V2 API は key 必須)"], available: false };
+  }
+
   const details: string[] = [];
   let totalNetInflow = 0;
   let walletsChecked = 0;
+  const errors: string[] = [];
 
   for (const [name, addr] of Object.entries(KNOWN_CEX_WALLETS)) {
-    const flow = await fetchWalletFlow(addr);
-    if (flow.inflows > 0 || flow.outflows > 0) {
-      walletsChecked++;
-      totalNetInflow += flow.netInflow;
-      if (Math.abs(flow.netInflow) > 100) {
-        const sign = flow.netInflow > 0 ? "流入" : "流出";
-        details.push(`${name}: 24h ${sign} ${Math.abs(flow.netInflow).toFixed(0)} ETH`);
-      }
+    const flow = await fetchWalletFlow(addr, key);
+    if (flow.error) {
+      errors.push(`${name}: ${flow.error}`);
+      continue;
+    }
+    walletsChecked++;
+    totalNetInflow += flow.netInflow;
+    if (Math.abs(flow.netInflow) > 100) {
+      const sign = flow.netInflow > 0 ? "流入" : "流出";
+      details.push(`${name}: 24h ${sign} ${Math.abs(flow.netInflow).toFixed(0)} ETH`);
     }
   }
 
   if (walletsChecked === 0) {
-    return { score: 0, details: ["whale data 取得失敗"], available: false };
+    return { score: 0, details: ["whale data 取得失敗", ...errors.slice(0, 2)], available: false };
   }
 
   // 正規化: 1000 ETH 流入で score -50、流出で +50

@@ -32,12 +32,21 @@ export interface LightningSignal {
 const MEMPOOL_LN = "https://mempool.space/api/v1/lightning";
 
 interface LnStat {
-  added: string;
+  /** unix sec (number) or ISO (string) */
+  added: number | string;
   channel_count: number;
-  node_count: number;
   total_capacity: number;
+  /** node_count は API には無い. tor + clearnet + unannounced + clearnet_tor の合算 */
+  node_count?: number;
   tor_nodes?: number;
   clearnet_nodes?: number;
+  unannounced_nodes?: number;
+  clearnet_tor_nodes?: number;
+}
+
+function totalNodes(s: LnStat): number {
+  if (typeof s.node_count === "number" && s.node_count > 0) return s.node_count;
+  return (s.tor_nodes ?? 0) + (s.clearnet_nodes ?? 0) + (s.unannounced_nodes ?? 0) + (s.clearnet_tor_nodes ?? 0);
 }
 
 async function fetchJson<T>(url: string): Promise<T | null> {
@@ -75,7 +84,9 @@ export async function getLightningSignal(): Promise<LightningSignal> {
   const weekAgo = history[weekAgoIdx];
 
   const pct = (now: number, then: number) => then > 0 ? ((now - then) / then) * 100 : 0;
-  const nodeChange = pct(latest.node_count, weekAgo.node_count);
+  const latestNodes = totalNodes(latest);
+  const weekAgoNodes = totalNodes(weekAgo);
+  const nodeChange = pct(latestNodes, weekAgoNodes);
   const channelChange = pct(latest.channel_count, weekAgo.channel_count);
   const capacityChange = pct(latest.total_capacity, weekAgo.total_capacity);
 
@@ -86,7 +97,7 @@ export async function getLightningSignal(): Promise<LightningSignal> {
   if (composite <= -5) score = Math.max(-80, score - 20);
 
   const details: string[] = [];
-  details.push(`ノード ${latest.node_count.toLocaleString()} (${nodeChange.toFixed(2)}% / 7d)`);
+  details.push(`ノード ${latestNodes.toLocaleString()} (${nodeChange.toFixed(2)}% / 7d)`);
   details.push(`チャネル ${latest.channel_count.toLocaleString()} (${channelChange.toFixed(2)}% / 7d)`);
   details.push(`総 capacity ${(latest.total_capacity / 1e8).toFixed(0)} BTC (${capacityChange.toFixed(2)}% / 7d)`);
 
@@ -94,7 +105,7 @@ export async function getLightningSignal(): Promise<LightningSignal> {
     score: Math.round(score),
     available: true,
     metrics: {
-      nodeCount: latest.node_count,
+      nodeCount: latestNodes,
       channelCount: latest.channel_count,
       totalCapacitySat: latest.total_capacity,
       nodeChangePercent7d: nodeChange,

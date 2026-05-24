@@ -18,7 +18,13 @@ interface CommunitySignal {
   /** 上位 posts のタイトル */
   topPosts: { title: string; ups: number; sentiment: "bullish" | "bearish" | "neutral" }[];
   available: boolean;
+  /** 失敗時の理由 (UI 表示用) */
+  errors?: string[];
 }
+
+// Reddit 推奨 UA 形式: <platform>:<app id>:<version> (by /u/<reddit user>)
+// 環境変数 REDDIT_USER_AGENT で上書き可能 (cloud IP block 回避用)
+const DEFAULT_UA = "node:crypto-trader:1.0 (by /u/koach08)";
 
 const SUBREDDITS = ["CryptoCurrency", "Bitcoin", "ethereum"];
 
@@ -59,30 +65,39 @@ function classifySentiment(title: string): "bullish" | "bearish" | "neutral" {
   return "neutral";
 }
 
-async function fetchSubreddit(name: string): Promise<RedditPost[]> {
-  const url = `https://www.reddit.com/r/${name}/hot.json?limit=25`;
+async function fetchSubreddit(name: string, ua: string): Promise<{ posts: RedditPost[]; error?: string }> {
+  // old.reddit.com の方が cloud IP block が緩い傾向
+  const url = `https://old.reddit.com/r/${name}/hot.json?limit=25&raw_json=1`;
   try {
     const res = await fetch(url, {
-      headers: { "User-Agent": "crypto-trader-bot/1.0" },
+      headers: {
+        "User-Agent": ua,
+        "Accept": "application/json",
+      },
       signal: AbortSignal.timeout(10000),
     });
-    if (!res.ok) return [];
+    if (!res.ok) return { posts: [], error: `${name}: http-${res.status}` };
     const data: RedditResponse = await res.json();
-    return data?.data?.children ?? [];
-  } catch {
-    return [];
+    return { posts: data?.data?.children ?? [] };
+  } catch (e) {
+    return { posts: [], error: `${name}: ${e instanceof Error ? e.message.slice(0, 60) : "fetch failed"}` };
   }
 }
 
 export async function getCommunitySentiment(): Promise<CommunitySignal> {
+  const ua = process.env.REDDIT_USER_AGENT || DEFAULT_UA;
   const all: RedditPost[] = [];
+  const errors: string[] = [];
   for (const sub of SUBREDDITS) {
-    const posts = await fetchSubreddit(sub);
-    all.push(...posts);
+    const result = await fetchSubreddit(sub, ua);
+    if (result.error) errors.push(result.error);
+    all.push(...result.posts);
+    // rate limit 回避 (Reddit 60 req/min)
+    await new Promise(r => setTimeout(r, 1100));
   }
 
   if (all.length === 0) {
-    return { score: 0, postCount: 0, topPosts: [], available: false };
+    return { score: 0, postCount: 0, topPosts: [], available: false, errors };
   }
 
   // 重み付き集計: ups (upvote 数) で重要度
@@ -109,5 +124,6 @@ export async function getCommunitySentiment(): Promise<CommunitySignal> {
     postCount: all.length,
     topPosts,
     available: true,
+    errors: errors.length > 0 ? errors : undefined,
   };
 }
