@@ -5,7 +5,7 @@ import {
   LineChart, Line, AreaChart, Area, BarChart, Bar,
   XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
 } from "recharts";
-import type { BotStatus, Position, DailyPnL, AIDecision, TickerData, TradeRecord } from "@/lib/types";
+import type { BotStatus, Position, DailyPnL, AIDecision, TickerData, TradeRecord, PortfolioRiskOverlay } from "@/lib/types";
 import { BITFLYER_PAIRS } from "@/lib/types";
 
 interface StatusData {
@@ -27,6 +27,7 @@ interface StatusData {
     winRate: number;
     positionValueJPY: number;
   };
+  riskOverlay: PortfolioRiskOverlay;
   recentDecisions: AIDecision[];
 }
 
@@ -164,6 +165,18 @@ function timeAgo(iso: string) {
   const hrs = Math.floor(mins / 60);
   if (hrs < 24) return `${hrs}時間前`;
   return `${Math.floor(hrs / 24)}日前`;
+}
+
+function riskGateLabel(gate?: PortfolioRiskOverlay["gate"]) {
+  if (gate === "TRADEABLE") return "取引可";
+  if (gate === "REDUCE_SIZE") return "サイズ縮小";
+  return "新規停止";
+}
+
+function riskGateClass(gate?: PortfolioRiskOverlay["gate"]) {
+  if (gate === "TRADEABLE") return "border-green-500/40 bg-green-950/30 text-green-300";
+  if (gate === "REDUCE_SIZE") return "border-amber-500/40 bg-amber-950/30 text-amber-300";
+  return "border-red-500/40 bg-red-950/30 text-red-300";
 }
 
 export default function Dashboard() {
@@ -326,6 +339,7 @@ export default function Dashboard() {
   const pnl = data?.dailyPnL;
   const cum = data?.cumulativePnL;
   const status = data?.status;
+  const risk = data?.riskOverlay;
 
   // ポートフォリオ構成データ: NAV API (全currency集計済み) から構築。
   // 旧コードは state.livePositions (state.pairs限定) しか出してなかった
@@ -390,6 +404,47 @@ export default function Dashboard() {
         )}
         <span className="text-xs text-zinc-600 ml-auto">Cycle #{status?.cycleCount ?? 0}</span>
       </div>
+
+      {risk && (
+        <div className={`rounded-xl border p-4 ${riskGateClass(risk.gate)}`}>
+          <div className="flex items-start justify-between gap-3 flex-wrap">
+            <div>
+              <div className="text-[10px] uppercase tracking-wider opacity-70 font-semibold">Institutional Risk Overlay</div>
+              <div className="mt-1 flex items-baseline gap-2">
+                <span className="text-xl font-bold">{riskGateLabel(risk.gate)}</span>
+                <span className="font-mono text-sm opacity-80">Risk {risk.riskScore}/100</span>
+              </div>
+              <div className="mt-1 text-xs opacity-80">{risk.recommendedAction}</div>
+            </div>
+            <div className="grid grid-cols-3 gap-2 text-right text-xs min-w-[280px]">
+              <div>
+                <div className="opacity-60">Exposure</div>
+                <div className="font-mono">¥{Math.round(risk.exposureJPY).toLocaleString()}</div>
+                <div className="opacity-60">{risk.exposurePercent.toFixed(1)}%</div>
+              </div>
+              <div>
+                <div className="opacity-60">Open Risk</div>
+                <div className="font-mono">¥{Math.round(risk.openRiskJPY).toLocaleString()}</div>
+                <div className="opacity-60">{risk.openRiskPercent.toFixed(2)}%</div>
+              </div>
+              <div>
+                <div className="opacity-60">Daily Loss</div>
+                <div className="font-mono">{risk.dailyLossPercent.toFixed(2)}%</div>
+                <div className="opacity-60">limit aware</div>
+              </div>
+            </div>
+          </div>
+          {risk.warnings.length > 0 && (
+            <div className="mt-3 flex gap-2 flex-wrap">
+              {risk.warnings.map((warning) => (
+                <span key={warning} className="rounded border border-current/20 bg-black/20 px-2 py-1 text-[11px]">
+                  {warning}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* 累計損益バナー: 色だけで判定、文言は中立 */}
       {lifetime ? (

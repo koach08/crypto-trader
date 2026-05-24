@@ -27,6 +27,7 @@ import { computeAllocations, type ForwardSignal, type PairAllocation } from "./c
 import { evaluateTier } from "./capital-policy";
 import { analyzeLossPatterns } from "../quant/loss-analyzer";
 import { getActiveOverrides, runStrategicRetrospective } from "../quant/retrospective";
+import { assessPreTradeRisk, buildPortfolioRiskOverlay } from "./institutional-risk";
 
 // 緊急ロスカット閾値（pipelineと無関係に発火）
 const EMERGENCY_LOSS_PERCENT = 5.0;
@@ -553,6 +554,38 @@ async function runCycleForPair(pair: string): Promise<void> {
     decision.reason = `${decision.reason} | ${disciplineNotes.join(" / ")}`;
   }
 
+  const preRiskCapital = state.paperMode
+    ? PAPER_VIRTUAL_CAPITAL_JPY
+    : (balance.find((b) => b.currency === "JPY")?.total ?? 0) + position.amount * ticker.price;
+  const preRiskCurrentPositionJPY = state.paperMode
+    ? (state.paperTrader.getPosition(pair)?.amount ?? 0) * ticker.price
+    : position.amount * ticker.price;
+  const preRiskMaxPositionJPY = state.paperMode
+    ? PAPER_MAX_POSITION_JPY
+    : state.pairAllocations.get(pair) ?? LIVE_MAX_POSITION_JPY;
+  const institutionalRisk = assessPreTradeRisk({
+    bars,
+    action: decision.action,
+    confidence: decision.confidence,
+    regime,
+    totalCapitalJPY: preRiskCapital,
+    currentPositionJPY: preRiskCurrentPositionJPY,
+    maxPositionJPY: preRiskMaxPositionJPY,
+    dailyPnL: state.riskManager.getDailyPnL(),
+  });
+  decision.institutionalRisk = institutionalRisk;
+  if (decision.action === "BUY") {
+    if (institutionalRisk.gate === "AVOID") {
+      decision.action = "HOLD";
+      decision.confidence = Math.min(decision.confidence, 35);
+      decision.reason = `${decision.reason} | [RiskGate] AVOID: ${institutionalRisk.warnings.join(" / ") || "risk score low"}`;
+    } else if (institutionalRisk.gate === "REDUCE_SIZE") {
+      decision.reason = `${decision.reason} | [RiskGate] REDUCE_SIZE x${institutionalRisk.sizeMultiplier}: ${institutionalRisk.warnings.join(" / ")}`;
+    } else {
+      decision.reason = `${decision.reason} | [RiskGate] TRADEABLE risk=${institutionalRisk.riskScore}`;
+    }
+  }
+
   // 監査ログを保存（判断根拠の完全な記録）
   const auditEntry = {
     ...scoringResult.audit,
@@ -579,7 +612,7 @@ async function runCycleForPair(pair: string): Promise<void> {
         totalCapital,
         currentPositionJPY,
         PAPER_MAX_POSITION_JPY,
-      );
+      ) * (decision.institutionalRisk?.sizeMultiplier ?? 1);
 
       if (tradeAmount > 0) {
         const trade = await state.paperTrader.executeBuy(pair, tradeAmount, ticker, decision);
@@ -780,20 +813,27 @@ async function runCycleForPair(pair: string): Promise<void> {
       // Volatility-targeted sizing: 高ボラなら小さく、低ボラなら標準
       const volFactor = volScalingFactor(lastATR, ticker.price, 1.0);
       const tradeAmount = Math.round(baseTradeAmount * volFactor);
+      const riskAdjustedTradeAmount = Math.min(
+        Math.round(tradeAmount * (decision.institutionalRisk?.sizeMultiplier ?? 1)),
+        decision.institutionalRisk?.suggestedMaxTradeJPY ?? tradeAmount,
+      );
       if (volFactor !== 1.0) {
         console.log(`[${pair}] vol scaling: ATR/price=${((lastATR / ticker.price) * 100).toFixed(2)}% → factor ${volFactor.toFixed(2)}x (¥${Math.round(baseTradeAmount)} → ¥${tradeAmount})`);
+      }
+      if (riskAdjustedTradeAmount !== tradeAmount) {
+        console.log(`[${pair}] institutional risk sizing: ¥${tradeAmount} → ¥${riskAdjustedTradeAmount} (${decision.institutionalRisk?.gate})`);
       }
 
       // ペア固有の最小発注額 (BitFlyer: ETH 0.01, BTC 0.001, etc) を尊重
       const perPairMin = liveExchange.getMinOrderJPY?.(pair, ticker.price) ?? LIVE_MIN_TRADE_JPY;
       const minRequired = Math.max(LIVE_MIN_TRADE_JPY, perPairMin);
-      if (tradeAmount < minRequired) {
-        console.log(`[${pair}] BUY見送り: 注文額 ¥${Math.round(tradeAmount)} < 最小 ¥${minRequired}`);
+      if (riskAdjustedTradeAmount < minRequired) {
+        console.log(`[${pair}] BUY見送り: 注文額 ¥${Math.round(riskAdjustedTradeAmount)} < 最小 ¥${minRequired}`);
         return;
       }
-      if (tradeAmount >= minRequired && jpyFree >= tradeAmount) {
+      if (riskAdjustedTradeAmount >= minRequired && jpyFree >= riskAdjustedTradeAmount) {
         try {
-          const { order, viaMaker } = await executeBuy(liveExchange, pair, tradeAmount);
+          const { order, viaMaker } = await executeBuy(liveExchange, pair, riskAdjustedTradeAmount);
           const trade: TradeRecord = {
             id: `live-${Date.now()}`,
             timestamp: new Date().toISOString(),
@@ -803,7 +843,7 @@ async function runCycleForPair(pair: string): Promise<void> {
             type: viaMaker ? "limit" : "market",
             amount: order.amount,
             price: order.price,
-            valueJPY: tradeAmount,
+            valueJPY: riskAdjustedTradeAmount,
             orderId: order.id,
             fee: order.fee ?? 0,
             paperTrade: false,
@@ -853,7 +893,7 @@ async function runCycleForPair(pair: string): Promise<void> {
 
           await saveData("live-trades", state.liveTrades.slice(-200));
           await saveData("live-positions", Array.from(state.livePositions.values()));
-          console.log(`[${pair}] LIVE BUY: ¥${tradeAmount.toLocaleString()} @ ¥${order.price.toLocaleString()}`);
+          console.log(`[${pair}] LIVE BUY: ¥${riskAdjustedTradeAmount.toLocaleString()} @ ¥${order.price.toLocaleString()}`);
         } catch (e) {
           console.error(`[${pair}] LIVE BUY 失敗:`, e);
         }
@@ -1604,6 +1644,22 @@ export function getPositions() {
 
 export function getDailyPnL() {
   return state.riskManager.getDailyPnL();
+}
+
+export function getPortfolioRiskOverlay() {
+  const dailyPnL = state.riskManager.getDailyPnL();
+  const positions = getPositions();
+  const cumulative = getCumulativePnL();
+  const capitalJPY = cumulative.startCapitalJPY > 0
+    ? cumulative.startCapitalJPY
+    : dailyPnL.startCapitalJPY;
+  return buildPortfolioRiskOverlay({
+    positions,
+    dailyPnL,
+    capitalJPY,
+    paperMode: state.paperMode,
+    recentDecisions: state.decisions,
+  });
 }
 
 export async function getEngineAllocations() {

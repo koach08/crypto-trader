@@ -4,6 +4,7 @@ export type SignalType = "STRONG_BUY" | "BUY" | "NEUTRAL" | "SELL" | "STRONG_SEL
 export type EngineId = "claude" | "gpt4o" | "gemini" | "grok" | "perplexity";
 export type RiskLevel = "LOW" | "MEDIUM" | "HIGH";
 export type CircuitBreakerState = "ACTIVE" | "WARNING" | "TRIGGERED" | "MANUAL_STOP";
+export type InstitutionalRiskGate = "TRADEABLE" | "REDUCE_SIZE" | "AVOID";
 
 // === Exchange Types ===
 export interface ExchangeConfig {
@@ -103,6 +104,36 @@ export interface AIDecision {
   technicalScore: number;
   fearGreedIndex: number;
   engineResults?: EngineResult[];
+  institutionalRisk?: InstitutionalRiskReport;
+}
+
+export interface InstitutionalRiskReport {
+  gate: InstitutionalRiskGate;
+  riskScore: number;
+  sizeMultiplier: number;
+  suggestedMaxTradeJPY: number;
+  annualizedVolatilityPercent: number;
+  valueAtRisk95Percent: number;
+  conditionalVaR95Percent: number;
+  maxDrawdownPercent: number;
+  atrPercent: number;
+  exposurePercent: number;
+  openRiskPercent: number;
+  maxLossAtSuggestedSizePercent: number;
+  killSwitch: boolean;
+  warnings: string[];
+}
+
+export interface PortfolioRiskOverlay {
+  gate: InstitutionalRiskGate;
+  riskScore: number;
+  exposureJPY: number;
+  exposurePercent: number;
+  openRiskJPY: number;
+  openRiskPercent: number;
+  dailyLossPercent: number;
+  recommendedAction: string;
+  warnings: string[];
 }
 
 export interface EngineResult {

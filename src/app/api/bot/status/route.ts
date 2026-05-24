@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getBotStatus, getDecisions, getTrades, getPositions, getDailyPnL, getCumulativePnL, ensureReady } from "@/lib/trading/engine";
+import { getBotStatus, getDecisions, getTrades, getPositions, getDailyPnL, getCumulativePnL, getPortfolioRiskOverlay, ensureReady } from "@/lib/trading/engine";
 
 export async function GET() {
   await ensureReady();
@@ -8,6 +8,7 @@ export async function GET() {
     positions: getPositions(),
     dailyPnL: getDailyPnL(),
     cumulativePnL: getCumulativePnL(),
+    riskOverlay: getPortfolioRiskOverlay(),
     recentDecisions: getDecisions().slice(-10),
     recentTrades: getTrades().slice(-20),
   });
