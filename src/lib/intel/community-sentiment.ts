@@ -97,7 +97,11 @@ export async function getCommunitySentiment(): Promise<CommunitySignal> {
   }
 
   if (all.length === 0) {
+    console.warn(`[community-sentiment] 全 subreddit 失敗: ${errors.join(" | ")}`);
     return { score: 0, postCount: 0, topPosts: [], available: false, errors };
+  }
+  if (errors.length > 0) {
+    console.warn(`[community-sentiment] 一部失敗 (取得 ${all.length} posts): ${errors.join(" | ")}`);
   }
 
   // 重み付き集計: ups (upvote 数) で重要度

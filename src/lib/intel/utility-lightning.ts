@@ -49,13 +49,16 @@ function totalNodes(s: LnStat): number {
   return (s.tor_nodes ?? 0) + (s.clearnet_nodes ?? 0) + (s.unannounced_nodes ?? 0) + (s.clearnet_tor_nodes ?? 0);
 }
 
-async function fetchJson<T>(url: string): Promise<T | null> {
+async function fetchJson<T>(url: string): Promise<{ data: T | null; error?: string }> {
   try {
-    const res = await fetch(url, { headers: { Accept: "application/json" } });
-    if (!res.ok) return null;
-    return (await res.json()) as T;
-  } catch {
-    return null;
+    const res = await fetch(url, {
+      headers: { Accept: "application/json", "User-Agent": "crypto-trader/1.0" },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) return { data: null, error: `http-${res.status}` };
+    return { data: (await res.json()) as T };
+  } catch (e) {
+    return { data: null, error: e instanceof Error ? e.message.slice(0, 100) : "fetch failed" };
   }
 }
 
@@ -75,8 +78,11 @@ export async function getLightningSignal(): Promise<LightningSignal> {
   };
 
   // 直近 統計 (history 配列、最新が先頭)
-  const history = await fetchJson<LnStat[]>(`${MEMPOOL_LN}/statistics/3m`);
-  if (!history || !Array.isArray(history) || history.length === 0) return unavailable;
+  const { data: history, error } = await fetchJson<LnStat[]>(`${MEMPOOL_LN}/statistics/3m`);
+  if (!history || !Array.isArray(history) || history.length === 0) {
+    if (error) console.warn(`[lightning] fetch 失敗: ${error}`);
+    return { ...unavailable, details: [`mempool.space LN 取得失敗 (${error ?? "no-data"})`] };
+  }
 
   // 最新 + 7d 前を取り出す (日次データ仮定)
   const latest = history[0];

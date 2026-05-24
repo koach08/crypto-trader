@@ -25,7 +25,7 @@ export interface AggregatedIntel {
   components: {
     // 投機系
     whale: { score: number; details: string[]; available: boolean };
-    community: { score: number; postCount: number; available: boolean };
+    community: { score: number; postCount: number; available: boolean; errors?: string[] };
     funding: { score: number; interpretation: string; available: boolean };
     // 実需系
     onchain: { score: number; details: string[]; available: boolean };
@@ -69,8 +69,8 @@ function weightedAvg(items: Array<{ score: number; weight: number; available: bo
   return { score: w > 0 ? s / w : 0, available: any };
 }
 
-export async function getAggregatedIntel(): Promise<AggregatedIntel> {
-  if (_cache && Date.now() - _cache.fetchedAt < CACHE_TTL_MS) {
+export async function getAggregatedIntel(opts?: { force?: boolean }): Promise<AggregatedIntel> {
+  if (!opts?.force && _cache && Date.now() - _cache.fetchedAt < CACHE_TTL_MS) {
     return _cache.data;
   }
 
@@ -118,7 +118,7 @@ export async function getAggregatedIntel(): Promise<AggregatedIntel> {
     totalScore: normalizedScore,
     components: {
       whale: { score: whale.score, details: whale.details, available: whale.available },
-      community: { score: community.score, postCount: community.postCount, available: community.available },
+      community: { score: community.score, postCount: community.postCount, available: community.available, errors: (community as { errors?: string[] }).errors },
       funding: { score: funding.score, interpretation: funding.interpretation, available: funding.available },
       onchain: { score: onchain.score, details: onchain.details, available: onchain.available },
       stablecoin: { score: stablecoin.score, details: stablecoin.details, available: stablecoin.available },
