@@ -1,58 +1,60 @@
 /**
  * Lightning Network 成長 = BTC を実際に決済に使う人の規模.
  *
- * LN は BTC 小額決済の主要レイヤー. 容量とチャネル数が伸びる =
- * 「BTC で実際にコーヒー買う / 送金する」人の規模拡大.
+ * 旧 mempool.space LN は 2026-02-15 で集計停止 (statistics/3m が [] を返す).
+ * 1ml.com の statistics?json=true に切替.
  *
- * データ源: mempool.space LN API (https://mempool.space/api/v1/lightning/statistics/latest)
- *   - ノード数
- *   - チャネル数
- *   - 総 capacity (sat)
+ * 1ml.com の利点:
+ *   - 30d change フィールドが built-in (numberofnodes30dchange など)
+ *   - newnodes24h, newchannels24h で「直近の伸び」も取れる
+ *   - USD 換算 capacity も持ってる
  *
- * スコア:
- *   capacity, channels, nodes の 7d 変化を平均し ±2% → ±40pt
+ * スコア化:
+ *   30d change を 4 で割って ~7d 換算
+ *   ノード/チャネル/容量の重み付き平均
+ *   newnodes24h が異常に多ければ追加 boost
  */
 
 export interface LightningSignal {
-  /** -100 〜 +100 */
   score: number;
   available: boolean;
   metrics: {
     nodeCount: number;
     channelCount: number;
     totalCapacitySat: number;
-    /** 過去 7d 比較 (取得できれば) */
+    totalCapacityUSD: number;
     nodeChangePercent7d: number;
     channelChangePercent7d: number;
     capacityChangePercent7d: number;
+    newNodes24h: number;
+    newChannels24h: number;
   };
   details: string[];
+  errors?: string[];
 }
 
-const MEMPOOL_LN = "https://mempool.space/api/v1/lightning";
+const ONEML_STATS = "https://1ml.com/statistics?json=true";
 
-interface LnStat {
-  /** unix sec (number) or ISO (string) */
-  added: number | string;
-  channel_count: number;
-  total_capacity: number;
-  /** node_count は API には無い. tor + clearnet + unannounced + clearnet_tor の合算 */
-  node_count?: number;
-  tor_nodes?: number;
-  clearnet_nodes?: number;
-  unannounced_nodes?: number;
-  clearnet_tor_nodes?: number;
-}
-
-function totalNodes(s: LnStat): number {
-  if (typeof s.node_count === "number" && s.node_count > 0) return s.node_count;
-  return (s.tor_nodes ?? 0) + (s.clearnet_nodes ?? 0) + (s.unannounced_nodes ?? 0) + (s.clearnet_tor_nodes ?? 0);
+interface OneMlStats {
+  numberofnodes: number;
+  numberofnodes30dchange?: number;
+  numberofchannels: number;
+  numberofchannels30dchange?: number;
+  networkcapacity: number; // sat
+  networkcapacity30dchange?: number;
+  networkcapacityusd?: number;
+  newnodes24h?: number;
+  newchannels24h?: number;
 }
 
 async function fetchJson<T>(url: string): Promise<{ data: T | null; error?: string }> {
   try {
     const res = await fetch(url, {
-      headers: { Accept: "application/json", "User-Agent": "crypto-trader/1.0" },
+      headers: {
+        Accept: "application/json",
+        // 1ml.com は generic UA を block 気味なのでブラウザ風 UA
+        "User-Agent": "Mozilla/5.0 (compatible; crypto-trader/1.0)",
+      },
       signal: AbortSignal.timeout(15000),
     });
     if (!res.ok) return { data: null, error: `http-${res.status}` };
@@ -70,53 +72,59 @@ export async function getLightningSignal(): Promise<LightningSignal> {
       nodeCount: 0,
       channelCount: 0,
       totalCapacitySat: 0,
+      totalCapacityUSD: 0,
       nodeChangePercent7d: 0,
       channelChangePercent7d: 0,
       capacityChangePercent7d: 0,
+      newNodes24h: 0,
+      newChannels24h: 0,
     },
-    details: ["mempool.space LN 取得失敗"],
+    details: ["1ml.com 取得失敗"],
   };
 
-  // 直近 統計 (history 配列、最新が先頭)
-  const { data: history, error } = await fetchJson<LnStat[]>(`${MEMPOOL_LN}/statistics/3m`);
-  if (!history || !Array.isArray(history) || history.length === 0) {
-    if (error) console.warn(`[lightning] fetch 失敗: ${error}`);
-    return { ...unavailable, details: [`mempool.space LN 取得失敗 (${error ?? "no-data"})`] };
+  const { data, error } = await fetchJson<OneMlStats>(ONEML_STATS);
+  if (!data) {
+    if (error) console.warn(`[lightning] 1ml.com fetch 失敗: ${error}`);
+    return { ...unavailable, details: [`1ml.com 取得失敗 (${error ?? "no-data"})`], errors: error ? [error] : undefined };
   }
 
-  // 最新 + 7d 前を取り出す (日次データ仮定)
-  const latest = history[0];
-  const weekAgoIdx = Math.min(history.length - 1, 7);
-  const weekAgo = history[weekAgoIdx];
+  // 30d change を 7d 相当に按分 (30d 中の純変化を 7d/30d で線形近似)
+  const node30d = data.numberofnodes30dchange ?? 0;
+  const chan30d = data.numberofchannels30dchange ?? 0;
+  const cap30d = data.networkcapacity30dchange ?? 0;
+  const nodeChange = (node30d * 7) / 30;
+  const channelChange = (chan30d * 7) / 30;
+  const capacityChange = (cap30d * 7) / 30;
 
-  const pct = (now: number, then: number) => then > 0 ? ((now - then) / then) * 100 : 0;
-  const latestNodes = totalNodes(latest);
-  const weekAgoNodes = totalNodes(weekAgo);
-  const nodeChange = pct(latestNodes, weekAgoNodes);
-  const channelChange = pct(latest.channel_count, weekAgo.channel_count);
-  const capacityChange = pct(latest.total_capacity, weekAgo.total_capacity);
-
-  // 3 指標の平均 (capacity 重め)
-  const composite = (nodeChange + channelChange + capacityChange * 2) / 4;
-  let score = Math.max(-50, Math.min(50, composite * 20)); // ±2.5% → ±50pt
+  // 重み: capacity > nodes > channels (capacity = 実際にロックされてる BTC = 重み大)
+  const composite = (nodeChange * 0.25) + (channelChange * 0.20) + (capacityChange * 0.55);
+  let score = Math.max(-50, Math.min(50, composite * 25)); // ±2% → ±50pt
   if (composite >= 5) score = Math.min(80, score + 20);
   if (composite <= -5) score = Math.max(-80, score - 20);
 
+  // newnodes24h boost: 直近 24h で異常に活発なら追加
+  const newNodes = data.newnodes24h ?? 0;
+  if (newNodes >= 100) score = Math.min(100, score + 10);
+
   const details: string[] = [];
-  details.push(`ノード ${latestNodes.toLocaleString()} (${nodeChange.toFixed(2)}% / 7d)`);
-  details.push(`チャネル ${latest.channel_count.toLocaleString()} (${channelChange.toFixed(2)}% / 7d)`);
-  details.push(`総 capacity ${(latest.total_capacity / 1e8).toFixed(0)} BTC (${capacityChange.toFixed(2)}% / 7d)`);
+  details.push(`ノード ${data.numberofnodes.toLocaleString()} (30d ${node30d.toFixed(2)}% → 7d換算 ${nodeChange.toFixed(2)}%)`);
+  details.push(`チャネル ${data.numberofchannels.toLocaleString()} (30d ${chan30d.toFixed(2)}%)`);
+  details.push(`総 capacity ${(data.networkcapacity / 1e8).toFixed(0)} BTC (30d ${cap30d.toFixed(2)}%)`);
+  if (newNodes > 0) details.push(`新規ノード 24h: ${newNodes}`);
 
   return {
     score: Math.round(score),
     available: true,
     metrics: {
-      nodeCount: latestNodes,
-      channelCount: latest.channel_count,
-      totalCapacitySat: latest.total_capacity,
+      nodeCount: data.numberofnodes,
+      channelCount: data.numberofchannels,
+      totalCapacitySat: data.networkcapacity,
+      totalCapacityUSD: data.networkcapacityusd ?? 0,
       nodeChangePercent7d: nodeChange,
       channelChangePercent7d: channelChange,
       capacityChangePercent7d: capacityChange,
+      newNodes24h: newNodes,
+      newChannels24h: data.newchannels24h ?? 0,
     },
     details,
   };

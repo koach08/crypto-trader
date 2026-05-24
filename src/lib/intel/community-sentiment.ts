@@ -1,132 +1,148 @@
 /**
  * コミュニティ sentiment 取得.
  *
- * Reddit JSON API (認証不要、無料、rate limit あり) を使う.
- * r/CryptoCurrency, r/bitcoin の top post を取得し、タイトルから sentiment 抽出.
+ * 旧 Reddit 直接スクレイプは datacenter IP (Railway/AWS/GCP) からは
+ * 一律 http-403 で block されるため使用不可.
  *
- * 限界:
- *  - 英語コミュニティのみ
- *  - キーワードベースで簡易判定
- *  - より精緻にするなら Twitter/X API (有料) や Discord scraping (規約注意)
+ * 代替ソース (両方 datacenter IP 制限なし):
+ *   1. alternative.me Fear & Greed Index (社会的 sentiment の代表)
+ *      - F&G 0-100 を -100〜+100 にマッピング (50=中立、極度恐怖=底値圏=bullish 反転狙い)
+ *      - 既存 engine とは「逆張り」の見方: 極度恐怖=-100 ではなく逆に +50 寄与 (歴史的に底)
+ *   2. Hacker News Algolia API (crypto 関連 story の量と質)
+ *      - 過去 24h の crypto post 数と points 合計
+ *      - 「話題沸騰」= attention 急増 = 短期的に上下どちらにせよボラ高
  */
 
 interface CommunitySignal {
-  /** -100 (panic) 〜 +100 (euphoria) */
+  /** -100 〜 +100 */
   score: number;
-  /** 集計に使った投稿数 */
+  /** 集計に使った posts 数 (HN 由来) */
   postCount: number;
   /** 上位 posts のタイトル */
   topPosts: { title: string; ups: number; sentiment: "bullish" | "bearish" | "neutral" }[];
   available: boolean;
-  /** 失敗時の理由 (UI 表示用) */
   errors?: string[];
 }
 
-// Reddit 推奨 UA 形式: <platform>:<app id>:<version> (by /u/<reddit user>)
-// 環境変数 REDDIT_USER_AGENT で上書き可能 (cloud IP block 回避用)
-const DEFAULT_UA = "node:crypto-trader:1.0 (by /u/koach08)";
+const FNG_API = "https://api.alternative.me/fng/";
+const HN_API = "https://hn.algolia.com/api/v1/search_by_date";
 
-const SUBREDDITS = ["CryptoCurrency", "Bitcoin", "ethereum"];
+interface FngEntry { value: string; value_classification: string; timestamp: string }
+interface FngResponse { data?: FngEntry[] }
 
-// 簡易 sentiment 辞書 (英語、crypto コンテキスト)
+interface HnHit {
+  title?: string;
+  points?: number;
+  created_at_i?: number;
+  num_comments?: number;
+}
+interface HnResponse { hits?: HnHit[] }
+
 const BULLISH_WORDS = [
-  "rally", "moon", "surge", "pump", "bull", "buy", "long", "rocket",
-  "ath", "all-time high", "breakout", "accumulating", "hold", "hodl",
-  "diamond hands", "to the moon", "lambo", "etf approved", "adoption",
+  "rally", "surge", "pump", "bull", "rocket", "ath", "breakout", "adoption",
+  "etf approved", "halving", "moon", "buy", "long", "accumulating", "rebound",
 ];
-
 const BEARISH_WORDS = [
-  "crash", "dump", "rug", "scam", "hack", "sell", "short", "bear",
-  "panic", "fud", "regulation", "ban", "lawsuit", "exploit",
-  "liquidation", "rekt", "collapse", "down", "drop", "fear",
+  "crash", "dump", "rug", "scam", "hack", "ban", "lawsuit", "collapse",
+  "exploit", "rekt", "fud", "panic", "regulation", "outflow", "selloff",
 ];
-
-interface RedditPost {
-  data: {
-    title: string;
-    ups: number;
-    selftext: string;
-    created_utc: number;
-  };
-}
-
-interface RedditResponse {
-  data: { children: RedditPost[] };
-}
 
 function classifySentiment(title: string): "bullish" | "bearish" | "neutral" {
   const lower = title.toLowerCase();
-  let bullScore = 0;
-  let bearScore = 0;
-  for (const w of BULLISH_WORDS) if (lower.includes(w)) bullScore++;
-  for (const w of BEARISH_WORDS) if (lower.includes(w)) bearScore++;
-  if (bullScore > bearScore) return "bullish";
-  if (bearScore > bullScore) return "bearish";
+  let b = 0, s = 0;
+  for (const w of BULLISH_WORDS) if (lower.includes(w)) b++;
+  for (const w of BEARISH_WORDS) if (lower.includes(w)) s++;
+  if (b > s) return "bullish";
+  if (s > b) return "bearish";
   return "neutral";
 }
 
-async function fetchSubreddit(name: string, ua: string): Promise<{ posts: RedditPost[]; error?: string }> {
-  // old.reddit.com の方が cloud IP block が緩い傾向
-  const url = `https://old.reddit.com/r/${name}/hot.json?limit=25&raw_json=1`;
+async function fetchFng(): Promise<{ score: number; latest: number; trend7d: number; available: boolean; error?: string }> {
   try {
-    const res = await fetch(url, {
-      headers: {
-        "User-Agent": ua,
-        "Accept": "application/json",
-      },
-      signal: AbortSignal.timeout(10000),
-    });
-    if (!res.ok) return { posts: [], error: `${name}: http-${res.status}` };
-    const data: RedditResponse = await res.json();
-    return { posts: data?.data?.children ?? [] };
+    const res = await fetch(`${FNG_API}?limit=8`, { signal: AbortSignal.timeout(10000) });
+    if (!res.ok) return { score: 0, latest: 0, trend7d: 0, available: false, error: `fng http-${res.status}` };
+    const data = (await res.json()) as FngResponse;
+    const arr = data.data ?? [];
+    if (arr.length === 0) return { score: 0, latest: 0, trend7d: 0, available: false, error: "fng empty" };
+    const latest = Number(arr[0].value);
+    const weekAgo = Number(arr[Math.min(arr.length - 1, 7)].value);
+    // 逆張りビュー: 極度恐怖 (≤25) = 反転狙い +、極度貪欲 (≥75) = bearish 警戒 -
+    // F&G 50 を 0 にして両側に振る (係数 -2 で逆方向)
+    let score = -(latest - 50) * 1.5; // 0→+75, 100→-75
+    // トレンド: 上昇 (恐怖→貪欲) は短期 bullish 寄与 (中立に向かう自然な流れ)
+    const trend = latest - weekAgo;
+    score += trend * 0.5; // ±20 の変動で ±10pt
+    return {
+      score: Math.max(-100, Math.min(100, Math.round(score))),
+      latest, trend7d: trend, available: true,
+    };
   } catch (e) {
-    return { posts: [], error: `${name}: ${e instanceof Error ? e.message.slice(0, 60) : "fetch failed"}` };
+    return { score: 0, latest: 0, trend7d: 0, available: false, error: e instanceof Error ? e.message.slice(0, 80) : "fng fetch failed" };
+  }
+}
+
+async function fetchHnCrypto(): Promise<{ score: number; postCount: number; topPosts: { title: string; ups: number; sentiment: "bullish" | "bearish" | "neutral" }[]; available: boolean; error?: string }> {
+  try {
+    // 過去 24h の crypto 関連 story
+    const oneDayAgo = Math.floor(Date.now() / 1000) - 86400;
+    const url = `${HN_API}?query=bitcoin+OR+ethereum+OR+crypto&tags=story&numericFilters=created_at_i>${oneDayAgo}&hitsPerPage=50`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    if (!res.ok) return { score: 0, postCount: 0, topPosts: [], available: false, error: `hn http-${res.status}` };
+    const data = (await res.json()) as HnResponse;
+    const hits = data.hits ?? [];
+    if (hits.length === 0) return { score: 0, postCount: 0, topPosts: [], available: true };
+
+    let weighted = 0;
+    let totalWeight = 0;
+    const tagged = hits
+      .filter(h => typeof h.title === "string")
+      .map(h => {
+        const sent = classifySentiment(h.title!);
+        const w = Math.max(1, h.points ?? 1);
+        weighted += (sent === "bullish" ? 1 : sent === "bearish" ? -1 : 0) * w;
+        totalWeight += w;
+        return { title: h.title!, ups: h.points ?? 0, sentiment: sent };
+      });
+
+    const sentimentScore = totalWeight > 0 ? Math.round((weighted / totalWeight) * 100) : 0;
+    const topPosts = tagged.sort((a, b) => b.ups - a.ups).slice(0, 5);
+    return {
+      score: Math.max(-100, Math.min(100, sentimentScore)),
+      postCount: hits.length,
+      topPosts,
+      available: true,
+    };
+  } catch (e) {
+    return { score: 0, postCount: 0, topPosts: [], available: false, error: e instanceof Error ? e.message.slice(0, 80) : "hn fetch failed" };
   }
 }
 
 export async function getCommunitySentiment(): Promise<CommunitySignal> {
-  const ua = process.env.REDDIT_USER_AGENT || DEFAULT_UA;
-  const all: RedditPost[] = [];
+  const [fng, hn] = await Promise.all([fetchFng(), fetchHnCrypto()]);
   const errors: string[] = [];
-  for (const sub of SUBREDDITS) {
-    const result = await fetchSubreddit(sub, ua);
-    if (result.error) errors.push(result.error);
-    all.push(...result.posts);
-    // rate limit 回避 (Reddit 60 req/min)
-    await new Promise(r => setTimeout(r, 1100));
-  }
+  if (fng.error) errors.push(fng.error);
+  if (hn.error) errors.push(hn.error);
 
-  if (all.length === 0) {
-    console.warn(`[community-sentiment] 全 subreddit 失敗: ${errors.join(" | ")}`);
+  // F&G が main、HN が補助 (HN sentiment は keyword ベースで信頼度低め)
+  // F&G 70%, HN 30%
+  let score = 0;
+  let totalWeight = 0;
+  if (fng.available) { score += fng.score * 0.7; totalWeight += 0.7; }
+  if (hn.available) { score += hn.score * 0.3; totalWeight += 0.3; }
+  const finalScore = totalWeight > 0 ? Math.round(score / totalWeight) : 0;
+
+  if (!fng.available && !hn.available) {
+    console.warn(`[community-sentiment] 全ソース失敗: ${errors.join(" | ")}`);
     return { score: 0, postCount: 0, topPosts: [], available: false, errors };
   }
   if (errors.length > 0) {
-    console.warn(`[community-sentiment] 一部失敗 (取得 ${all.length} posts): ${errors.join(" | ")}`);
+    console.warn(`[community-sentiment] 一部失敗: ${errors.join(" | ")}`);
   }
 
-  // 重み付き集計: ups (upvote 数) で重要度
-  let weightedScore = 0;
-  let totalWeight = 0;
-  const tagged = all.map(p => {
-    const sentiment = classifySentiment(p.data.title);
-    const ups = p.data.ups || 1;
-    const value = sentiment === "bullish" ? 1 : sentiment === "bearish" ? -1 : 0;
-    weightedScore += value * ups;
-    totalWeight += ups;
-    return { title: p.data.title, ups, sentiment };
-  });
-
-  const avgScore = totalWeight > 0 ? weightedScore / totalWeight : 0;
-  const score = Math.round(avgScore * 100);
-
-  const topPosts = tagged
-    .sort((a, b) => b.ups - a.ups)
-    .slice(0, 5);
-
   return {
-    score: Math.max(-100, Math.min(100, score)),
-    postCount: all.length,
-    topPosts,
+    score: Math.max(-100, Math.min(100, finalScore)),
+    postCount: hn.postCount,
+    topPosts: hn.topPosts,
     available: true,
     errors: errors.length > 0 ? errors : undefined,
   };
