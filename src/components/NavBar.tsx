@@ -2,10 +2,11 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { LayoutDashboard, Bot, BarChart3, History, Wallet, Settings } from "lucide-react";
+import { LayoutDashboard, Bot, BarChart3, History, Wallet, Settings, Gauge } from "lucide-react";
 import clsx from "clsx";
 
 const links = [
+  { href: "/summary", icon: Gauge, label: "サマリ" },
   { href: "/", icon: LayoutDashboard, label: "ダッシュ" },
   { href: "/trade", icon: Bot, label: "Bot" },
   { href: "/positions", icon: BarChart3, label: "ポジション" },
