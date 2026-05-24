@@ -97,6 +97,53 @@ function isLowLiquidityHourJST(): boolean {
   return hour >= 3 && hour < 7;
 }
 
+function numericFactor(value: number | string | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function evaluateAdaptiveBuyGuardrails(input: {
+  action: AIDecision["action"];
+  pair: string;
+  confidence: number;
+  fearGreed: number;
+  quantAnalysis: ReturnType<typeof runQuantAnalysis>;
+  audit: ReturnType<typeof calculateFinalDecision>["audit"];
+}): string[] {
+  if (input.action !== "BUY") return [];
+
+  const volumeRatio = numericFactor(
+    input.quantAnalysis.signals.find((s) => s.name === "出来高異常")?.factors.ratio,
+  );
+  const rangePosition = numericFactor(
+    input.quantAnalysis.signals.find((s) => s.name === "ATRブレイクアウト")?.factors.rangePosition,
+  );
+  const directionalVotes = input.audit.votes.filter((v) => v.action !== "HOLD");
+  const supportVotes = directionalVotes.filter((v) => v.action === "BUY").length;
+  const opposingVotes = directionalVotes.filter((v) => v.action === "SELL").length;
+  const reasons: string[] = [];
+
+  if (volumeRatio != null && volumeRatio < 0.3 && supportVotes <= 2) {
+    reasons.push(`薄商い volume=${volumeRatio.toFixed(2)}x かつ BUY支持${supportVotes}票`);
+  }
+  if (volumeRatio != null && volumeRatio < 0.3 && input.fearGreed < 30 && supportVotes <= 3) {
+    reasons.push(`Extreme Fear(${input.fearGreed}) + 薄商い + BUY支持不足`);
+  }
+  if (
+    volumeRatio != null &&
+    rangePosition != null &&
+    volumeRatio < 0.3 &&
+    rangePosition > 65 &&
+    opposingVotes >= 2
+  ) {
+    reasons.push(`薄商いでレンジ上部${rangePosition.toFixed(0)}%かつ反対票${opposingVotes}票`);
+  }
+  if (input.pair === "XRP/JPY" && input.confidence < 74 && supportVotes <= 3) {
+    reasons.push(`XRPは直近損失集中のため conf<74 かつ BUY支持${supportVotes}票では見送り`);
+  }
+
+  return reasons;
+}
+
 // ライブポジション追跡（エントリー価格・SL/TPを保持）
 interface LivePositionEntry {
   pair: string;
@@ -775,6 +822,18 @@ async function runCycleForPair(pair: string): Promise<void> {
       // 重要経済指標 6h 以内 → 取引控える (FOMC/雇用統計などで暴騰暴落リスク)
       if (externalBias?.pause) {
         console.log(`[${pair}] BUY見送り: ${externalBias.pauseReason}`);
+        return;
+      }
+      const adaptiveBlocks = evaluateAdaptiveBuyGuardrails({
+        action: decision.action,
+        pair,
+        confidence: decision.confidence,
+        fearGreed: fearGreed.value,
+        quantAnalysis,
+        audit: scoringResult.audit,
+      });
+      if (adaptiveBlocks.length > 0) {
+        console.log(`[${pair}] BUY見送り: 適応ガードレール ${adaptiveBlocks.join(" / ")}`);
         return;
       }
       // Lessons learned: 過去同じパターンで複数回負けてたら BUY 見送り

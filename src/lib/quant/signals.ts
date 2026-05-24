@@ -313,6 +313,10 @@ function atrBreakout(bars: OHLCVBar[]): QuantSignal {
     reason = `レンジ内 (${lookback}本: ¥${Math.round(breakoutLow).toLocaleString()}〜¥${Math.round(breakoutHigh).toLocaleString()}, 位置${rangePosition.toFixed(0)}%)`;
   }
 
+  const rangePosition = breakoutHigh > breakoutLow
+    ? ((price - breakoutLow) / (breakoutHigh - breakoutLow)) * 100
+    : 50;
+
   return {
     name: "ATRブレイクアウト",
     score,
@@ -323,6 +327,7 @@ function atrBreakout(bars: OHLCVBar[]): QuantSignal {
       breakoutHigh: Number(breakoutHigh.toFixed(2)),
       breakoutLow: Number(breakoutLow.toFixed(2)),
       atr: Number(currentATR.toFixed(2)),
+      rangePosition: Number(rangePosition.toFixed(2)),
     },
   };
 }
