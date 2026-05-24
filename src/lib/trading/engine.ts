@@ -25,6 +25,8 @@ import { reflectOnLoss } from "../quant/reflection";
 import { getActiveLessons, matchLessons, rebuildLessonsFromReflections } from "../quant/lessons";
 import { computeAllocations, type ForwardSignal, type PairAllocation } from "./capital-allocator";
 import { evaluateTier } from "./capital-policy";
+import { evaluateKillSwitch, isKillSwitchActive } from "./kill-switch";
+import { sendAlert } from "../alerts";
 import { analyzeLossPatterns } from "../quant/loss-analyzer";
 import { getActiveOverrides, runStrategicRetrospective } from "../quant/retrospective";
 import { assessPreTradeRisk, buildPortfolioRiskOverlay } from "./institutional-risk";
@@ -1162,10 +1164,59 @@ async function runCycleForPair(pair: string): Promise<void> {
   await saveData("decisions", state.decisions.slice(-100));
 }
 
+async function closeAllLivePositions(reason: string): Promise<void> {
+  if (state.paperMode) return;
+  const exchange = getExchange();
+  for (const [pair, livePos] of [...state.livePositions]) {
+    try {
+      const realPos = await exchange.getPosition(pair);
+      if (realPos.free <= 0.0000001) {
+        state.livePositions.delete(pair);
+        continue;
+      }
+      const ticker = await exchange.getTicker(pair);
+      const order = await exchange.marketSell(pair, realPos.free);
+      const fillPrice = order.price > 0 ? order.price : ticker.price;
+      const pnl = (fillPrice - livePos.entryPrice) * order.amount;
+      const pnlPercent = livePos.entryPrice > 0 ? ((fillPrice - livePos.entryPrice) / livePos.entryPrice) * 100 : 0;
+      const trade: TradeRecord = {
+        id: `killswitch-${Date.now()}-${pair.replace("/", "")}`,
+        timestamp: new Date().toISOString(),
+        exchange: "bitflyer",
+        pair,
+        side: "sell",
+        type: "stop_loss",
+        amount: order.amount,
+        price: fillPrice,
+        valueJPY: order.amount * fillPrice,
+        orderId: order.id,
+        fee: order.fee ?? 0,
+        pnl,
+        pnlPercent,
+        paperTrade: false,
+      };
+      state.recentTrades.push(trade);
+      state.liveTrades.push(trade);
+      state.riskManager.recordTrade(pnl);
+      state.livePositions.delete(pair);
+      console.log(`[kill-switch] ${pair} closeout fill ¥${fillPrice.toFixed(0)} PnL ¥${pnl.toFixed(0)} (${reason})`);
+    } catch (e) {
+      console.error(`[kill-switch] ${pair} closeout 失敗:`, e instanceof Error ? e.message : e);
+    }
+  }
+}
+
 async function runCycle(): Promise<void> {
   state.cycleCount++;
   state.lastCycleTimestamp = new Date().toISOString();
   console.log(`\n=== サイクル #${state.cycleCount} (${state.lastCycleTimestamp}) ===`);
+
+  // === Kill switch: 既に発火済みなら cycle 全スキップ (新規エントリ防止) ===
+  if (await isKillSwitchActive()) {
+    console.warn(`[kill-switch] アクティブ. cycle スキップ. 手動 reset まで停止状態`);
+    state.running = false;
+    return;
+  }
 
   // 日付ロールオーバー: 0時を跨いだら dailyPnL をリセット
   try {
@@ -1194,6 +1245,24 @@ async function runCycle(): Promise<void> {
     const rolled = await state.riskManager.rolloverIfNewDay(currentCapital);
     if (rolled) {
       console.log(`日付ロールオーバー: 開始資金 ¥${currentCapital.toLocaleString()} で本日損益をリセット`);
+    }
+
+    // === Kill switch: NAV を peak と比較し閾値発火判定 ===
+    try {
+      const ks = await evaluateKillSwitch(currentCapital);
+      if (ks.justTriggered) {
+        await closeAllLivePositions(`kill-switch (-${ks.drawdownPct.toFixed(1)}%)`);
+        state.running = false;
+        await sendAlert({
+          level: "critical",
+          message: `bot 全停止完了. 全 live ポジションを closeout しました. 手動 reset 必要.`,
+          dedupeKey: "kill-switch:closed-all",
+          fields: { "Final NAV": `¥${Math.round(currentCapital).toLocaleString()}` },
+        });
+        return;
+      }
+    } catch (e) {
+      console.warn("[kill-switch] 評価失敗:", e instanceof Error ? e.message : e);
     }
   } catch (e) {
     console.error("日付ロールオーバー失敗:", e);
