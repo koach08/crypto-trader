@@ -133,6 +133,36 @@ interface LearningResponse {
   };
 }
 
+interface AdaptiveStrategyResponse {
+  generatedAt: string;
+  portfolioPosture: "DEFENSIVE" | "RECOVERY" | "GROWTH";
+  dailyLossPercent: number;
+  realizedPnLJPY: number;
+  unrealizedPnLJPY: number;
+  netPnLJPY: number;
+  globalRules: string[];
+  lossPatterns: { category: string; finding: string; suggestion: string; share: number }[];
+  positionPlans: {
+    pair: string;
+    currentPrice: number;
+    entryPrice: number;
+    valueJPY: number;
+    unrealizedPnLJPY: number;
+    unrealizedPnLPercent: number;
+    posture: "PROTECT" | "REPAIR" | "COMPOUND";
+    mtf: { reason: string; consensus: string } | null;
+    rules: string[];
+    plans: {
+      horizon: "short" | "medium" | "long";
+      label: string;
+      action: "HOLD" | "WAIT" | "REDUCE" | "EXIT" | "ADD_SMALL";
+      confidence: number;
+      thesis: string;
+      invalidation: string;
+    }[];
+  }[];
+}
+
 interface TimingAnalysis {
   days: number;
   fng: {
@@ -179,6 +209,13 @@ function riskGateClass(gate?: PortfolioRiskOverlay["gate"]) {
   return "border-red-500/40 bg-red-950/30 text-red-300";
 }
 
+function strategyActionClass(action: string) {
+  if (action === "ADD_SMALL") return "bg-green-500/15 text-green-300 border-green-500/30";
+  if (action === "REDUCE" || action === "EXIT") return "bg-red-500/15 text-red-300 border-red-500/30";
+  if (action === "WAIT") return "bg-amber-500/15 text-amber-300 border-amber-500/30";
+  return "bg-zinc-500/15 text-zinc-300 border-zinc-500/30";
+}
+
 export default function Dashboard() {
   const [data, setData] = useState<StatusData | null>(null);
   const [tickers, setTickers] = useState<Record<string, TickerData>>({});
@@ -192,6 +229,7 @@ export default function Dashboard() {
   const [diagnostics, setDiagnostics] = useState<DiagnosticsResponse | null>(null);
   const [learning, setLearning] = useState<LearningResponse | null>(null);
   const [timing, setTiming] = useState<TimingAnalysis | null>(null);
+  const [adaptiveStrategy, setAdaptiveStrategy] = useState<AdaptiveStrategyResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [activePair, setActivePair] = useState("ETH/JPY");
 
@@ -314,6 +352,18 @@ export default function Dashboard() {
     }
   }, []);
 
+  const fetchAdaptiveStrategy = useCallback(async () => {
+    try {
+      const res = await fetch("/api/bot/adaptive-strategy");
+      if (res.ok) {
+        const data = (await res.json()) as AdaptiveStrategyResponse;
+        setAdaptiveStrategy(data);
+      }
+    } catch (e) {
+      console.error("adaptive strategy fetch失敗:", e);
+    }
+  }, []);
+
   useEffect(() => {
     fetchData();
     fetchSlowData();
@@ -322,15 +372,17 @@ export default function Dashboard() {
     fetchDiagnostics();
     fetchLearning();
     fetchTiming();
+    fetchAdaptiveStrategy();
     const fast = setInterval(fetchData, 15000);
     const slow = setInterval(fetchSlowData, 300000); // 5分ごと
     const navInt = setInterval(fetchNav, 60_000); // 1分ごと
     const diagInt = setInterval(fetchDiagnostics, 60_000); // 1分ごと
     const learnInt = setInterval(fetchLearning, 5 * 60_000); // 5分ごと
     const timingInt = setInterval(fetchTiming, 60 * 60_000); // 1時間ごと
+    const strategyInt = setInterval(fetchAdaptiveStrategy, 5 * 60_000); // 5分ごと
     const lifeInt = setInterval(() => fetchLifetime(), 30 * 60 * 1000); // 30分ごと
-    return () => { clearInterval(fast); clearInterval(slow); clearInterval(navInt); clearInterval(diagInt); clearInterval(learnInt); clearInterval(timingInt); clearInterval(lifeInt); };
-  }, [fetchData, fetchSlowData, fetchLifetime, fetchNav, fetchDiagnostics, fetchLearning, fetchTiming]);
+    return () => { clearInterval(fast); clearInterval(slow); clearInterval(navInt); clearInterval(diagInt); clearInterval(learnInt); clearInterval(timingInt); clearInterval(strategyInt); clearInterval(lifeInt); };
+  }, [fetchData, fetchSlowData, fetchLifetime, fetchNav, fetchDiagnostics, fetchLearning, fetchTiming, fetchAdaptiveStrategy]);
 
   if (loading) {
     return <div className="text-center py-20 text-zinc-500">読み込み中...</div>;
@@ -441,6 +493,116 @@ export default function Dashboard() {
                   {warning}
                 </span>
               ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {adaptiveStrategy && (
+        <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
+          <div className="flex items-start justify-between gap-3 flex-wrap mb-4">
+            <div>
+              <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold">Adaptive Profit Strategy</div>
+              <div className="mt-1 flex items-baseline gap-2">
+                <span className={`text-xl font-bold ${
+                  adaptiveStrategy.portfolioPosture === "DEFENSIVE" ? "text-red-300" :
+                  adaptiveStrategy.portfolioPosture === "RECOVERY" ? "text-amber-300" : "text-green-300"
+                }`}>
+                  {adaptiveStrategy.portfolioPosture === "DEFENSIVE" ? "防御優先" :
+                   adaptiveStrategy.portfolioPosture === "RECOVERY" ? "回復戦略" : "成長追求"}
+                </span>
+                <span className="text-xs text-zinc-500">
+                  短期・中期・長期を5分ごとに再評価
+                </span>
+              </div>
+            </div>
+            <div className="grid grid-cols-3 gap-3 text-right text-xs">
+              <div>
+                <div className="text-zinc-600">Realized</div>
+                <div className={`font-mono ${adaptiveStrategy.realizedPnLJPY >= 0 ? "text-green-400" : "text-red-400"}`}>
+                  {adaptiveStrategy.realizedPnLJPY >= 0 ? "+" : ""}¥{adaptiveStrategy.realizedPnLJPY.toLocaleString()}
+                </div>
+              </div>
+              <div>
+                <div className="text-zinc-600">Unrealized</div>
+                <div className={`font-mono ${adaptiveStrategy.unrealizedPnLJPY >= 0 ? "text-green-400" : "text-red-400"}`}>
+                  {adaptiveStrategy.unrealizedPnLJPY >= 0 ? "+" : ""}¥{adaptiveStrategy.unrealizedPnLJPY.toLocaleString()}
+                </div>
+              </div>
+              <div>
+                <div className="text-zinc-600">Daily Loss</div>
+                <div className="font-mono text-zinc-300">{adaptiveStrategy.dailyLossPercent.toFixed(2)}%</div>
+              </div>
+            </div>
+          </div>
+
+          {adaptiveStrategy.globalRules.length > 0 && (
+            <div className="mb-4 flex gap-2 flex-wrap">
+              {adaptiveStrategy.globalRules.slice(0, 4).map((rule) => (
+                <span key={rule} className="rounded border border-zinc-700 bg-zinc-950/60 px-2 py-1 text-[11px] text-zinc-400">
+                  {rule}
+                </span>
+              ))}
+            </div>
+          )}
+
+          <div className="space-y-3">
+            {adaptiveStrategy.positionPlans.slice(0, 4).map((position) => (
+              <div key={position.pair} className="rounded-lg border border-zinc-800 bg-zinc-950/50 p-3">
+                <div className="flex items-start justify-between gap-3 flex-wrap mb-3">
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="font-semibold text-zinc-100">{position.pair}</span>
+                      <span className={`rounded px-2 py-0.5 text-[10px] border ${
+                        position.posture === "PROTECT" ? "border-red-500/30 bg-red-500/10 text-red-300" :
+                        position.posture === "REPAIR" ? "border-amber-500/30 bg-amber-500/10 text-amber-300" :
+                        "border-green-500/30 bg-green-500/10 text-green-300"
+                      }`}>
+                        {position.posture === "PROTECT" ? "守る" : position.posture === "REPAIR" ? "回復" : "伸ばす"}
+                      </span>
+                    </div>
+                    <div className="text-[11px] text-zinc-500 mt-1">
+                      entry ¥{Math.round(position.entryPrice).toLocaleString()} → now ¥{Math.round(position.currentPrice).toLocaleString()}
+                      {position.mtf && <span className="ml-2">{position.mtf.reason}</span>}
+                    </div>
+                  </div>
+                  <div className={`font-mono text-sm ${position.unrealizedPnLJPY >= 0 ? "text-green-400" : "text-red-400"}`}>
+                    {position.unrealizedPnLJPY >= 0 ? "+" : ""}¥{position.unrealizedPnLJPY.toLocaleString()}
+                    <span className="ml-1 text-xs">({position.unrealizedPnLPercent >= 0 ? "+" : ""}{position.unrealizedPnLPercent.toFixed(2)}%)</span>
+                  </div>
+                </div>
+                <div className="grid gap-2 md:grid-cols-3">
+                  {position.plans.map((plan) => (
+                    <div key={plan.horizon} className="rounded border border-zinc-800 bg-zinc-900/80 p-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[11px] text-zinc-500">{plan.label}</span>
+                        <span className={`rounded border px-2 py-0.5 text-[10px] ${strategyActionClass(plan.action)}`}>
+                          {plan.action === "ADD_SMALL" ? "小さく追加" :
+                           plan.action === "REDUCE" ? "縮小" :
+                           plan.action === "EXIT" ? "撤退" :
+                           plan.action === "WAIT" ? "待機" : "維持"}
+                        </span>
+                      </div>
+                      <div className="mt-2 text-[11px] text-zinc-300 leading-relaxed">{plan.thesis}</div>
+                      <div className="mt-1 text-[10px] text-zinc-600">無効条件: {plan.invalidation}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {adaptiveStrategy.lossPatterns.length > 0 && (
+            <div className="mt-4 border-t border-zinc-800 pt-3">
+              <div className="text-xs font-medium text-zinc-400 mb-2">失敗からの学習</div>
+              <div className="space-y-1.5">
+                {adaptiveStrategy.lossPatterns.slice(0, 3).map((pattern) => (
+                  <div key={`${pattern.category}-${pattern.finding}`} className="text-[11px] text-zinc-400">
+                    <span className="text-red-300">[{pattern.category}]</span> {pattern.finding}
+                    <span className="text-zinc-600"> → {pattern.suggestion}</span>
+                  </div>
+                ))}
+              </div>
             </div>
           )}
         </div>
