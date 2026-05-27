@@ -119,7 +119,10 @@ export class RiskManager {
     if (this.isCircuitBroken()) return 0;
 
     const state = this.getState();
-    const basePercent = state === "WARNING" ? 1.5 : 3;
+    // basePercent: 1 取引で NAV のどれだけ動かすか.
+    // 旧 3% は 1 件 ¥2K 程度になり、手数料負け (203 取引 -¥1,500 のうち手数料 -¥1,200) を起こした.
+    // 8% に引き上げて 1 件 ¥5K-7K にし、policy 50% 投入上限を実効的に使えるように.
+    const basePercent = state === "WARNING" ? 4 : 8;
     const baseAmount = totalCapitalJPY * (basePercent / 100);
     const scaledAmount = baseAmount * (confidence / 100);
     const remainingCapacity = Math.max(0, maxPositionJPY - currentPositionJPY);
