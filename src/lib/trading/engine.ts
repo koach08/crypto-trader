@@ -508,17 +508,23 @@ async function runCycleForPair(pair: string): Promise<void> {
   // 積極反転検出 (extreme 条件不要、段階的)
   const reversalOp = detectAggressiveReversal(timingInput);
 
+  // 底打ち/反転 override が発火したら MTF check を skip するフラグ
+  // 「下降トレンド中の底値買い」を MTF discipline で潰さないため
+  let bypassMtfCheck = false;
+
   if (bottomOp.fire && decision.action !== "BUY") {
     console.log(`[${pair}] 🔻 底打ち検出 → BUY override (${bottomOp.confidence}% 確信): ${bottomOp.conditions.join(" / ")}`);
     decision.action = "BUY";
     decision.confidence = bottomOp.confidence;
     decision.reason = `[底打ちoverride ${bottomOp.confidence}%] ${bottomOp.conditions.join(" / ")}`;
+    if (bottomOp.confidence >= 80) bypassMtfCheck = true;
   } else if (reversalOp.fire && decision.action !== "BUY") {
     // 積極反転: 条件少ない代わりに confidence 段階 (65/78/88)
     console.log(`[${pair}] 📈 反転検出 → BUY override (${reversalOp.confidence}% 確信): ${reversalOp.conditions.join(" / ")}`);
     decision.action = "BUY";
     decision.confidence = reversalOp.confidence;
     decision.reason = `[反転 ${reversalOp.confidence}%] ${reversalOp.conditions.join(" / ")}`;
+    if (reversalOp.confidence >= 85) bypassMtfCheck = true;
   } else if (topOp.fire && decision.action !== "SELL") {
     console.log(`[${pair}] 🔺 天井検出 → SELL override (${topOp.confidence}% 確信): ${topOp.conditions.join(" / ")}`);
     decision.action = "SELL";
@@ -585,14 +591,20 @@ async function runCycleForPair(pair: string): Promise<void> {
   }
 
   // 2. マルチタイムフレーム整合性: h1の判断がh4トレンドと逆なら見送り
+  //    但し底打ち override (≥80%) や反転 override (≥85%) で発火した場合は skip
+  //    (下降トレンド中の底値買い = バリュー投資的、MTF で潰さない)
   if (decision.action !== "HOLD") {
-    const mtf = checkMTFAlignment(bars, decision.action);
-    if (!mtf.aligned) {
-      disciplineNotes.push(`[MTF] ${mtf.reason}`);
-      decision.action = "HOLD";
-      decision.confidence = Math.min(decision.confidence, 40);
+    if (bypassMtfCheck) {
+      disciplineNotes.push(`[MTF] override ${decision.confidence}% で MTF check skip`);
     } else {
-      disciplineNotes.push(`[MTF] ${mtf.reason}`);
+      const mtf = checkMTFAlignment(bars, decision.action);
+      if (!mtf.aligned) {
+        disciplineNotes.push(`[MTF] ${mtf.reason}`);
+        decision.action = "HOLD";
+        decision.confidence = Math.min(decision.confidence, 40);
+      } else {
+        disciplineNotes.push(`[MTF] ${mtf.reason}`);
+      }
     }
   }
 
