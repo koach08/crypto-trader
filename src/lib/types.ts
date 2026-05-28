@@ -236,6 +236,7 @@ export const BITFLYER_PAIRS = [
   "BTC/JPY",
   "ETH/JPY",
   "XRP/JPY",
+  "SOL/JPY",
   "XLM/JPY",
   "MONA/JPY",
 ] as const;

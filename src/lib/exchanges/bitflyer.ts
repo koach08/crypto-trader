@@ -4,6 +4,7 @@ import type { TickerData, OHLCVBar, Balance, OrderResult, ExchangeConfig } from 
 
 const MIN_BASE_AMOUNT: Record<string, number> = {
   BTC: 0.001, ETH: 0.01, XRP: 0.1, XLM: 0.1, MONA: 0.1,
+  SOL: 0.01, // BitFlyer 現物 SOL 0.01 単位
 };
 
 export class BitFlyerExchange implements IExchange {

@@ -192,7 +192,7 @@ const state: EngineState = {
   intervalId: null,
   cycleCount: 0,
   lastCycleTimestamp: null,
-  pairs: ["BTC/JPY", "ETH/JPY", "XRP/JPY"],
+  pairs: ["BTC/JPY", "ETH/JPY", "XRP/JPY", "SOL/JPY"],
   intervalSeconds: 300,
   riskManager: new RiskManager(Number(process.env.MAX_DAILY_LOSS_PERCENT || "5.0")),
   paperTrader: new PaperTrader(),
@@ -844,9 +844,13 @@ async function runCycleForPair(pair: string): Promise<void> {
         quantAnalysis,
         audit: scoringResult.audit,
       });
-      if (adaptiveBlocks.length > 0) {
+      // 底打ち/反転 override (高 confidence) なら適応ガードレール skip
+      // 「底値で出来高薄い」は構造的事実、ここで止めると押し目買い不能
+      if (adaptiveBlocks.length > 0 && !bypassMtfCheck) {
         console.log(`[${pair}] BUY見送り: 適応ガードレール ${adaptiveBlocks.join(" / ")}`);
         return;
+      } else if (adaptiveBlocks.length > 0 && bypassMtfCheck) {
+        console.log(`[${pair}] 適応ガードレール warn but override で続行: ${adaptiveBlocks.join(" / ")}`);
       }
       // Lessons learned: 過去同じパターンで複数回負けてたら BUY 見送り
       try {
@@ -1334,17 +1338,22 @@ async function runCycle(): Promise<void> {
       console.log(`日付ロールオーバー: 開始資金 ¥${currentCapital.toLocaleString()} で本日損益をリセット`);
     }
 
-    // === Kill switch: NAV を peak と比較し閾値発火判定 ===
+    // === Kill switch (reduce only モード) ===
+    // 発火時の挙動: 「新規 BUY 停止」のみ. 既存 position は強制 close しない.
+    // 理由: 旧設計 (全 close) は底値売りマシン化した (5/26 -42% で発火→ 5/28 +100% 反発を逃す).
+    // reduce only なら、保有資産の自然な反発を取れる. 手動 reset で BUY 再開可能.
     try {
       const ks = await evaluateKillSwitch(currentCapital);
       if (ks.justTriggered) {
-        await closeAllLivePositions(`kill-switch (-${ks.drawdownPct.toFixed(1)}%)`);
         state.running = false;
         await sendAlert({
           level: "critical",
-          message: `bot 全停止完了. 全 live ポジションを closeout しました. 手動 reset 必要.`,
-          dedupeKey: "kill-switch:closed-all",
-          fields: { "Final NAV": `¥${Math.round(currentCapital).toLocaleString()}` },
+          message: `🚨 kill switch 発火 (NAV -${ks.drawdownPct.toFixed(1)}%). 新規 BUY 停止. 既存 ${state.livePositions.size} ポジションは保持 (反発期待). 手動 reset 必要.`,
+          dedupeKey: "kill-switch:reduce-only",
+          fields: {
+            "NAV": `¥${Math.round(currentCapital).toLocaleString()}`,
+            "保持中": `${state.livePositions.size} positions`,
+          },
         });
         return;
       }
