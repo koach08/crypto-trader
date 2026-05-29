@@ -21,7 +21,8 @@ done
 if [ "$AUTO_START_LIVE" = "true" ]; then
   (
     sleep 5
-    PAIRS=${TRADING_PAIRS:-"BTC/JPY,ETH/JPY,XRP/JPY,SOL/JPY"}
+    # SOL/JPY は BitFlyer に存在しない (BadSymbol エラーで毎サイクル失敗) ため除外
+    PAIRS=${TRADING_PAIRS:-"BTC/JPY,ETH/JPY,XRP/JPY,XLM/JPY,MONA/JPY"}
     INTERVAL=${BOT_INTERVAL_SECONDS:-300}
     PAIRS_JSON=$(echo "$PAIRS" | sed 's/,/","/g' | sed 's/^/["/' | sed 's/$/"]/')
     echo "[start.sh] Starting live bot: pairs=$PAIRS interval=${INTERVAL}s"

@@ -430,6 +430,12 @@ async function runCycleForPair(pair: string): Promise<void> {
       timestamp: d.timestamp,
     }));
 
+  // MTF を AI prompt 投入前に計算 (後段の override にも再利用)
+  const mtfForPrompt: MultiTimeframeAnalysis | null =
+    (fourHourBars && fourHourBars.length >= 50 && dailyBars && dailyBars.length >= 50)
+      ? analyzeMultiTimeframe({ hourlyBars: bars, fourHourBars, dailyBars })
+      : null;
+
   // Build prompt
   const prompt = buildAnalysisPrompt({
     pair,
@@ -440,6 +446,7 @@ async function runCycleForPair(pair: string): Promise<void> {
     balance,
     recentDecisions: recentForPair,
     paperMode: state.paperMode,
+    mtf: mtfForPrompt,
   });
 
   // Run AI - full consensus for borderline signals, single engine otherwise
@@ -568,12 +575,9 @@ async function runCycleForPair(pair: string): Promise<void> {
   // === MTF 短期/中期/長期 マルチタイムフレーム合議 ===
   // 「歴史的に安い + 反転兆候 + 短期確認」が揃ったら底値仕込みで強制 BUY
   // 逆に「歴史的に高い + 失速」なら強制 SELL
-  if (fourHourBars && fourHourBars.length >= 50 && dailyBars && dailyBars.length >= 50) {
-    const mtf = analyzeMultiTimeframe({
-      hourlyBars: bars,
-      fourHourBars,
-      dailyBars,
-    });
+  // (AI prompt 投入時に計算済みの mtfForPrompt を再利用)
+  if (mtfForPrompt) {
+    const mtf = mtfForPrompt;
     if (state.cycleCount % 6 === 0) {
       console.log(`[${pair}] MTF: ${mtf.reason}`);
     }
@@ -978,9 +982,7 @@ async function runCycleForPair(pair: string): Promise<void> {
             composite: scoringResult.audit.votes.reduce((s, v) => s + v.score * v.weight, 0),
             regime,
             fearGreed: fearGreed.value,
-            mtf: (fourHourBars && fourHourBars.length >= 50 && dailyBars && dailyBars.length >= 50)
-              ? analyzeMultiTimeframe({ hourlyBars: bars, fourHourBars, dailyBars })
-              : null,
+            mtf: mtfForPrompt,
             bottomOp,
           });
           const existing = state.livePositions.get(pair);
