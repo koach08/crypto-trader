@@ -34,6 +34,7 @@ import { shouldFireDCA, executeDCA } from "./dca";
 import { runGridCycle } from "./grid-trader";
 import { analyzeLossPatterns } from "../quant/loss-analyzer";
 import { getActiveOverrides, runStrategicRetrospective } from "../quant/retrospective";
+import { computeAutoGuardrails, getAutoGuardrails, isBlockedHourJST, type AutoGuardrails } from "../quant/auto-guardrails";
 import { assessPreTradeRisk, buildPortfolioRiskOverlay } from "./institutional-risk";
 
 // 緊急ロスカット閾値（pipelineと無関係に発火）
@@ -133,9 +134,11 @@ function evaluateAdaptiveBuyGuardrails(input: {
   pair: string;
   confidence: number;
   fearGreed: number;
+  regime: MarketRegime;
   quantAnalysis: ReturnType<typeof runQuantAnalysis>;
   audit: ReturnType<typeof calculateFinalDecision>["audit"];
   recentTrades: TradeRecord[];
+  autoGuardrails: AutoGuardrails | null;
 }): string[] {
   if (input.action !== "BUY") return [];
 
@@ -177,6 +180,23 @@ function evaluateAdaptiveBuyGuardrails(input: {
   if (input.pair === "XRP/JPY" && input.confidence < 74 && supportVotes <= 3) {
     if (hasRecentLosses(input.recentTrades, "XRP/JPY", PAIR_LOSS_LOOKBACK_MS, 2)) {
       reasons.push(`XRPは直近${PAIR_LOSS_LOOKBACK_DAYS}日に損失集中のため conf<74 かつ BUY支持${supportVotes}票では見送り`);
+    }
+  }
+
+  // === Auto-guardrails (常時更新の loss-pattern 由来) ===
+  if (input.autoGuardrails) {
+    const ag = input.autoGuardrails;
+    // ペア損失集中: high risk ペアは conf 閾値 +10 を要求
+    if (ag.highRiskPairs.includes(input.pair) && input.confidence < 60) {
+      reasons.push(`[auto] ${input.pair} 高損失集中ペア conf<60 では見送り`);
+    }
+    // レジーム損失集中: 例 TRENDING_UP で 93% 負け → BUY 慎重に
+    if (ag.highRiskRegimes.includes(input.regime) && input.confidence < 70) {
+      reasons.push(`[auto] ${input.regime} は高損失レジーム、conf<70 では見送り (高値掴み警戒)`);
+    }
+    // 時間帯損失集中: 該当時間帯の BUY 完全 block
+    if (isBlockedHourJST(ag.blockedHourRanges)) {
+      reasons.push(`[auto] JST 高損失時間帯 (${ag.blockedHourRanges.join(",")}) のため BUY 見送り`);
     }
   }
 
@@ -905,14 +925,18 @@ async function runCycleForPair(pair: string): Promise<void> {
         console.log(`[${pair}] BUY見送り: ${externalBias.pauseReason}`);
         return;
       }
+      // Auto-guardrails: 直近キャッシュ取得 (engine 内で 10 サイクルごと再計算)
+      const autoGuardrails = await getAutoGuardrails().catch(() => null);
       const adaptiveBlocks = evaluateAdaptiveBuyGuardrails({
         action: decision.action,
         pair,
         confidence: decision.confidence,
         fearGreed: fearGreed.value,
+        regime,
         quantAnalysis,
         audit: scoringResult.audit,
         recentTrades: state.liveTrades,
+        autoGuardrails,
       });
       // 適応ガードレール: 厳格化済 (volume<0.1x + BUY票0 等の極端時のみ block).
       // override や強い判断時は警告のみで続行.
@@ -1369,6 +1393,29 @@ async function runCycle(): Promise<void> {
   state.cycleCount++;
   state.lastCycleTimestamp = new Date().toISOString();
   console.log(`\n=== サイクル #${state.cycleCount} (${state.lastCycleTimestamp}) ===`);
+
+  // === 継続学習ループ: 10 サイクルごとに auto-guardrails / lessons を再計算 ===
+  // 損失パターン (ペア集中 / レジーム集中 / 時間帯集中) を実データから自動抽出し
+  // evaluateAdaptiveBuyGuardrails に反映する。lessons も clustering 再構築。
+  if (state.cycleCount % 10 === 0 && state.liveTrades.length >= 5) {
+    try {
+      const ag = await computeAutoGuardrails(state.liveTrades);
+      if (ag.reasons.length > 0) {
+        console.log(`[auto-guardrails] 更新: ${ag.reasons.join(" / ")}`);
+      }
+    } catch (e) {
+      console.warn("[auto-guardrails] 失敗:", e instanceof Error ? e.message : e);
+    }
+    try {
+      const lessons = await rebuildLessonsFromReflections();
+      const active = lessons.filter(l => l.active);
+      if (active.length > 0) {
+        console.log(`[lessons] active ${active.length} 件: ${active.slice(0, 3).map(l => `${l.id} (${l.occurrences}x)`).join(", ")}`);
+      }
+    } catch (e) {
+      console.warn("[lessons] 再構築失敗:", e instanceof Error ? e.message : e);
+    }
+  }
 
   // === Kill switch: 既に発火済みなら cycle 全スキップ (新規エントリ防止) ===
   if (await isKillSwitchActive()) {

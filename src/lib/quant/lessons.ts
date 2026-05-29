@@ -1,14 +1,15 @@
 /**
  * Lessons learned: 振り返りから抽出したルールを集約 → 次の判断に活かす。
  *
- * - 個別の振り返り (reflection) → 似たもの集約 → 重み付きルール (lessons)
+ * - 個別の振り返り (reflection) を「意味的に同じパターン」でクラスタ化
+ * - クラスタ化キー: category + action + regime + 確信度バケット
+ *   (旧設計の preventionRule.slice(0,60) は LLM 文章のユニーク化で集約に失敗していた)
  * - 各サイクルの BUY/SELL 判断時にルールを照合
  * - 同じパターンで N 回負けてたら、次回は警告 or skip
  *
  * 設計:
- * - ルールの「強度」は発生回数で決まる (3回以上で active)
- * - 古いルール (30日以上前) は弱める (時間減衰)
- * - 過剰禁止防止のため、active ルールは最大 10 個まで
+ * - クラスタ 2 回以上発生 + 直近 30日以内 → active
+ * - active ルールは最大 10 個まで
  */
 
 import type { LossReflection } from "./reflection";
@@ -16,10 +17,15 @@ import { getReflections } from "./reflection";
 import { loadData, saveData } from "../data";
 
 export interface Lesson {
+  /** クラスタキー: category::action::regime::confBucket */
   id: string;
-  /** 元の振り返りから抽出した条件文 */
-  rule: string;
   category: string;
+  action: "BUY" | "SELL" | "HOLD";
+  regime: string;
+  /** confidence bucket (10pt 単位、例 60 = 60-69%) */
+  confidenceBucket: number;
+  /** 代表 rule 文 (表示用) */
+  rule: string;
   /** 同じパターンで何回負けたか */
   occurrences: number;
   totalLoss: number;
@@ -30,17 +36,46 @@ export interface Lesson {
 }
 
 const LESSONS_FILE = "lessons-active";
+const ACTIVATION_THRESHOLD = 2; // 2 回以上同パターンで損失 → active
+const MAX_ACTIVE_LESSONS = 10;
+const STALENESS_DAYS = 30;
 
-/** 似たルール文を 60 文字 prefix でクラスタ化して集約 */
+type LessonAction = "BUY" | "SELL" | "HOLD";
+function normalizeAction(a: string): LessonAction {
+  const u = a.toUpperCase();
+  return u === "BUY" || u === "SELL" ? u : "HOLD";
+}
+
+function clusterKey(r: LossReflection): string {
+  const ctx = r.decisionContext;
+  const confBucket = Math.floor(ctx.confidence / 10) * 10;
+  return `${r.category}::${normalizeAction(ctx.action)}::${ctx.regime}::conf${confBucket}`;
+}
+
+/** 意味的クラスタリングで lessons を再構築 */
 export async function rebuildLessonsFromReflections(): Promise<Lesson[]> {
   const reflections = await getReflections(200);
-  const clusters: Record<string, { rule: string; reflections: LossReflection[]; category: string }> = {};
+  const clusters: Record<string, {
+    reflections: LossReflection[];
+    sampleRule: string;
+    category: string;
+    action: "BUY" | "SELL" | "HOLD";
+    regime: string;
+    confidenceBucket: number;
+  }> = {};
 
   for (const r of reflections) {
-    const key = r.preventionRule.slice(0, 60).trim();
-    if (!key) continue;
+    const key = clusterKey(r);
+    const ctx = r.decisionContext;
     if (!clusters[key]) {
-      clusters[key] = { rule: r.preventionRule, reflections: [], category: r.category };
+      clusters[key] = {
+        reflections: [],
+        sampleRule: r.preventionRule,
+        category: r.category,
+        action: normalizeAction(ctx.action),
+        regime: ctx.regime,
+        confidenceBucket: Math.floor(ctx.confidence / 10) * 10,
+      };
     }
     clusters[key].reflections.push(r);
   }
@@ -53,14 +88,15 @@ export async function rebuildLessonsFromReflections(): Promise<Lesson[]> {
       const firstSeen = sortedRefls[0].timestamp;
       const lastSeen = sortedRefls[sortedRefls.length - 1].timestamp;
       const ageDays = (now.getTime() - new Date(lastSeen).getTime()) / (24 * 60 * 60 * 1000);
-      // 30日以上ぶりは inactive
-      const recentEnough = ageDays < 30;
-      // 3 回以上発生 + 直近 30日以内 → active
-      const active = c.reflections.length >= 3 && recentEnough;
+      const recentEnough = ageDays < STALENESS_DAYS;
+      const active = c.reflections.length >= ACTIVATION_THRESHOLD && recentEnough;
       return {
-        id: `lesson-${Buffer.from(key).toString("base64").slice(0, 12)}`,
-        rule: c.rule,
+        id: key,
         category: c.category,
+        action: c.action,
+        regime: c.regime,
+        confidenceBucket: c.confidenceBucket,
+        rule: c.sampleRule,
         occurrences: c.reflections.length,
         totalLoss,
         firstSeen,
@@ -68,12 +104,13 @@ export async function rebuildLessonsFromReflections(): Promise<Lesson[]> {
         active,
       };
     })
-    .sort((a, b) => b.occurrences - a.occurrences);
+    // 損失大きい順に並べる (損失合計の絶対値)
+    .sort((a, b) => a.totalLoss - b.totalLoss);
 
-  // active 上限 10 個
+  // active 上限制御
   let activeCount = 0;
   for (const l of lessons) {
-    if (l.active && activeCount >= 10) {
+    if (l.active && activeCount >= MAX_ACTIVE_LESSONS) {
       l.active = false;
     }
     if (l.active) activeCount++;
@@ -92,12 +129,7 @@ export async function getAllLessons(): Promise<Lesson[]> {
   return loadData<Lesson[]>(LESSONS_FILE, []);
 }
 
-/**
- * AI に「現在の状況がルールに該当するか」を判定させる軽量ヘルパー。
- * パフォーマンス考慮で AI 呼出しはせず、文字列マッチで近似する MVP。
- *
- * 高度版: 後で AI でコンテキスト評価に置き換え可能。
- */
+/** 現在の判断コンテキスト */
 export interface LessonCheckContext {
   action: "BUY" | "SELL" | "HOLD";
   pair: string;
@@ -108,48 +140,33 @@ export interface LessonCheckContext {
   confidence: number;
 }
 
-/** 単純文字列マッチでルール照合 (将来 AI 置換可) */
+/**
+ * クラスタ署名でマッチング: 現在の (action, regime, confBucket) が
+ * 過去の損失クラスタと一致したら block 候補.
+ */
 export function matchLessons(ctx: LessonCheckContext, lessons: Lesson[]): {
   blocked: boolean;
   matched: { rule: string; reason: string }[];
 } {
   const matched: { rule: string; reason: string }[] = [];
-  const text = ctx.action.toUpperCase();
+  const ctxBucket = Math.floor(ctx.confidence / 10) * 10;
+
   for (const l of lessons) {
     if (!l.active) continue;
-    const rule = l.rule.toUpperCase();
-    // 雑だが効く: ルール文に含まれるキーワードと現状を突き合わせる
-    if (!rule.includes(text)) continue; // BUY 用ルールに SELL は無関係
+    if (l.action !== ctx.action) continue;
+    if (l.regime !== ctx.regime) continue;
+    // 確信度バケットは ±1 段階まで許容 (60-79 で 70-bucket lesson にもヒット)
+    if (Math.abs(l.confidenceBucket - ctxBucket) > 10) continue;
 
-    // 例: ルール = "RSI > 70 + 過去5本 +3% 急騰時 BUY 見送り"
-    // 現状 RSI 73, 直近 +4% なら match
-    let hit = false;
-    if (ctx.rsi != null) {
-      const rsiMatch = l.rule.match(/RSI\s*[><]\s*(\d+)/i);
-      if (rsiMatch) {
-        const threshold = Number(rsiMatch[1]);
-        const op = l.rule.includes(">") ? ">" : "<";
-        if (op === ">" && ctx.rsi > threshold) hit = true;
-        if (op === "<" && ctx.rsi < threshold) hit = true;
-      }
-    }
-    const fgMatch = l.rule.match(/F&G\s*[><]\s*(\d+)/i);
-    if (fgMatch) {
-      const threshold = Number(fgMatch[1]);
-      const op = l.rule.includes(">") ? ">" : "<";
-      if (op === ">" && ctx.fearGreed > threshold) hit = true;
-      if (op === "<" && ctx.fearGreed < threshold) hit = true;
-    }
-    if (l.rule.toUpperCase().includes(ctx.regime.toUpperCase())) hit = true;
-
-    if (hit) {
-      matched.push({
-        rule: l.rule,
-        reason: `過去 ${l.occurrences} 回同じパターンで合計 ¥${Math.round(l.totalLoss)} の損失`,
-      });
-    }
+    matched.push({
+      rule: l.rule,
+      reason: `過去 ${l.occurrences} 回 ${l.regime}/${l.action}/conf${l.confidenceBucket} で合計 ¥${Math.round(l.totalLoss).toLocaleString()} の損失`,
+    });
   }
 
-  // 2 件以上マッチ → block
-  return { blocked: matched.length >= 2, matched };
+  // 1 件マッチでも、強い損失パターン (-¥50 以上) なら block
+  const strongBlock = matched.some(m => /-¥[5-9]\d|-¥\d{3,}/.test(m.reason));
+  const blocked = matched.length >= 2 || strongBlock;
+
+  return { blocked, matched };
 }

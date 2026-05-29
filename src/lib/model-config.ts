@@ -12,7 +12,7 @@ const MODELS = {
   claude: {
     LIGHT: "claude-sonnet-4-6",
     STANDARD: "claude-sonnet-4-6",
-    HEAVY: "claude-opus-4-6",
+    HEAVY: "claude-opus-4-8",
   },
   openai: {
     LIGHT: "gpt-4.1-mini",
