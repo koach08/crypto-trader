@@ -27,6 +27,11 @@ import { computeAllocations, type ForwardSignal, type PairAllocation } from "./c
 import { evaluateTier } from "./capital-policy";
 import { evaluateKillSwitch, isKillSwitchActive } from "./kill-switch";
 import { sendAlert } from "../alerts";
+import { checkOpportunities } from "../opportunity-detector";
+import { shouldFireCommentary, runDailyCommentary } from "../ai-commentary";
+import { getCapitalPolicy } from "./capital-policy";
+import { shouldFireDCA, executeDCA } from "./dca";
+import { runGridCycle } from "./grid-trader";
 import { analyzeLossPatterns } from "../quant/loss-analyzer";
 import { getActiveOverrides, runStrategicRetrospective } from "../quant/retrospective";
 import { assessPreTradeRisk, buildPortfolioRiskOverlay } from "./institutional-risk";
@@ -509,6 +514,32 @@ async function runCycleForPair(pair: string): Promise<void> {
 
   // 積極反転検出 (extreme 条件不要、段階的)
   const reversalOp = detectAggressiveReversal(timingInput);
+
+  // === Opportunity 検知 (bot 判断と独立、純粋な「機会」を Slack push) ===
+  try {
+    const recentBars = bars.slice(-14);
+    const low14 = Math.min(...recentBars.map(b => b.low));
+    const high14 = Math.max(...recentBars.map(b => b.high));
+    const near14LowPercent = low14 > 0 ? ((ticker.price - low14) / low14) * 100 : 100;
+    const near14HighPercent = high14 > 0 ? ((high14 - ticker.price) / high14) * 100 : 100;
+    const volumeRatio = numericFactor(
+      quantAnalysis.signals.find(s => s.name === "出来高異常")?.factors.ratio,
+    ) ?? 1.0;
+    await checkOpportunities({
+      pair,
+      price: ticker.price,
+      near14LowPercent,
+      near14HighPercent,
+      fearGreed: fearGreed.value,
+      volumeRatio,
+      intel: intelBias,
+      bottomFire: bottomOp.fire,
+      bottomConfidence: bottomOp.confidence,
+      reversalFire: reversalOp.fire,
+    });
+  } catch (e) {
+    console.warn(`[${pair}] opportunity check 失敗:`, e instanceof Error ? e.message : e);
+  }
 
   // 底打ち/反転 override が発火したら MTF check を skip するフラグ
   // 「下降トレンド中の底値買い」を MTF discipline で潰さないため
@@ -1501,6 +1532,184 @@ async function runCycle(): Promise<void> {
       }
     } catch (e) {
       console.error("learning失敗:", e);
+    }
+  }
+
+  // === Daily Commentary: JST 9時台に当日 1 回だけ AI レポート生成 + Slack 配信 ===
+  try {
+    if (await shouldFireCommentary()) {
+      let currentNAV = state.riskManager.getDailyPnL().startCapitalJPY || 0;
+      if (!state.paperMode) {
+        try {
+          const exchange = getExchange();
+          const balance = await exchange.getBalance();
+          const jpy = balance.find(b => b.currency === "JPY")?.total ?? 0;
+          let cryptoVal = 0;
+          for (const bal of balance) {
+            if (bal.currency === "JPY" || bal.total <= 0.0000001) continue;
+            try {
+              const t = await exchange.getTicker(`${bal.currency}/JPY`);
+              cryptoVal += bal.total * t.price;
+            } catch {/* skip */}
+          }
+          if (jpy + cryptoVal > 0) currentNAV = jpy + cryptoVal;
+        } catch {/* fallback */}
+      }
+      const [intel, policy] = await Promise.all([
+        getAggregatedIntel().catch(() => null),
+        getCapitalPolicy().catch(() => null),
+      ]);
+      await runDailyCommentary({
+        trades: state.liveTrades,
+        intel,
+        policy,
+        currentNAV,
+      });
+    }
+  } catch (e) {
+    console.warn("[daily-commentary] 失敗:", e instanceof Error ? e.message : e);
+  }
+
+  // === DCA (週次積立): 長期視点で機械的に定額買い ===
+  try {
+    if (await shouldFireDCA()) {
+      const fgVal = (await getFearGreedIndex().catch(() => ({ value: 50 }))).value;
+      const ksActive = await isKillSwitchActive();
+      await executeDCA({
+        pairs: state.pairs,
+        fearGreed: fgVal,
+        killSwitchActive: ksActive,
+        marketBuy: async (pair: string, jpyAmount: number) => {
+          if (state.paperMode) {
+            return { ok: false, reason: "paperMode" };
+          }
+          try {
+            const exchange = getExchange();
+            const balance = await exchange.getBalance();
+            const jpyFree = balance.find(b => b.currency === "JPY")?.free ?? 0;
+            if (jpyFree < jpyAmount) return { ok: false, reason: `JPY 不足 (free ¥${jpyFree})` };
+            const order = await exchange.marketBuy(pair, jpyAmount);
+            const trade: TradeRecord = {
+              id: `dca-${Date.now()}-${pair.replace("/", "")}`,
+              timestamp: new Date().toISOString(),
+              exchange: "bitflyer",
+              pair, side: "buy", type: "market",
+              amount: order.amount, price: order.price,
+              valueJPY: jpyAmount, orderId: order.id, fee: order.fee ?? 0,
+              paperTrade: false,
+            };
+            state.recentTrades.push(trade);
+            state.liveTrades.push(trade);
+            // livePosition への加算 (既存 if あれば平均化)
+            const existing = state.livePositions.get(pair);
+            if (existing) {
+              const newTotal = existing.amount + order.amount;
+              existing.entryPrice = (existing.entryPrice * existing.amount + order.price * order.amount) / newTotal;
+              existing.amount = newTotal;
+            } else {
+              state.livePositions.set(pair, {
+                pair, entryPrice: order.price, amount: order.amount,
+                entryTimestamp: new Date().toISOString(),
+                stopLossPercent: 8.0,   // DCA は長期視点で SL 緩め
+                takeProfitPercent: 30.0, // TP も大きく
+                style: "HOLD",
+                styleReason: "DCA 長期積立",
+              });
+            }
+            await saveData("live-trades", state.liveTrades.slice(-200));
+            await saveData("live-positions", Array.from(state.livePositions.values()));
+            return { ok: true, orderId: order.id, fillPrice: order.price, amount: order.amount };
+          } catch (e) {
+            return { ok: false, reason: e instanceof Error ? e.message : String(e) };
+          }
+        },
+      });
+    }
+  } catch (e) {
+    console.warn("[DCA] 失敗:", e instanceof Error ? e.message : e);
+  }
+
+  // === Grid trader (短期上下取り): GRID_ENABLED=1 で有効. 6 cycle ごとに評価 ===
+  if (process.env.GRID_ENABLED === "1" && state.cycleCount % 6 === 0 && !state.paperMode) {
+    try {
+      const exchange = getExchange();
+      const balance = await exchange.getBalance();
+      const jpy = balance.find(b => b.currency === "JPY")?.total ?? 0;
+      let nav = jpy;
+      const tickerMap: Record<string, number> = {};
+      for (const p of state.pairs) {
+        try {
+          const t = await exchange.getTicker(p);
+          tickerMap[p] = t.price;
+          const base = p.split("/")[0];
+          const bal = balance.find(b => b.currency === base);
+          if (bal) nav += bal.total * t.price;
+        } catch {/* skip */}
+      }
+      const intel = await getAggregatedIntel().catch(() => null);
+      const fgVal = (await getFearGreedIndex().catch(() => ({ value: 50 }))).value;
+      const policy = await getCapitalPolicy().catch(() => null);
+      const gridCapPercent = Number(process.env.GRID_CAPITAL_PERCENT ?? "15"); // NAV の何 % を grid に
+      const ksActive = await isKillSwitchActive();
+      if (!ksActive) {
+        await runGridCycle({
+          nav,
+          capitalAvailable: Math.round(nav * (gridCapPercent / 100)),
+          pairs: state.pairs,
+          fearGreed: fgVal,
+          intel,
+          tickerMap,
+          marketBuy: async (pair, jpyAmount) => {
+            try {
+              const jpyFree = balance.find(b => b.currency === "JPY")?.free ?? 0;
+              if (jpyFree < jpyAmount) return { ok: false };
+              const order = await exchange.marketBuy(pair, jpyAmount);
+              const trade: TradeRecord = {
+                id: `grid-${Date.now()}-${pair.replace("/", "")}`,
+                timestamp: new Date().toISOString(),
+                exchange: "bitflyer",
+                pair, side: "buy", type: "market",
+                amount: order.amount, price: order.price,
+                valueJPY: jpyAmount, orderId: order.id, fee: order.fee ?? 0,
+                paperTrade: false,
+              };
+              state.recentTrades.push(trade);
+              state.liveTrades.push(trade);
+              await saveData("live-trades", state.liveTrades.slice(-200));
+              return { ok: true, fillPrice: order.price, amount: order.amount };
+            } catch (e) {
+              console.warn(`[grid] ${pair} marketBuy 失敗:`, e instanceof Error ? e.message : e);
+              return { ok: false };
+            }
+          },
+          marketSell: async (pair, baseAmount) => {
+            try {
+              const realPos = await exchange.getPosition(pair);
+              if (realPos.free < baseAmount) return { ok: false };
+              const order = await exchange.marketSell(pair, Math.min(realPos.free, baseAmount));
+              const fillPrice = order.price > 0 ? order.price : (tickerMap[pair] ?? 0);
+              const trade: TradeRecord = {
+                id: `grid-${Date.now()}-${pair.replace("/", "")}-s`,
+                timestamp: new Date().toISOString(),
+                exchange: "bitflyer",
+                pair, side: "sell", type: "market",
+                amount: order.amount, price: fillPrice,
+                valueJPY: order.amount * fillPrice, orderId: order.id, fee: order.fee ?? 0,
+                paperTrade: false,
+              };
+              state.recentTrades.push(trade);
+              state.liveTrades.push(trade);
+              await saveData("live-trades", state.liveTrades.slice(-200));
+              return { ok: true, fillPrice, amount: order.amount };
+            } catch (e) {
+              console.warn(`[grid] ${pair} marketSell 失敗:`, e instanceof Error ? e.message : e);
+              return { ok: false };
+            }
+          },
+        });
+      }
+    } catch (e) {
+      console.warn("[grid] cycle 失敗:", e instanceof Error ? e.message : e);
     }
   }
 }
