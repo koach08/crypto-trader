@@ -488,6 +488,16 @@ async function runCycleForPair(pair: string): Promise<void> {
       ? analyzeMultiTimeframe({ hourlyBars: bars, fourHourBars, dailyBars })
       : null;
 
+  // AI self-awareness: 自分のパフォーマンスと負けパターンを prompt に注入
+  const autoGuardrailsForPrompt = await getAutoGuardrails().catch(() => null);
+  const closedTrades = state.liveTrades.filter(t => t.side === "sell" && t.pnl !== undefined);
+  const wins = closedTrades.filter(t => (t.pnl ?? 0) > 0).length;
+  const performanceContext = closedTrades.length >= 5 ? {
+    closedTrades: closedTrades.length,
+    winRate: (wins / closedTrades.length) * 100,
+    netPnLJPY: closedTrades.reduce((s, t) => s + (t.pnl ?? 0), 0),
+  } : null;
+
   // Build prompt
   const prompt = buildAnalysisPrompt({
     pair,
@@ -499,6 +509,8 @@ async function runCycleForPair(pair: string): Promise<void> {
     recentDecisions: recentForPair,
     paperMode: state.paperMode,
     mtf: mtfForPrompt,
+    autoGuardrails: autoGuardrailsForPrompt,
+    performanceContext,
   });
 
   // Run AI - full consensus for borderline signals, single engine otherwise
