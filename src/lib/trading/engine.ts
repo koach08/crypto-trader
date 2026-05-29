@@ -106,6 +106,28 @@ function numericFactor(value: number | string | undefined): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+// Yahoo/CoinGecko fallback で volume=0 が返るペアでも判断材料を奪わないように、
+// 直近 N 本の bar 全部が volume=0 = データ欠損として扱う閾値
+const VOLUME_DATA_MISSING_THRESHOLD = 0.001;
+
+// XRP の per-pair 損失制限を「直近 N 日に loss が確認されたら」だけに限定するためのウィンドウ
+const PAIR_LOSS_LOOKBACK_DAYS = 7;
+const PAIR_LOSS_LOOKBACK_MS = PAIR_LOSS_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
+
+function hasRecentLosses(trades: TradeRecord[], pair: string, lookbackMs: number, minLosses: number = 2): boolean {
+  const cutoff = Date.now() - lookbackMs;
+  let losses = 0;
+  for (const t of trades) {
+    if (t.pair !== pair) continue;
+    if (t.side !== "sell") continue;
+    if (t.pnl == null || t.pnl >= 0) continue;
+    if (new Date(t.timestamp).getTime() < cutoff) continue;
+    losses++;
+    if (losses >= minLosses) return true;
+  }
+  return false;
+}
+
 function evaluateAdaptiveBuyGuardrails(input: {
   action: AIDecision["action"];
   pair: string;
@@ -113,6 +135,7 @@ function evaluateAdaptiveBuyGuardrails(input: {
   fearGreed: number;
   quantAnalysis: ReturnType<typeof runQuantAnalysis>;
   audit: ReturnType<typeof calculateFinalDecision>["audit"];
+  recentTrades: TradeRecord[];
 }): string[] {
   if (input.action !== "BUY") return [];
 
@@ -127,14 +150,20 @@ function evaluateAdaptiveBuyGuardrails(input: {
   const opposingVotes = directionalVotes.filter((v) => v.action === "SELL").length;
   const reasons: string[] = [];
 
+  // Volume データ欠損判定: Yahoo/CoinGecko fallback は volume=0 を返す。
+  // volumeRatio が VOLUME_DATA_MISSING_THRESHOLD 未満 ≒ データ欠損とみなし volume 系 gate を無視。
+  const volumeDataMissing = volumeRatio == null || volumeRatio < VOLUME_DATA_MISSING_THRESHOLD;
+
   // 厳格化: 「客観的に絶対避けるべき」局面のみ block.
   // 旧設計は守りすぎて「動かない bot」になった (volume<0.3 で全部 block).
   // 新設計: volume<0.1x (=ほぼ板無し) かつ BUY 票 0 票の極端時のみ.
-  if (volumeRatio != null && volumeRatio < 0.10 && supportVotes === 0) {
+  // ただし volume データ欠損時は判断保留せず通す (fallback OHLCV では出来高情報が無い)
+  if (!volumeDataMissing && volumeRatio != null && volumeRatio < 0.10 && supportVotes === 0) {
     reasons.push(`板枯渇 volume=${volumeRatio.toFixed(2)}x かつ BUY支持0票 (約定リスク高)`);
   }
   // レンジ高値圏での反対票多数: 「天井圏で買い」は客観的に不利
   if (
+    !volumeDataMissing &&
     volumeRatio != null &&
     rangePosition != null &&
     volumeRatio < 0.15 &&
@@ -143,9 +172,12 @@ function evaluateAdaptiveBuyGuardrails(input: {
   ) {
     reasons.push(`レンジ天井圏${rangePosition.toFixed(0)}% + 板薄 + 反対票${opposingVotes}票`);
   }
-  // XRP の per-pair 損失制限はそのまま (data driven な妥当判断)
+  // XRP の per-pair 損失制限: 直近 7 日に 2 件以上の loss-sell があった時のみ発動
+  // (永続ルール化で「いつまでも XRP 買えない」状態を回避)
   if (input.pair === "XRP/JPY" && input.confidence < 74 && supportVotes <= 3) {
-    reasons.push(`XRPは直近損失集中のため conf<74 かつ BUY支持${supportVotes}票では見送り`);
+    if (hasRecentLosses(input.recentTrades, "XRP/JPY", PAIR_LOSS_LOOKBACK_MS, 2)) {
+      reasons.push(`XRPは直近${PAIR_LOSS_LOOKBACK_DAYS}日に損失集中のため conf<74 かつ BUY支持${supportVotes}票では見送り`);
+    }
   }
 
   return reasons;
@@ -880,6 +912,7 @@ async function runCycleForPair(pair: string): Promise<void> {
         fearGreed: fearGreed.value,
         quantAnalysis,
         audit: scoringResult.audit,
+        recentTrades: state.liveTrades,
       });
       // 適応ガードレール: 厳格化済 (volume<0.1x + BUY票0 等の極端時のみ block).
       // override や強い判断時は警告のみで続行.
