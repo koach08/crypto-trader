@@ -122,21 +122,23 @@ function evaluateAdaptiveBuyGuardrails(input: {
   const opposingVotes = directionalVotes.filter((v) => v.action === "SELL").length;
   const reasons: string[] = [];
 
-  if (volumeRatio != null && volumeRatio < 0.3 && supportVotes <= 2) {
-    reasons.push(`薄商い volume=${volumeRatio.toFixed(2)}x かつ BUY支持${supportVotes}票`);
+  // 厳格化: 「客観的に絶対避けるべき」局面のみ block.
+  // 旧設計は守りすぎて「動かない bot」になった (volume<0.3 で全部 block).
+  // 新設計: volume<0.1x (=ほぼ板無し) かつ BUY 票 0 票の極端時のみ.
+  if (volumeRatio != null && volumeRatio < 0.10 && supportVotes === 0) {
+    reasons.push(`板枯渇 volume=${volumeRatio.toFixed(2)}x かつ BUY支持0票 (約定リスク高)`);
   }
-  if (volumeRatio != null && volumeRatio < 0.3 && input.fearGreed < 30 && supportVotes <= 3) {
-    reasons.push(`Extreme Fear(${input.fearGreed}) + 薄商い + BUY支持不足`);
-  }
+  // レンジ高値圏での反対票多数: 「天井圏で買い」は客観的に不利
   if (
     volumeRatio != null &&
     rangePosition != null &&
-    volumeRatio < 0.3 &&
-    rangePosition > 65 &&
-    opposingVotes >= 2
+    volumeRatio < 0.15 &&
+    rangePosition > 80 &&
+    opposingVotes >= 3
   ) {
-    reasons.push(`薄商いでレンジ上部${rangePosition.toFixed(0)}%かつ反対票${opposingVotes}票`);
+    reasons.push(`レンジ天井圏${rangePosition.toFixed(0)}% + 板薄 + 反対票${opposingVotes}票`);
   }
+  // XRP の per-pair 損失制限はそのまま (data driven な妥当判断)
   if (input.pair === "XRP/JPY" && input.confidence < 74 && supportVotes <= 3) {
     reasons.push(`XRPは直近損失集中のため conf<74 かつ BUY支持${supportVotes}票では見送り`);
   }
@@ -591,20 +593,20 @@ async function runCycleForPair(pair: string): Promise<void> {
   }
 
   // 2. マルチタイムフレーム整合性: h1の判断がh4トレンドと逆なら見送り
-  //    但し底打ち override (≥80%) や反転 override (≥85%) で発火した場合は skip
-  //    (下降トレンド中の底値買い = バリュー投資的、MTF で潰さない)
+  //    MTF は警告のみで block しない (旧設計: 下降トレンド逆張りを全部潰してた).
+  //    判断は score 側 (Quant + Tech) に任せ、MTF は disciplineNotes に記録するのみ.
+  //    例外: confidence 50% 未満 + MTF 不一致 = 弱い判断 → HOLD (両方妥当な場合のみ却下)
   if (decision.action !== "HOLD") {
-    if (bypassMtfCheck) {
-      disciplineNotes.push(`[MTF] override ${decision.confidence}% で MTF check skip`);
-    } else {
-      const mtf = checkMTFAlignment(bars, decision.action);
-      if (!mtf.aligned) {
-        disciplineNotes.push(`[MTF] ${mtf.reason}`);
-        decision.action = "HOLD";
-        decision.confidence = Math.min(decision.confidence, 40);
-      } else {
-        disciplineNotes.push(`[MTF] ${mtf.reason}`);
-      }
+    const mtf = checkMTFAlignment(bars, decision.action);
+    disciplineNotes.push(`[MTF] ${mtf.reason}`);
+    if (!mtf.aligned && decision.confidence < 50 && !bypassMtfCheck) {
+      // 弱い判断 (conf<50) かつ MTF も不一致 = 両方妥当なら HOLD
+      decision.action = "HOLD";
+      decision.confidence = Math.min(decision.confidence, 40);
+      disciplineNotes.push(`[MTF] 弱判断 + 不一致で HOLD`);
+    } else if (!mtf.aligned) {
+      // 強い判断 (conf>=50) または override 経由 → MTF 不一致でも続行
+      disciplineNotes.push(`[MTF] 不一致だが conf${decision.confidence}% で続行`);
     }
   }
 
@@ -844,13 +846,13 @@ async function runCycleForPair(pair: string): Promise<void> {
         quantAnalysis,
         audit: scoringResult.audit,
       });
-      // 底打ち/反転 override (高 confidence) なら適応ガードレール skip
-      // 「底値で出来高薄い」は構造的事実、ここで止めると押し目買い不能
-      if (adaptiveBlocks.length > 0 && !bypassMtfCheck) {
-        console.log(`[${pair}] BUY見送り: 適応ガードレール ${adaptiveBlocks.join(" / ")}`);
+      // 適応ガードレール: 厳格化済 (volume<0.1x + BUY票0 等の極端時のみ block).
+      // override や強い判断時は警告のみで続行.
+      if (adaptiveBlocks.length > 0 && !bypassMtfCheck && decision.confidence < 70) {
+        console.log(`[${pair}] BUY見送り(REJECT): 適応ガードレール ${adaptiveBlocks.join(" / ")} | conf${decision.confidence}% < 70`);
         return;
-      } else if (adaptiveBlocks.length > 0 && bypassMtfCheck) {
-        console.log(`[${pair}] 適応ガードレール warn but override で続行: ${adaptiveBlocks.join(" / ")}`);
+      } else if (adaptiveBlocks.length > 0) {
+        console.log(`[${pair}] BUY続行(WARN): 適応ガードレール ${adaptiveBlocks.join(" / ")} | bypass=${bypassMtfCheck} or conf${decision.confidence}%≥70`);
       }
       // Lessons learned: 過去同じパターンで複数回負けてたら BUY 見送り
       try {
