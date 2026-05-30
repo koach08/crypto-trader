@@ -1808,98 +1808,10 @@ async function runCycle(): Promise<void> {
     }
   }
 
-  // === Allocation maintainer: DISABLED (Plan A redesign 2026-05-30) ===
-  // 「下落相場で落ちるナイフを掴む」リスクが高く、現在の bot 設計 (5min day trading
-  // で edge 出ない構造) のままでは損失加速器になるため停止。
-  // 代わりに Weekly DCA baseline (低頻度・規律的) で target ratio に近づける。
-  if (false && !state.paperMode && state.cycleCount % 3 === 0) {
-    try {
-      const exchange = getExchange();
-      const balance = await exchange.getBalance();
-      const jpyFree = balance.find(b => b.currency === "JPY")?.free ?? 0;
-      let cryptoValueJPY = 0;
-      const pairScores: { pair: string; compositeScore: number; price: number }[] = [];
-      for (const p of state.pairs) {
-        try {
-          const t = await exchange.getTicker(p);
-          const base = p.split("/")[0];
-          const bal = balance.find(b => b.currency === base);
-          if (bal) cryptoValueJPY += bal.total * t.price;
-          // 最新 decision の composite を引き当て
-          const lastDec = [...state.decisions].reverse().find(d => d.pair === p);
-          const composite = lastDec ? lastDec.confidence - 50 : 0; // confidence 50% = neutral
-          pairScores.push({ pair: p, compositeScore: composite, price: t.price });
-        } catch { /* skip */ }
-      }
-      const fgVal = (await getFearGreedIndex().catch(() => ({ value: 50 }))).value;
-      const ksActive = await isKillSwitchActive();
-      const decision = await evaluateAllocation({
-        jpyFree,
-        cryptoValueJPY,
-        fearGreed: fgVal,
-        dailyPnLPercent: state.riskManager.getDailyPnL()?.totalPnLPercent ?? 0,
-        killSwitchActive: ksActive,
-        pairScores,
-      });
-      if (decision.shouldBuy && decision.pair && decision.amountJPY) {
-        console.log(`[alloc] ${decision.reason}`);
-        try {
-          const { order, viaMaker } = await executeBuy(exchange, decision.pair, decision.amountJPY);
-          const trade: TradeRecord = {
-            id: `alloc-${Date.now()}-${decision.pair.replace("/", "")}`,
-            timestamp: new Date().toISOString(),
-            exchange: "bitflyer",
-            pair: decision.pair,
-            side: "buy",
-            type: "market",
-            amount: order.amount,
-            price: order.price,
-            valueJPY: decision.amountJPY,
-            orderId: order.id,
-            fee: order.fee ?? 0,
-            paperTrade: false,
-          };
-          state.recentTrades.push(trade);
-          state.liveTrades.push(trade);
-          // livePosition に加算 (既存あれば平均化)
-          const existing = state.livePositions.get(decision.pair);
-          if (existing) {
-            const newTotal = existing.amount + order.amount;
-            existing.entryPrice = (existing.entryPrice * existing.amount + order.price * order.amount) / newTotal;
-            existing.amount = newTotal;
-          } else {
-            state.livePositions.set(decision.pair, {
-              pair: decision.pair,
-              entryPrice: order.price,
-              amount: order.amount,
-              entryTimestamp: new Date().toISOString(),
-              stopLossPercent: 5.0,   // allocation は中期視点で SL 緩め
-              takeProfitPercent: 15.0, // TP も大きく
-              style: "HOLD",
-              styleReason: "allocation maintainer 受動 BUY",
-            });
-          }
-          await recordAllocationEvent({
-            timestamp: new Date().toISOString(),
-            pair: decision.pair,
-            amountJPY: decision.amountJPY,
-            price: order.price,
-            reason: decision.reason,
-          });
-          await saveData("live-trades", state.liveTrades.slice(-200));
-          await saveData("live-positions", Array.from(state.livePositions.values()));
-          console.log(`[alloc] ${decision.pair} BUY ¥${decision.amountJPY.toLocaleString()} @ ¥${order.price.toFixed(0)} ${viaMaker ? "(maker)" : "(taker)"}`);
-        } catch (e) {
-          console.warn("[alloc] BUY 失敗:", e instanceof Error ? e.message : e);
-        }
-      } else if (decision.diagnostics.triggered) {
-        // 発動条件は満たしたが他の安全弁で stop した場合のログ
-        console.log(`[alloc] skip: ${decision.reason} (現金率 ${(decision.diagnostics.cashRatio * 100).toFixed(1)}%)`);
-      }
-    } catch (e) {
-      console.warn("[alloc] cycle 失敗:", e instanceof Error ? e.message : e);
-    }
-  }
+  // === Allocation maintainer: REMOVED (Plan A redesign 2026-05-30) ===
+  // 「下落相場で落ちるナイフを掴む」リスクが高く、bot 設計が edge 出ない
+  // 構造のまま auto-BUY を続けると損失加速器になるため、機能ごと削除。
+  // 復活させる場合は allocation-maintainer.ts と本ブロックを再実装。
 }
 
 interface NavSnapshot {

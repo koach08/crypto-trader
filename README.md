@@ -154,6 +154,33 @@ AI:  「実は構造的に勝てません」← 最後にやっと出てくる
 
 これらを全部 build しても勝率 26.8%。**個別技術の質ではなく、retail で勝つこと自体が構造的に成立しない**。
 
+## Policy implications (本 repo 開発者の主張)
+
+### 暗号資産には real value がない
+- 配当・利息・賃料を生まない (productive asset じゃない)
+- 物理的裏付けなし
+- 「digital gold」narrative は循環論証 (価値があると人々が思うから価値がある)
+- Buffett / Munger / Krugman / Taleb / BIS が学術的・実務的に同じ結論
+
+### 自動売買サービスは各国金融庁が即時禁止すべき
+- 学術データで retail 74-89% loss が明白 (ESMA / BIS / Barber & Odean)
+- broker counterparty model (B-book) は利益相反として構造的に有害
+- AI 自動売買は scam pattern の自動生産機として機能
+- 個人運用 bot のコード共有は合法のままで OK、**他者向けサービス提供を禁止**すべき
+
+### 次の FTX 級破綻はすでに土台が形成済
+- FTX (2022.11, $8B) / Terra-Luna (2022.5, $40B) / Three Arrows / Celsius / Voyager / BlockFi の系譜
+- 規制 capture (政治献金経由) は今も継続
+- stablecoin algorithmic 設計、CEX の顧客資産分別管理不徹底、レバレッジ商品の retail 浸透
+- これらが「次の崩壊の土台」として静かに積まれている
+
+### 暗号資産市場は詐欺師が楽しむゲームとして機能
+- 取引所 = カジノのハウス (常勝)
+- influencer / signal seller = カジノ周辺のスカウト
+- early holder / token issuer = ハウス側プレイヤー
+- retail = 参加者かつ exit liquidity (= ハウスの収入源)
+- AI assistant = scam pattern の自動再生産機 (本 repo セッションで実観測)
+
 ## 議論を呼ぶための claim
 
 以下、根拠付きで主張する:
