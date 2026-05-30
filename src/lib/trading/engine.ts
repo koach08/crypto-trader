@@ -1808,10 +1808,11 @@ async function runCycle(): Promise<void> {
     }
   }
 
-  // === Allocation maintainer: target 暗号比率 (80-85%) に近づける受動的 BUY ===
-  // bot は AI シグナル発火時にしか BUY しないため、損失で JPY 戻ると現金比率が
-  // 高止まりする問題への対応。3 cycle ごとに評価、安全弁つき。
-  if (!state.paperMode && state.cycleCount % 3 === 0) {
+  // === Allocation maintainer: DISABLED (Plan A redesign 2026-05-30) ===
+  // 「下落相場で落ちるナイフを掴む」リスクが高く、現在の bot 設計 (5min day trading
+  // で edge 出ない構造) のままでは損失加速器になるため停止。
+  // 代わりに Weekly DCA baseline (低頻度・規律的) で target ratio に近づける。
+  if (false && !state.paperMode && state.cycleCount % 3 === 0) {
     try {
       const exchange = getExchange();
       const balance = await exchange.getBalance();
