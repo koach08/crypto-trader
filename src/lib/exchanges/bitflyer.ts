@@ -100,7 +100,53 @@ export class BitFlyerExchange implements IExchange {
     quote: string,
     limit: number
   ): Promise<{ time: number; open: number; high: number; low: number; close: number; volumefrom: number }[]> {
-    // Attempt 1 & 2: CryptoCompare with retry
+    // === Primary: BitFlyer 公式 chart API (実出来高あり) ===
+    // フォーマット: [ts_ms, open, high, low, close, volume, ...] 配列
+    // period: m=1m, h=1h, d=1d
+    try {
+      const bfPeriod =
+        endpoint === "histominute" ? "m" :
+        endpoint === "histoday" ? "d" : "h";
+      const symbol = `${base}_${quote}`;
+      const before = Date.now();
+      const resp = await fetch(
+        `https://lightchart.bitflyer.com/api/ohlc?symbol=${symbol}&period=${bfPeriod}&before=${before}&type=full&grouping=1`,
+        {
+          signal: AbortSignal.timeout(15000),
+          headers: { "User-Agent": "Mozilla/5.0 crypto-trader", "Accept": "application/json" },
+          redirect: "follow",
+        }
+      );
+      if (resp.ok) {
+        const arr = await resp.json();
+        if (Array.isArray(arr) && arr.length > 0) {
+          // 古い → 新しい順に並べ替え (BitFlyer は新しい順で返す)
+          const bars = arr
+            .filter((row: number[]) =>
+              Array.isArray(row) &&
+              row.length >= 6 &&
+              row[1] != null && row[2] != null && row[3] != null && row[4] != null,
+            )
+            .map((row: number[]) => ({
+              time: Math.floor(row[0] / 1000),
+              open: row[1],
+              high: row[2],
+              low: row[3],
+              close: row[4],
+              volumefrom: row[5] ?? 0,
+            }))
+            .filter(b => b.close > 0 && b.open > 0)
+            .sort((a, b) => a.time - b.time);
+          if (bars.length > 0) {
+            return bars.slice(-limit);
+          }
+        }
+      }
+    } catch {
+      // fall through to next source
+    }
+
+    // === Fallback 1 & 2: CryptoCompare with retry ===
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const resp = await fetch(
