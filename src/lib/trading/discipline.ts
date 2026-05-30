@@ -141,15 +141,19 @@ export function calibrateConfidence(
   rawConfidence: number
 ): CalibrationResult {
   const completed = audits.filter((a) => a.outcome?.wasCorrect !== undefined);
-  if (completed.length < 20) {
+  if (completed.length < 10) {
     return {
       raw: rawConfidence,
       calibrated: rawConfidence,
       bucketSampleSize: completed.length,
       bucketWinRate: null,
-      reason: `サンプル${completed.length}件 (<20) のためキャリブレーションなし`,
+      reason: `サンプル${completed.length}件 (<10) のためキャリブレーションなし`,
     };
   }
+
+  // 全体勝率による floor: 著しく低勝率なら全 conf を下方修正
+  const overallWins = completed.filter((a) => a.outcome?.wasCorrect).length;
+  const overallWinRate = (overallWins / completed.length) * 100;
 
   const bucketSize = 10;
   const bucket = Math.floor(rawConfidence / bucketSize) * bucketSize;
@@ -157,27 +161,30 @@ export function calibrateConfidence(
     (a) => Math.floor(a.finalConfidence / bucketSize) * bucketSize === bucket
   );
 
-  if (sameBucket.length < 5) {
+  // バケットサンプル少ない場合は全体勝率で fallback (旧設計は生値返してた)
+  if (sameBucket.length < 3) {
+    const calibrated = Math.round(overallWinRate * 0.5 + rawConfidence * 0.5);
     return {
       raw: rawConfidence,
-      calibrated: rawConfidence,
+      calibrated,
       bucketSampleSize: sameBucket.length,
       bucketWinRate: null,
-      reason: `信頼度${bucket}-${bucket + bucketSize}%バケットのサンプルが${sameBucket.length}件 (<5)、生値使用`,
+      reason: `バケット${bucket}-${bucket + bucketSize}%サンプル${sameBucket.length}件 → 全体勝率${overallWinRate.toFixed(0)}%で平滑化 → ${calibrated}%`,
     };
   }
 
   const wins = sameBucket.filter((a) => a.outcome?.wasCorrect).length;
   const winRate = (wins / sameBucket.length) * 100;
-  // 平滑化: キャリブレーション値70% + 生値30% (過剰適応防止)
-  const calibrated = Math.round(winRate * 0.7 + rawConfidence * 0.3);
+  // 平滑化を強化: バケット勝率 85% + 生値 15% (旧 70/30) — 80-89% bucket が 93% 損失でも
+  // 旧設計は 27%×0.7 + 85%×0.3 = 44% で gate を通すケースが多かった。新設計は鋭く下げる
+  const calibrated = Math.round(winRate * 0.85 + rawConfidence * 0.15);
 
   return {
     raw: rawConfidence,
     calibrated,
     bucketSampleSize: sameBucket.length,
     bucketWinRate: winRate,
-    reason: `信頼度${bucket}-${bucket + bucketSize}%の実勝率${winRate.toFixed(0)}% (n=${sameBucket.length}) → ${calibrated}%に補正`,
+    reason: `信頼度${bucket}-${bucket + bucketSize}%の実勝率${winRate.toFixed(0)}% (n=${sameBucket.length}, 全体${overallWinRate.toFixed(0)}%) → ${calibrated}%に補正`,
   };
 }
 
