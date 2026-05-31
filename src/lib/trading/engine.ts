@@ -36,6 +36,7 @@ import { analyzeLossPatterns } from "../quant/loss-analyzer";
 import { getActiveOverrides, runStrategicRetrospective } from "../quant/retrospective";
 import { computeAutoGuardrails, getAutoGuardrails, isBlockedHourJST, type AutoGuardrails } from "../quant/auto-guardrails";
 import { evaluateAllocation, recordAllocationEvent } from "./allocation-maintainer";
+import { sma as smaIndicator } from "../indicators";
 import { assessPreTradeRisk, buildPortfolioRiskOverlay } from "./institutional-risk";
 
 // 緊急ロスカット閾値（pipelineと無関係に発火）
@@ -1470,11 +1471,13 @@ async function runCycle(): Promise<void> {
       await exchange.connect();
       const balance = await exchange.getBalance();
       currentCapital = balance.find((b) => b.currency === "JPY")?.total ?? 0;
-      // 保有暗号通貨も評価額に加算
-      for (const [posPair, pos] of state.livePositions) {
+      // 2026-05-31: exchange balance 全体を見る (livePositions に未追跡の crypto も含める)
+      // kill-switch reset 側と計算を統一しないと「reset しても次 cycle で 13% drawdown 再発火」となる。
+      for (const bal of balance) {
+        if (bal.currency === "JPY" || bal.total <= 0.0000001) continue;
         try {
-          const t = await exchange.getTicker(posPair);
-          currentCapital += pos.amount * t.price;
+          const t = await exchange.getTicker(`${bal.currency}/JPY`);
+          currentCapital += bal.total * t.price;
         } catch { /* ティッカー取れない場合は無視 */ }
       }
     }
@@ -1825,10 +1828,153 @@ async function runCycle(): Promise<void> {
     }
   }
 
-  // === Allocation maintainer: REMOVED (Plan A redesign 2026-05-30) ===
-  // 「下落相場で落ちるナイフを掴む」リスクが高く、bot 設計が edge 出ない
-  // 構造のまま auto-BUY を続けると損失加速器になるため、機能ごと削除。
-  // 復活させる場合は allocation-maintainer.ts と本ブロックを再実装。
+  // === Allocation maintainer (Wealth Navi 風 動的配分, 2026-05-31 再有効化) ===
+  // user 指示: 「自動で現金の配分を決めてほしい、SBI AI ラップ・wealth navi みたいな感じ」
+  // 動的 target cash% (F&G / drawdown / ATR / trend に応じて 10-50%) を計算し、
+  // 現金比率が target + buffer 超なら最良ペアに小額 BUY 実行。BUY のみ、SELL なし。
+  // 落ちるナイフ防止: kill switch / daily loss / 過剰買いに上限あり。
+  if (state.cycleCount % 6 === 0 && !state.paperMode) {
+    try {
+      const exchange = getExchange();
+      const balance = await exchange.getBalance();
+      const jpyFree = balance.find(b => b.currency === "JPY")?.free ?? 0;
+      const jpyTotal = balance.find(b => b.currency === "JPY")?.total ?? 0;
+      let cryptoVal = 0;
+      const tickerMap: Record<string, number> = {};
+      const barsMap: Record<string, import("../types").OHLCVBar[]> = {};
+
+      for (const bal of balance) {
+        if (bal.currency === "JPY" || bal.total <= 0.0000001) continue;
+        try {
+          const t = await exchange.getTicker(`${bal.currency}/JPY`);
+          tickerMap[`${bal.currency}/JPY`] = t.price;
+          cryptoVal += bal.total * t.price;
+        } catch { /* skip */ }
+      }
+
+      // BTC bars for dynamic target (ATR%, SMA trend)
+      let btcAtrPercent = 2.5; // safe default
+      let btcTrendBullish = true;
+      try {
+        const btcBars = await exchange.getOHLCV("BTC/JPY", "1h", 100);
+        if (btcBars && btcBars.length >= 50) {
+          barsMap["BTC/JPY"] = btcBars;
+          const highs = btcBars.map(b => b.high);
+          const lows = btcBars.map(b => b.low);
+          const closes = btcBars.map(b => b.close);
+          const atrVals = atrIndicator(highs, lows, closes, 14).filter((v): v is number => v != null);
+          const lastAtr = atrVals.length > 0 ? atrVals[atrVals.length - 1] : 0;
+          const lastClose = closes[closes.length - 1];
+          if (lastAtr > 0 && lastClose > 0) btcAtrPercent = (lastAtr / lastClose) * 100;
+          const sma20 = smaIndicator(closes, 20).filter((v): v is number => v != null);
+          const sma50 = smaIndicator(closes, 50).filter((v): v is number => v != null);
+          if (sma20.length > 0 && sma50.length > 0) {
+            btcTrendBullish = sma20[sma20.length - 1] > sma50[sma50.length - 1];
+          }
+        }
+      } catch { /* skip */ }
+
+      // NAV drawdown from kill-switch state (peakNAV)
+      const ksState = await (await import("./kill-switch")).getKillSwitchState();
+      const currentNAV = jpyTotal + cryptoVal;
+      const navDrawdownPct = ksState.peakNAV > 0
+        ? Math.max(0, ((ksState.peakNAV - currentNAV) / ksState.peakNAV) * 100)
+        : 0;
+
+      // pair scores
+      const pairScores: { pair: string; compositeScore: number; price: number }[] = [];
+      for (const pair of state.pairs) {
+        try {
+          const bars = barsMap[pair] ?? await exchange.getOHLCV(pair, "1h", 100);
+          if (!bars || bars.length < 50) continue;
+          const qa = runQuantAnalysis(bars);
+          pairScores.push({
+            pair,
+            compositeScore: qa.compositeScore,
+            price: tickerMap[pair] ?? bars[bars.length - 1].close,
+          });
+        } catch { /* skip */ }
+      }
+
+      const fgVal = (await getFearGreedIndex().catch(() => ({ value: 50 }))).value;
+      const dailyPnL = state.riskManager.getDailyPnL();
+      const dailyPnLPercent = dailyPnL.startCapitalJPY > 0
+        ? (dailyPnL.totalPnL / dailyPnL.startCapitalJPY) * 100
+        : 0;
+      const ksActive = await isKillSwitchActive();
+
+      const decision = await evaluateAllocation({
+        jpyFree,
+        cryptoValueJPY: cryptoVal,
+        fearGreed: fgVal,
+        dailyPnLPercent,
+        killSwitchActive: ksActive,
+        pairScores,
+        navDrawdownPct,
+        btcAtrPercent,
+        btcTrendBullish,
+      });
+
+      if (state.cycleCount % 12 === 0) {
+        console.log(`[alloc] cash ${(decision.diagnostics.cashRatio * 100).toFixed(1)}% → target ${(decision.diagnostics.targetCashRatio * 100).toFixed(0)}% | ${decision.diagnostics.targetReason}`);
+      }
+
+      if (decision.shouldBuy && decision.pair && decision.amountJPY) {
+        try {
+          const { order } = await executeBuy(exchange, decision.pair, decision.amountJPY);
+          const fillPrice = order.price > 0 ? order.price : (tickerMap[decision.pair] ?? 0);
+          const trade: TradeRecord = {
+            id: `alloc-${Date.now()}-${decision.pair.replace("/", "")}`,
+            timestamp: new Date().toISOString(),
+            exchange: "bitflyer",
+            pair: decision.pair,
+            side: "buy",
+            type: "market",
+            amount: order.amount,
+            price: fillPrice,
+            valueJPY: decision.amountJPY,
+            orderId: order.id,
+            fee: order.fee ?? 0,
+            paperTrade: false,
+          };
+          state.recentTrades.push(trade);
+          state.liveTrades.push(trade);
+          // livePosition 加算
+          const existing = state.livePositions.get(decision.pair);
+          if (existing) {
+            const newTotal = existing.amount + order.amount;
+            existing.entryPrice = (existing.entryPrice * existing.amount + fillPrice * order.amount) / newTotal;
+            existing.amount = newTotal;
+          } else {
+            state.livePositions.set(decision.pair, {
+              pair: decision.pair,
+              entryPrice: fillPrice,
+              amount: order.amount,
+              entryTimestamp: new Date().toISOString(),
+              stopLossPercent: 5.0,
+              takeProfitPercent: 15.0,
+              style: "HOLD",
+              styleReason: "Allocation maintainer (動的配分 BUY)",
+            });
+          }
+          await saveData("live-trades", state.liveTrades.slice(-200));
+          await saveData("live-positions", Array.from(state.livePositions.values()));
+          await recordAllocationEvent({
+            timestamp: new Date().toISOString(),
+            pair: decision.pair,
+            amountJPY: decision.amountJPY,
+            price: fillPrice,
+            reason: decision.reason,
+          });
+          console.log(`[alloc] ✅ BUY ${decision.pair}: ¥${decision.amountJPY.toLocaleString()} @ ¥${fillPrice.toLocaleString()} — ${decision.reason}`);
+        } catch (e) {
+          console.warn(`[alloc] BUY 失敗:`, e instanceof Error ? e.message : e);
+        }
+      }
+    } catch (e) {
+      console.warn("[alloc] cycle 失敗:", e instanceof Error ? e.message : e);
+    }
+  }
 }
 
 interface NavSnapshot {
