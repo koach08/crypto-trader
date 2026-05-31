@@ -2042,6 +2042,20 @@ async function reconcileLivePositionsFromExchange(): Promise<void> {
       const realPos = await exchange.getPosition(pair);
       if (realPos.amount <= 0.0000001) continue;
 
+      // dust skip: 評価額 ¥500 未満は売却不能 + 判断ノイズなので追跡対象外
+      try {
+        const ticker = await exchange.getTicker(pair);
+        const valueJPY = realPos.amount * ticker.price;
+        if (valueJPY < 500) {
+          // 既存追跡があれば削除
+          if (state.livePositions.has(pair)) {
+            state.livePositions.delete(pair);
+            console.log(`[reconcile] ${pair} dust (¥${Math.round(valueJPY)}) → livePositions から除外`);
+          }
+          continue;
+        }
+      } catch { /* ticker 取れないペアはそのまま reconcile */ }
+
       const tracked = state.livePositions.get(pair);
       const alreadyAligned =
         tracked &&
