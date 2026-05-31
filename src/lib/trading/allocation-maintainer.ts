@@ -128,6 +128,10 @@ export interface AllocationInput {
   navDrawdownPct: number;       // peak からの drawdown % (正値)
   btcAtrPercent: number;        // BTC ATR / 価格 * 100
   btcTrendBullish: boolean;     // SMA20 > SMA50
+  /** AI 駆動の target override (cash %, 0-1)。指定された場合はルールベースを上書き */
+  aiTargetCashRatio?: number;
+  aiTargetReason?: string;
+  aiTargetSource?: "ai" | "fallback";
 }
 
 async function getRecentHistory(): Promise<AllocationEvent[]> {
@@ -148,21 +152,26 @@ export async function evaluateAllocation(input: AllocationInput): Promise<Alloca
   const cashRatio = total > 0 ? input.jpyFree / total : 1;
   const cryptoRatio = 1 - cashRatio;
 
-  // === Wealth Navi 風 動的 target 計算 ===
+  // === target 計算: AI 駆動 (優先) or ルールベース (fallback) ===
   const dyn = computeDynamicTargetCashRatio({
     fearGreed: input.fearGreed,
     ndDrawdownPct: input.navDrawdownPct,
     btcAtrPercent: input.btcAtrPercent,
     btcTrendBullish: input.btcTrendBullish,
   });
-  const targetCashRatio = dyn.target;
+  const targetCashRatio = input.aiTargetCashRatio !== undefined
+    ? Math.max(ALLOC_TARGET_CASH_FLOOR, Math.min(ALLOC_TARGET_CASH_CEIL, input.aiTargetCashRatio))
+    : dyn.target;
+  const targetReason = input.aiTargetCashRatio !== undefined
+    ? `[AI ${input.aiTargetSource ?? "ai"}] ${input.aiTargetReason ?? "AI judgment"} (rule参考: ${dyn.reason})`
+    : dyn.reason;
   const triggerCashRatio = targetCashRatio + ALLOC_TRIGGER_BUFFER;
 
   const diagnostics = {
     cashRatio,
     cryptoRatio,
     targetCashRatio,
-    targetReason: dyn.reason,
+    targetReason,
     totalJPY: total,
     jpyFreeJPY: input.jpyFree,
     triggered: cashRatio > triggerCashRatio,

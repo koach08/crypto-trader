@@ -35,7 +35,8 @@ import { runGridCycle } from "./grid-trader";
 import { analyzeLossPatterns } from "../quant/loss-analyzer";
 import { getActiveOverrides, runStrategicRetrospective } from "../quant/retrospective";
 import { computeAutoGuardrails, getAutoGuardrails, isBlockedHourJST, type AutoGuardrails } from "../quant/auto-guardrails";
-import { evaluateAllocation, recordAllocationEvent } from "./allocation-maintainer";
+import { evaluateAllocation, recordAllocationEvent, computeDynamicTargetCashRatio } from "./allocation-maintainer";
+import { decideTargetCashRatio } from "../ai/cash-allocation-ai";
 import { sma as smaIndicator } from "../indicators";
 import { assessPreTradeRisk, buildPortfolioRiskOverlay } from "./institutional-risk";
 
@@ -1896,12 +1897,50 @@ async function runCycle(): Promise<void> {
         } catch { /* skip */ }
       }
 
-      const fgVal = (await getFearGreedIndex().catch(() => ({ value: 50 }))).value;
+      const fgData = await getFearGreedIndex().catch(() => ({ value: 50, label: "Neutral" }));
+      const fgVal = fgData.value;
       const dailyPnL = state.riskManager.getDailyPnL();
       const dailyPnLPercent = dailyPnL.startCapitalJPY > 0
         ? (dailyPnL.totalPnL / dailyPnL.startCapitalJPY) * 100
         : 0;
       const ksActive = await isKillSwitchActive();
+
+      // === AI による target cash ratio 決定 (cache 6h, fallback rule-based) ===
+      const ruleBased = computeDynamicTargetCashRatio({
+        fearGreed: fgVal,
+        ndDrawdownPct: navDrawdownPct,
+        btcAtrPercent,
+        btcTrendBullish,
+      });
+      const btcTicker = tickerMap["BTC/JPY"] ?? 0;
+      const btcBars = barsMap["BTC/JPY"];
+      const btc24hChange = btcBars && btcBars.length >= 25
+        ? ((btcBars[btcBars.length - 1].close - btcBars[btcBars.length - 25].close) / btcBars[btcBars.length - 25].close) * 100
+        : 0;
+      const recentClosedTrades = state.liveTrades.filter(t => t.side === "sell" && typeof t.pnl === "number").slice(-30);
+      const wins = recentClosedTrades.filter(t => (t.pnl ?? 0) > 0).length;
+      const winRate = recentClosedTrades.length > 0 ? (wins / recentClosedTrades.length) * 100 : null;
+
+      const aiDecision = await decideTargetCashRatio({
+        navJPY: currentNAV,
+        cashRatio: jpyTotal / Math.max(1, currentNAV),
+        cryptoRatio: cryptoVal / Math.max(1, currentNAV),
+        fearGreed: fgVal,
+        fearGreedLabel: fgData.label ?? "",
+        btcPriceJPY: btcTicker,
+        btc24hChangePercent: btc24hChange,
+        btcAtrPercent,
+        btcTrendBullish,
+        navPeakJPY: ksState.peakNAV,
+        navDrawdownPct,
+        recentTradeWinRate: winRate,
+        recentTradeCount: recentClosedTrades.length,
+        ruleBasedTarget: ruleBased.target,
+        ruleBasedReason: ruleBased.reason,
+      });
+      if (state.cycleCount % 6 === 0) {
+        console.log(`[alloc:AI] target cash ${aiDecision.targetCashPercent}% (${aiDecision.source}, conf ${aiDecision.confidence}) — ${aiDecision.reason}`);
+      }
 
       const decision = await evaluateAllocation({
         jpyFree,
@@ -1913,6 +1952,9 @@ async function runCycle(): Promise<void> {
         navDrawdownPct,
         btcAtrPercent,
         btcTrendBullish,
+        aiTargetCashRatio: aiDecision.targetCashPercent / 100,
+        aiTargetReason: aiDecision.reason,
+        aiTargetSource: aiDecision.source,
       });
 
       if (state.cycleCount % 12 === 0) {
