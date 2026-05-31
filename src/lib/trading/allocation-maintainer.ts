@@ -221,12 +221,20 @@ export async function evaluateAllocation(input: AllocationInput): Promise<Alloca
     };
   }
 
-  // ペア選定: composite score が最も高いペア (0 以上)
-  const candidates = input.pairScores.filter(p => p.compositeScore >= 0 && p.price > 0);
+  // ペア選定: composite score が最も高いペア (0 以上) かつ amount で発注可能なペア
+  // BitFlyer 最小注文 (BTC 0.001 = 約 ¥11,700) を満たせないペアは候補から除外
+  const candidates = input.pairScores.filter(p => {
+    if (p.compositeScore < 0 || p.price <= 0) return false;
+    // ペアごとの最小発注 JPY を概算 (BTC 0.001, ETH 0.01, XRP/XLM/MONA 0.1 想定)
+    const base = p.pair.split("/")[0];
+    const minBase: Record<string, number> = { BTC: 0.001, ETH: 0.01, XRP: 0.1, XLM: 0.1, MONA: 0.1, BCH: 0.001 };
+    const minJPY = Math.ceil((minBase[base] ?? 0.001) * p.price * 1.1);
+    return amountJPY >= minJPY;
+  });
   if (candidates.length === 0) {
     return {
       shouldBuy: false,
-      reason: "全ペアで composite score < 0、allocation BUY する妥当なペアなし",
+      reason: `候補なし: ¥${amountJPY.toLocaleString()} で発注可能かつ composite score >= 0 のペアなし (BTC は ~¥11,700+ 必要)`,
       diagnostics,
     };
   }
