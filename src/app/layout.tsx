@@ -15,8 +15,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "AI crypto trader — retail AI 詐欺の証明 (academic experiment)",
-  description: "An institutional-grade retail crypto AI auto-trading bot — empirical proof that retail crypto AI day trading is structurally a losing game. Academic experiment / 学術実験.",
+  title: "AI Crypto Untrader — 自動取引詐欺師への対案 (academic experiment)",
+  description: "An AI crypto bot that, after honest analysis of its own edge, concludes the optimal action is to NOT trade. Academic experiment / 学術実験 / 自動取引詐欺師への対案.",
 };
 
 export default function RootLayout({
@@ -32,7 +32,7 @@ export default function RootLayout({
       <body className="min-h-full flex flex-col bg-zinc-950 text-zinc-100">
         <header className="sticky top-0 z-50 bg-zinc-900/80 backdrop-blur border-b border-zinc-800">
           <div className="flex items-center justify-between px-4 py-2 max-w-2xl mx-auto">
-            <h1 className="text-lg font-bold tracking-tight">AI crypto trader — retail AI 詐欺の証明 (academic experiment)</h1>
+            <h1 className="text-lg font-bold tracking-tight">AI Crypto Untrader — 自動取引詐欺師への対案 (academic experiment)</h1>
             <KillSwitch />
           </div>
         </header>

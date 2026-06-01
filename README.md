@@ -1,6 +1,10 @@
-# AI crypto trader scammer (academic experiment)
+# AI Crypto Untrader (academic experiment)
 
-## 機関投資家グレードの retail AI 自動売買 bot を作って、損失を出した実証データ
+## 自分の edge を分析した AI が「取引しない」という結論に達した bot — 世界中の自動取引詐欺師への対案
+
+> **「あんたらまともじゃない」 message to auto-trade scammers**: 「retail AI で短期売買して edge は構造的に出ない」というデータが集まったとき、まともな AI は「取引を止める」結論に至る。にもかかわらず勝てるかのように売り込み続けるのが、自動取引詐欺師。この bot は **「まともすぎて動かない bot」= Untrader**。逆に、これが正解。
+
+> **旧名**: AI crypto trader scammer (academic experiment) — 詐欺師アプリを作って暴くプロジェクトとして始めたが、保守ガード (1 週間 MIN_HOLD / dust skip / kill switch -8%) を入れていくと bot がほとんど trade しなくなった。これは bug でなく構造的結論: **trade しないのが retail crypto AI として最も誠実**。
 
 > **TL;DR**: BitFlyer 上で 25 日間 / 112 取引のライブ運用、**勝率 26.8% / 累積実現損益 -¥1,944**。「ずっと hold」が普通に勝った。**retail crypto AI day trading は構造的に勝てない**ことを実証データで示す repo。
 
