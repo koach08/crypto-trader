@@ -1,14 +1,10 @@
-# AI Crypto Untrader (academic experiment)
+# AI Crypto Trader (academic challenge)
 
-## 自分の edge を分析した AI が「取引しない」という結論に達した bot — 世界中の自動取引詐欺師への対案
+## 「retail swing trade は構造的に負ける」という研究結果を、一度でも覆せるかの実証実験
 
-> **「あんたらまともじゃない」 message to auto-trade scammers**: 「retail AI で短期売買して edge は構造的に出ない」というデータが集まったとき、まともな AI は「取引を止める」結論に至る。にもかかわらず勝てるかのように売り込み続けるのが、自動取引詐欺師。この bot は **「まともすぎて動かない bot」= Untrader**。逆に、これが正解。
-
-> **旧名**: AI crypto trader scammer (academic experiment) — 詐欺師アプリを作って暴くプロジェクトとして始めたが、保守ガード (1 週間 MIN_HOLD / dust skip / kill switch -8%) を入れていくと bot がほとんど trade しなくなった。これは bug でなく構造的結論: **trade しないのが retail crypto AI として最も誠実**。
-
-> **TL;DR**: BitFlyer 上で 25 日間 / 112 取引のライブ運用、**勝率 26.8% / 累積実現損益 -¥1,944**。「ずっと hold」が普通に勝った。**retail crypto AI day trading は構造的に勝てない**ことを実証データで示す repo。
-
-> **TL;DR (EN)**: An institutional-grade retail crypto AI auto-trader, 25 days of live trading on BitFlyer, 112 closed trades. **Win rate 26.8%, cumulative realized PnL -¥1,944**. Buy-and-hold would have won. This repo is an empirical proof that retail crypto AI day trading is structurally a losing game.
+> 学術文献 (Barber & Odean / BIS / ESMA) は retail short-term trading の負け率を 70-89% と示している。本 repo はこの結論を所与とせず、現代の AI (4 model consensus) + クオンツ + monitoring で、それを覆せるかを実演する。
+>
+> 負ければ「やっぱり」、勝てば「retail でも edge を取れる前例」。どちらの結果も意味がある。
 
 ---
 
@@ -16,16 +12,7 @@
 
 「AI で crypto 自動売買すれば retail でも勝てる」というナラティブは、X / YouTube / Note にあふれている。多くは詐欺、または無自覚な過剰宣伝。
 
-私 (koach08) は本気で取り組んだ:
-- Next.js 16 + ccxt + Railway 24/7 ライブ運用
-- AI 合議制 (Claude / GPT / Gemini / Grok の 4 model consensus)
-- クオンツ scoring engine + マルチタイムフレーム分析
-- 監査ログ + 自己反省 + lessons learning + auto-guardrails
-- 機関投資家グレードのリスクオーバーレイ + キャリブレーション
-
-それでも **勝率 26.8% / -¥1,944** で構造的に負けた。
-
-この経験データを公開することで、**「自分なら勝てる」と思って同じ罠に時間と金を投じる次の人を減らす** ことが目的。
+機関投資家グレードの実装 (4 model consensus / クオンツ scoring / MTF / monitoring / institutional risk overlay) を retail スケールで構築しても、構造的に edge は出ない。この repo はその学術エビデンスをまとめたもの。
 
 ## 学術エビデンス: なぜ retail で勝てないか
 
@@ -156,7 +143,7 @@ AI:  「実は構造的に勝てません」← 最後にやっと出てくる
 - Lessons learning (cluster reflections → activate gates)
 - Strategic retrospective (20 取引ごとに AI が SL/TP/conf 倍率調整)
 
-これらを全部 build しても勝率 26.8%。**個別技術の質ではなく、retail で勝つこと自体が構造的に成立しない**。
+これらを全部 build しても retail スケールでは構造的に edge が出ない (理由は下の学術エビデンス節)。
 
 ## Policy implications (本 repo 開発者の主張)
 
@@ -203,24 +190,6 @@ AI:  「実は構造的に勝てません」← 最後にやっと出てくる
 - 「もっと AI を入れれば」(本 repo は 4 model consensus)
 - 「もっと資金があれば」(本 repo は ¥77K → ¥150K → ¥200K のスケール案を memory に持ってた、構造は変わらない)
 - 「もっと feature を追加すれば」(本 repo は institutional grade、追加余地は scale じゃなく structural shift しかない)
-
-## Loss distribution by pair (損失分布の実データ)
-
-`/api/bot/loss-analysis` の出力 (2026-05-29 時点、累積 112 取引中):
-
-```
-Loss by trading pair (¥)
-========================================
-XRP/JPY  ████████████████████████████  -¥1,877  ( 90 closed, WR 25.6%, 93% of losses)
-ETH/JPY  █                             -¥75    ( 21 closed, WR 28.6%,  4% of losses)
-BTC/JPY  (no loss)                     +¥7.6   (  1 closed, WR 100%,  insufficient)
-XLM/JPY  ─                             ¥0      (  0 closed, no trades)
-MONA/JPY ─                             ¥0      (  0 closed, no trades)
-```
-
-XRP/JPY 単独で損失総額の 93% を生成。ETH も WR 28.6% で利益見込み薄。BTC は sample 不足 (1 件)。
-
----
 
 ## Random AI Decision Theater (本セッションで実際に起きた例)
 

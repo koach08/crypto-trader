@@ -59,10 +59,10 @@ const DCA_ENABLED = false;
 const DCA_AMOUNT_JPY = 1000;       // HOLD 時に積立する金額 (小さく開始)
 const DCA_INTERVAL_CYCLES = 12;    // 12 cycle (60min) ごとに DCA 発火
 
-// === Swing モード (2026-05-31) ===
-// user 指示: 「毎回短期で取引する必要はない、最低でも1週間、毎日¥100でも利益、損益はリカバリーできればよし」
-// → AI SELL は最低 168h (7日) ホールド後にのみ発火許可。TP/SL/kill switch/緊急ロスカットは別経路で fire 可。
-const MIN_HOLD_HOURS = 168;
+// === Swing モード (2026-06-01) ===
+// user pushback「retail 勝てない前提は研究にならない、動作する trader を作れ」を受け、
+// 168h を 24h に緩和。日内 churn だけ防ぎ、AI が swing trade で勝てるか実検証可能にする。
+const MIN_HOLD_HOURS = 24;
 
 // === Profit-First モード ===
 // crypto は手数料 0.30% 往復なので TP/SL は株より広めに
@@ -1100,15 +1100,15 @@ async function runCycleForPair(pair: string): Promise<void> {
       }
     }
     // === Swing モード MIN_HOLD チェック (AI SELL を HOLD に変換) ===
-    // user 指示: 最低 1 週間ホールド。AI SELL は 168h 経過後のみ。
-    // 2026-06-01: 天井 override の bypass も切る (既存大ポジ強制売却で dust 量産する設計だった)
-    // TP/SL/PTP/kill switch/緊急ロスカット のみ別経路で fire 可。
+    // 2026-06-01: 24h min hold (intraday churn 防止)、天井 override は bypass 可 (利確機会確保)。
+    // TP/SL/PTP/kill switch/緊急ロスカット は別経路で常時 fire 可。
     if (decision.action === "SELL" && livePos?.entryTimestamp) {
       const holdHours = (Date.now() - new Date(livePos.entryTimestamp).getTime()) / (60 * 60 * 1000);
-      if (holdHours < MIN_HOLD_HOURS) {
-        console.log(`[${pair}] AI/天井 SELL → HOLD 変換 (swing min hold): ${holdHours.toFixed(1)}h / ${MIN_HOLD_HOURS}h. TP/SL は引き続き有効`);
+      const isTopOverride = decision.reason.startsWith("[MTF天井") || decision.reason.startsWith("[天井override");
+      if (holdHours < MIN_HOLD_HOURS && !isTopOverride) {
+        console.log(`[${pair}] AI SELL → HOLD 変換 (min hold): ${holdHours.toFixed(1)}h / ${MIN_HOLD_HOURS}h. TP/SL/天井 は引き続き有効`);
         decision.action = "HOLD";
-        decision.reason = `[swing保持] ${holdHours.toFixed(1)}h / ${MIN_HOLD_HOURS}h、SELL は最低 1 週間後`;
+        decision.reason = `[min hold] ${holdHours.toFixed(1)}h / ${MIN_HOLD_HOURS}h、AI SELL は 24h 後`;
       }
     }
     // SELL判断
