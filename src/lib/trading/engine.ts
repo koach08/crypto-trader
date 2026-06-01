@@ -1101,14 +1101,14 @@ async function runCycleForPair(pair: string): Promise<void> {
     }
     // === Swing モード MIN_HOLD チェック (AI SELL を HOLD に変換) ===
     // user 指示: 最低 1 週間ホールド。AI SELL は 168h 経過後のみ。
-    // TP/SL/PTP/kill switch/緊急ロスカット/MTF 天井 SELL override は別経路で fire 可。
+    // 2026-06-01: 天井 override の bypass も切る (既存大ポジ強制売却で dust 量産する設計だった)
+    // TP/SL/PTP/kill switch/緊急ロスカット のみ別経路で fire 可。
     if (decision.action === "SELL" && livePos?.entryTimestamp) {
       const holdHours = (Date.now() - new Date(livePos.entryTimestamp).getTime()) / (60 * 60 * 1000);
-      const isTopOverride = decision.reason.startsWith("[MTF天井") || decision.reason.startsWith("[天井override");
-      if (holdHours < MIN_HOLD_HOURS && !isTopOverride) {
-        console.log(`[${pair}] AI SELL → HOLD 変換 (swing min hold): ${holdHours.toFixed(1)}h / ${MIN_HOLD_HOURS}h. TP/SL は引き続き有効`);
+      if (holdHours < MIN_HOLD_HOURS) {
+        console.log(`[${pair}] AI/天井 SELL → HOLD 変換 (swing min hold): ${holdHours.toFixed(1)}h / ${MIN_HOLD_HOURS}h. TP/SL は引き続き有効`);
         decision.action = "HOLD";
-        decision.reason = `[swing保持] ${holdHours.toFixed(1)}h / ${MIN_HOLD_HOURS}h、AI SELL は最低 1 週間後`;
+        decision.reason = `[swing保持] ${holdHours.toFixed(1)}h / ${MIN_HOLD_HOURS}h、SELL は最低 1 週間後`;
       }
     }
     // SELL判断

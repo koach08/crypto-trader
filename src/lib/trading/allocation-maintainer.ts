@@ -26,9 +26,9 @@ export const ALLOC_TARGET_CASH_CEIL = 0.50;
 export const ALLOC_BASE_CASH_RATIO = 0.20;
 /** target を超える buffer がこれ以上なら allocation BUY 発動 */
 export const ALLOC_TRIGGER_BUFFER = 0.05;
-/** allocation BUY の最小・最大金額 (BitFlyer 最小注文 ¥5,000 を考慮) */
-const ALLOC_BUY_MIN_JPY = 5000;
-const ALLOC_BUY_MAX_JPY = 8000;
+/** allocation BUY の最小・最大金額 (BitFlyer 最小注文 + BTC 0.001 = ~¥11,700 をカバー) */
+const ALLOC_BUY_MIN_JPY = 12000;
+const ALLOC_BUY_MAX_JPY = 30000;
 /** 24h 内の最大 allocation BUY 回数 */
 const ALLOC_MAX_PER_DAY = 5;
 /** daily loss これ以下なら allocation 停止 (resp risk) */
