@@ -79,9 +79,9 @@ describe("calculateFinalDecision", () => {
       technicalScore: 3,
       regime: "TRENDING_UP",
     });
-    expect(r.audit.votes).toHaveLength(4);
+    expect(r.audit.votes).toHaveLength(6);
     const sources = r.audit.votes.map((v) => v.source).sort();
-    expect(sources).toEqual(["ai", "quant", "regime", "technical"]);
+    expect(sources).toEqual(["ai", "external", "intel", "quant", "regime", "technical"]);
   });
 
   it("ウェイト合計 ≈ 1.0", () => {
@@ -93,13 +93,14 @@ describe("calculateFinalDecision", () => {
     expect(sum).toBeCloseTo(1.0, 2);
   });
 
-  it("Quant 最大ウェイト (≥0.4)", () => {
+  it("Quant が最大ウェイトのソース", () => {
     const r = calculateFinalDecision({
       ...baseInput,
       quantAnalysis: makeQuant(0),
     });
     const quantVote = r.audit.votes.find((v) => v.source === "quant");
-    expect(quantVote?.weight).toBeGreaterThanOrEqual(0.4);
+    const maxWeight = Math.max(...r.audit.votes.map((v) => v.weight));
+    expect(quantVote?.weight).toBe(maxWeight);
   });
 
   it("AI ウェイトは小さく (≤0.15)", () => {
