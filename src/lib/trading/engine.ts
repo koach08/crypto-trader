@@ -1632,8 +1632,8 @@ async function runCycle(): Promise<void> {
     }
   }
 
-  // Phase 2: 信号ウェイト学習を 24サイクル(=6時間)ごとに再計算
-  if (state.cycleCount % 24 === 0) {
+  // Phase 2: 信号ウェイト学習を 6サイクル(=6時間, cycle間隔1h前提)ごとに再計算
+  if (state.cycleCount % 6 === 0) {
     try {
       const audits = await getAudits(500);
       const summary = computeLearnedWeights(audits, BASELINE_SIGNAL_WEIGHTS);
