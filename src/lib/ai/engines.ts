@@ -107,15 +107,16 @@ export async function runAllEngines(
   tier: "STANDARD" | "HEAVY" = "STANDARD"
 ): Promise<EngineResult[]> {
   // Grok disabled: unpaid credits, 0% success rate across 100+ calls
+  // Perplexity disabled: Sonar Pro が 24/7 ループで課金を積み上げていたため consensus から除外。
+  //   3エンジン (claude/gpt4o/gemini) の重み付き投票で継続 (consensus は最低数に依存しない)。
   const results = await Promise.allSettled([
     runClaude(userMessage, tier),
     runOpenAI(userMessage, tier, "gpt4o"),
     runGemini(userMessage, tier),
-    runOpenAI(userMessage, tier, "perplexity"),
   ]);
 
   return results.map((r, i) => {
-    const engines: EngineId[] = ["claude", "gpt4o", "gemini", "perplexity"];
+    const engines: EngineId[] = ["claude", "gpt4o", "gemini"];
     if (r.status === "fulfilled") return r.value;
     return { engine: engines[i], status: "error" as const, error: String(r.reason), duration: 0 };
   });
