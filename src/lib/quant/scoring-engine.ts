@@ -45,6 +45,9 @@ interface ScoringInput {
 
   /** intel (whale + community + funding) bias (-100 〜 +100) */
   intelBias?: { score: number; reason: string } | null;
+
+  /** 板情報 (orderbook imbalance) bias (-100 〜 +100) - プロ用マイクロストラクチャ */
+  bookBias?: { score: number; reason: string } | null;
 }
 
 interface ScoringResult {
@@ -57,12 +60,13 @@ interface ScoringResult {
 // ソースごとの重み（合計100%）
 // Intel (whale/community/funding) 統合で再分配
 const WEIGHTS = {
-  quant: 0.30,        // 0.35 → 0.30
+  quant: 0.28,
   ai: 0.10,
-  technical: 0.10,    // 0.15 → 0.10
-  regime: 0.20,
-  external: 0.15,     // 0.20 → 0.15
-  intel: 0.15,        // ★新規: on-chain whale + community sentiment + funding rate
+  technical: 0.08,
+  regime: 0.18,
+  external: 0.13,
+  intel: 0.13,
+  book: 0.10,         // ★ orderbook imbalance (pro microstructure)
 };
 
 // 取引閾値: 「動かない bot は人間以下」。動く方向で全面緩和。
@@ -108,6 +112,7 @@ export function calculateFinalDecision(input: ScoringInput): ScoringResult {
   const regimeResult = regimeToScore(input.regime);
   const externalScore = input.externalBias?.score ?? 0;
   const intelScore = input.intelBias?.score ?? 0;
+  const bookScore = input.bookBias?.score ?? 0;
 
   // 加重平均スコア
   const compositeScore =
@@ -116,7 +121,8 @@ export function calculateFinalDecision(input: ScoringInput): ScoringResult {
     techScore * WEIGHTS.technical +
     regimeResult.score * WEIGHTS.regime +
     externalScore * WEIGHTS.external +
-    intelScore * WEIGHTS.intel;
+    intelScore * WEIGHTS.intel +
+    bookScore * WEIGHTS.book;
 
   // 各ソースの一致度チェック: 「方向のあるソース」のみカウント (HOLD/0は除外)
   const directions = [
@@ -126,6 +132,7 @@ export function calculateFinalDecision(input: ScoringInput): ScoringResult {
     Math.sign(regimeResult.score),
     Math.sign(externalScore),
     Math.sign(intelScore),
+    Math.sign(bookScore),
   ];
   const directional = directions.filter((d) => d !== 0);
   const buyVotes = directional.filter((d) => d > 0).length;
@@ -180,6 +187,9 @@ export function calculateFinalDecision(input: ScoringInput): ScoringResult {
   }
   if (input.intelBias && Math.abs(intelScore) >= 10) {
     reasons.push(`Intel: ${intelScore > 0 ? "買い" : "売り"}寄り (${intelScore.toFixed(0)}pt) ${input.intelBias.reason}`);
+  }
+  if (input.bookBias && Math.abs(bookScore) >= 8) {
+    reasons.push(`Book: ${bookScore > 0 ? "買い" : "売り"}圧力 (${bookScore}pt) ${input.bookBias.reason}`);
   }
 
   const reason = `[総合${compositeScore.toFixed(0)}pt, 一致${(agreement * 100).toFixed(0)}%] ${reasons.join(" | ")}`;

@@ -96,7 +96,7 @@ function analyzeTimeframe(bars: OHLCVBar[], smaWindow: number): TimeframeView {
   const score = Math.round(smaScore * 0.4 + rsiScore * 0.3 + positionScore * 0.3);
   const label = classify(score);
 
-  let reason = `SMA ${priceVsSMA >= 0 ? "+" : ""}${priceVsSMA.toFixed(1)}% / RSI ${lastRSI?.toFixed(0) ?? "-"} / 安値+${distanceFrom52wLow.toFixed(1)}% 高値-${distanceFrom52wHigh.toFixed(1)}%`;
+  const reason = `SMA ${priceVsSMA >= 0 ? "+" : ""}${priceVsSMA.toFixed(1)}% / RSI ${lastRSI?.toFixed(0) ?? "-"} / 安値+${distanceFrom52wLow.toFixed(1)}% 高値-${distanceFrom52wHigh.toFixed(1)}%`;
 
   return {
     score,

@@ -194,3 +194,17 @@ export function allocationsToMap(allocations: PairAllocation[]): Map<string, num
   for (const a of allocations) m.set(a.pair, a.maxJPY);
   return m;
 }
+
+/**
+ * Fractional Kelly (pro sizing)
+ * f = (winRate - lossRate) / avgWinLossRatio
+ * 安全のため 0.25〜0.5 Kelly を推奨 (full Kelly は破産確率高い)
+ */
+export function fractionalKelly(winRate: number, avgWin: number, avgLoss: number, fraction = 0.25): number {
+  if (winRate <= 0 || avgWin <= 0 || avgLoss <= 0) return 1.0;
+  const b = avgWin / avgLoss;
+  const p = winRate;
+  const q = 1 - p;
+  const f = (b * p - q) / b;
+  return Math.max(0.2, Math.min(2.0, 1 + (f * fraction - 1) * 0.5)); // conservative dampened
+}

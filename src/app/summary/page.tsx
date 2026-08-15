@@ -170,9 +170,28 @@ export default function SummaryPage() {
           </div>
         </div>
         {killSwitch.triggered && (
-          <div className="bg-red-900/30 border border-red-700 rounded p-2 text-xs text-red-300">
+          <div className="bg-red-900/30 border border-red-700 rounded p-2 text-xs text-red-300 space-y-2">
             🚨 KILL SWITCH 発火中 ({killSwitch.triggeredAt?.slice(0, 16)}, DD {killSwitch.triggeredDrawdownPct?.toFixed(1)}%)
             <br />全 close 済、reset 必要
+            <button
+              onClick={async () => {
+                if (!confirm('Kill switch をリセットしますか？\n(現在のNAVを新しいpeakにします)')) return;
+                const res = await fetch('/api/bot/kill-switch', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ action: 'reset', reason: 'manual from UI' })
+                });
+                if (res.ok) {
+                  alert('Reset 完了。ページをリロードして確認してください。');
+                  window.location.reload();
+                } else {
+                  alert('Reset 失敗: ' + (await res.text()));
+                }
+              }}
+              className="mt-1 block w-full bg-red-600 hover:bg-red-500 text-white text-xs py-1 rounded"
+            >
+              今すぐ Kill Switch をリセット (再開可能に)
+            </button>
           </div>
         )}
         <div className="text-xs text-zinc-500">

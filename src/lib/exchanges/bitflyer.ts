@@ -530,4 +530,17 @@ export class BitFlyerExchange implements IExchange {
       timestamp: o.timestamp ?? Date.now(),
     }));
   }
+
+  async getOrderBook(pair: string, limit = 20): Promise<{ bids: [number, number][]; asks: [number, number][] }> {
+    try {
+      const ob = await this.exchange.fetchOrderBook(pair, limit);
+      return {
+        bids: (ob.bids || []).slice(0, limit) as [number, number][],
+        asks: (ob.asks || []).slice(0, limit) as [number, number][],
+      };
+    } catch (e) {
+      console.warn(`[bitflyer] getOrderBook ${pair} failed:`, e);
+      return { bids: [], asks: [] };
+    }
+  }
 }

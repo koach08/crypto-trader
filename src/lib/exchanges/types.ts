@@ -29,4 +29,6 @@ export interface IExchange {
   limitBuyMakerOnly?(pair: string, amountQuoteJPY: number, timeoutMs?: number): Promise<OrderResult | null>;
   /** Maker-only 指値 SELL (手数料 0%)。約定なければ null */
   limitSellMakerOnly?(pair: string, amountBase: number, timeoutMs?: number): Promise<OrderResult | null>;
+  /** 板情報 (プロ級シグナル用) */
+  getOrderBook?(pair: string, limit?: number): Promise<{ bids: [number, number][], asks: [number, number][] }>;
 }

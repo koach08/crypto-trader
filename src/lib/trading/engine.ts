@@ -48,7 +48,10 @@ async function cleanupStaleOpenBuys(maxAgeMinutes = 5) {
   const exchange = getExchange();
   try {
     await exchange.connect();
-    const pairs = [...state.pairs];
+    // 取引対象 (state.pairs) だけでなく、過去に発注し得た既知の JPY ペアも sweep する。
+    // pair から外れた後に孤児化した買い指値を取りこぼすと現金が永久ロックされるため。
+    const KNOWN_JPY_PAIRS = ["BTC/JPY", "ETH/JPY", "XRP/JPY", "SOL/JPY"];
+    const pairs = [...new Set([...state.pairs, ...KNOWN_JPY_PAIRS])];
     let canceled = 0;
     for (const pair of pairs) {
       const opens = await exchange.getOpenOrders(pair).catch(() => []);
@@ -1565,16 +1568,19 @@ async function runCycle(): Promise<void> {
     }
   }
 
+  // 未約定買い指値の自動掃除 (古いものはキャンセルして free を回復)。
+  // ⚠️ kill-switch の判定より前に毎サイクル実行する。孤児化した買い指値に現金がロックされ
+  //    「残高はあるのに全ての BUY が資金不足で見送り」になる事故を防ぐため。
+  //    kill-switch 発火中でも資金だけは解放しておく (新規 BUY はこの後止まる)。
+  if (!state.paperMode) {
+    await cleanupStaleOpenBuys(3);
+  }
+
   // === Kill switch: 既に発火済みなら cycle 全スキップ (新規エントリ防止) ===
   if (await isKillSwitchActive()) {
     console.warn(`[kill-switch] アクティブ. cycle スキップ. 手動 reset まで停止状態`);
     state.running = false;
     return;
-  }
-
-  // 未約定買い指値の自動掃除 (5分以上古いものはキャンセルして free を回復)
-  if (!state.paperMode && state.cycleCount % 2 === 0) {
-    await cleanupStaleOpenBuys(5);
   }
 
   // 日付ロールオーバー: 0時を跨いだら dailyPnL をリセット

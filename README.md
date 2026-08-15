@@ -1,6 +1,21 @@
-# AI Crypto Trader (academic challenge)
+# AI Crypto Trader — Pro Execution Bot
 
-## 「retail swing trade は構造的に負ける」という研究結果を、一度でも覆せるかの実証実験
+> **本気のプロ投資家向け仕様を目指した暗号資産自動執行Bot**
+> - Maker優先執行 (手数料最小化)
+> - 板情報 (orderbook imbalance) + 複数インテル + クオンツ + AI の多層合議
+> - 動的資金配分 + ボラティリティターゲット + 高度リスクガード
+> - 自己学習 + 戦略リトロスペクティブ
+> - 詳細監査ログと説明可能性
+
+> **今すぐ使えるようにする手順 (2026-08)**
+> 1. `git pull` で最新取得
+> 2. Railway でデプロイ (または `npm run dev`)
+> 3. アプリ開く → /summary で 🚨 KILL SWITCH が出たら「今すぐリセット」ボタンを押す
+> 4. /trade ページで **Paper Mode で Start** → 動作確認
+> 5. 実弾: .env / Railway env に BITFLYER_* + AI keys 設定 + AUTO_START_LIVE=true で再デプロイ
+> 6. Kill reset 後、bot が自動再開するはず
+
+**学術的背景・限界の議論は RESEARCH.md を参照** (運用ツール本体とは分離)
 
 > 学術文献 (Barber & Odean / BIS / ESMA) は retail short-term trading の負け率を 70-89% と示している。本 repo はこの結論を所与とせず、現代の AI (4 model consensus) + クオンツ + monitoring で、それを覆せるかを実演する。
 >

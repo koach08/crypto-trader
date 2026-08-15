@@ -253,3 +253,18 @@ export const DEFAULT_BOT_CONFIG: BotConfig = {
   minConfidenceToTrade: 60,
   minEngineConsensus: 3,
 };
+
+// === Profit Config (for consistent daily gains) ===
+export interface ProfitConfig {
+  dailyTargetPercent: number; // e.g. 0.15
+  tpPercent: number;          // base TP
+  slPercent: number;          // base SL
+  minConfidence: number;      // min confidence to act
+}
+
+export const DEFAULT_PROFIT_CONFIG: ProfitConfig = {
+  dailyTargetPercent: 0.15,
+  tpPercent: 2.5,
+  slPercent: 0.9,
+  minConfidence: 50,
+};
