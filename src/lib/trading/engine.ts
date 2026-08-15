@@ -1,4 +1,5 @@
-import type { BotStatus, AIDecision, TradeRecord } from "../types";
+import type { BotStatus, AIDecision, TradeRecord, ProfitConfig } from "../types";
+import { DEFAULT_PROFIT_CONFIG } from "../types";
 import { getExchange } from "../exchanges/factory";
 import { generateCryptoSignal, detectRegime, type MarketRegime } from "../indicators";
 import { buildAnalysisPrompt } from "../ai/crypto-prompt";
@@ -17,13 +18,14 @@ import { atr as atrIndicator } from "../indicators";
 import { computeLifetimePnL } from "./lifetime";
 import { fetchExternalBias } from "../external/investment-app";
 import { getAggregatedIntel } from "../intel/aggregator";
+import { getOrderBookSignal } from "../quant/orderbook-signal";
 import { detectBottomOpportunity, detectTopOpportunity, detectAggressiveReversal } from "../quant/timing";
 import { analyzeMultiTimeframe, type MultiTimeframeAnalysis } from "../quant/timeframe-analyzer";
 import { classifyPositionStyle } from "./position-style";
 import { tryOpenFXLong, checkFXPositionExit } from "./fx-engine";
 import { reflectOnLoss } from "../quant/reflection";
 import { getActiveLessons, matchLessons, rebuildLessonsFromReflections } from "../quant/lessons";
-import { computeAllocations, type ForwardSignal, type PairAllocation } from "./capital-allocator";
+import { computeAllocations, fractionalKelly, type ForwardSignal, type PairAllocation } from "./capital-allocator";
 import { evaluateTier } from "./capital-policy";
 import { evaluateKillSwitch, isKillSwitchActive } from "./kill-switch";
 import { sendAlert } from "../alerts";
@@ -40,6 +42,34 @@ import { decideTargetCashRatio } from "../ai/cash-allocation-ai";
 import { sma as smaIndicator } from "../indicators";
 import { assessPreTradeRisk, buildPortfolioRiskOverlay } from "./institutional-risk";
 
+/** 古い未約定買い指値を自動キャンセルして資本を解放 (時間命のcrypto向け) */
+async function cleanupStaleOpenBuys(maxAgeMinutes = 5) {
+  if (state.paperMode) return;
+  const exchange = getExchange();
+  try {
+    await exchange.connect();
+    const pairs = [...state.pairs];
+    let canceled = 0;
+    for (const pair of pairs) {
+      const opens = await exchange.getOpenOrders(pair).catch(() => []);
+      for (const o of opens) {
+        if (o.side !== 'buy' || !o.id || !o.timestamp) continue;
+        const ageMin = (Date.now() - o.timestamp) / 60000;
+        if (ageMin > maxAgeMinutes) {
+          const ok = await exchange.cancelOrder(o.id, pair).catch(() => false);
+          if (ok) {
+            canceled++;
+            console.log(`[cleanup] canceled stale buy ${pair} id=${o.id} age=${ageMin.toFixed(1)}m`);
+          }
+        }
+      }
+    }
+    if (canceled > 0) console.log(`[cleanup] ${canceled} stale buy orders canceled`);
+  } catch (e) {
+    // ignore
+  }
+}
+
 // 緊急ロスカット閾値（pipelineと無関係に発火）
 const EMERGENCY_LOSS_PERCENT = 5.0;
 
@@ -49,9 +79,11 @@ const PAPER_MAX_POSITION_JPY = 200_000;      // ペアあたり最大ポジシ�
 
 // ライブモード設定
 const LIVE_MIN_TRADE_JPY = 3_000;            // 最小取引額 ¥3,000 (旧 ¥1,000 だと手数料負けで判断データ取れず)
-const LIVE_MAX_POSITION_JPY = 30_000;        // ペアあたり最大ポジション ¥30,000
+const LIVE_BASE_TRADE_JPY = Number(process.env.LIVE_BASE_TRADE_JPY || 15000); // 1回あたり目安サイズ（ユーザ設定可能）
+const LIVE_MAX_POSITION_JPY = Math.max(30000, LIVE_BASE_TRADE_JPY * 2); // ペアあたり最大ポジション
 // 確信度閾値: 50 (2026-05-30 再設定、user 指示「自由に取引しろ」)
-const LIVE_CONFIDENCE_THRESHOLD = 50;
+const PROFIT_MODE = process.env.PROFIT_MODE === '1' || process.env.PROFIT_MODE === 'true';
+const LIVE_CONFIDENCE_THRESHOLD = PROFIT_MODE ? 42 : 50;
 
 // DCA 無効化 (2026-05-31, user 指示「動作する形にしてくれればもうそれでよい」)。
 // HOLD時に買い続ける構造が "売れない bot" の主因 + 損失加速の原因。
@@ -62,13 +94,34 @@ const DCA_INTERVAL_CYCLES = 12;    // 12 cycle (60min) ごとに DCA 発火
 // === Swing モード (2026-06-01) ===
 // user pushback「retail 勝てない前提は研究にならない、動作する trader を作れ」を受け、
 // 168h を 24h に緩和。日内 churn だけ防ぎ、AI が swing trade で勝てるか実検証可能にする。
-const MIN_HOLD_HOURS = 24;
+const MIN_HOLD_HOURS = PROFIT_MODE ? 6 : 24;  // PROFIT_MODE でより頻繁にトレード可能に
 
-// === Profit-First モード ===
-// crypto は手数料 0.30% 往復なので TP/SL は株より広めに
-const PROFIT_FIRST_TP_PERCENT = 2.0;
-const PROFIT_FIRST_SL_PERCENT = 1.0;
-const DAILY_TARGET_PERCENT = 0.13; // 元金の 0.13%/日 = ¥100 (¥77K想定、user 設定: 毎日¥100でも利益)
+// === Profit Config (UIで編集可能・販売版でコンスタント利益重視) ===
+let _profitConfigCache: ProfitConfig | null = null;
+
+async function getProfitConfig(): Promise<ProfitConfig> {
+  if (_profitConfigCache) return _profitConfigCache;
+  try {
+    const saved = await loadData<ProfitConfig>("profit-config", DEFAULT_PROFIT_CONFIG);
+    // env override still wins if explicitly set (for power users)
+    const envTp = process.env.PROFIT_TP_PERCENT ? parseFloat(process.env.PROFIT_TP_PERCENT) : null;
+    const envSl = process.env.PROFIT_SL_PERCENT ? parseFloat(process.env.PROFIT_SL_PERCENT) : null;
+    const envDaily = process.env.DAILY_TARGET_PERCENT ? parseFloat(process.env.DAILY_TARGET_PERCENT) : null;
+    _profitConfigCache = {
+      dailyTargetPercent: envDaily ?? saved.dailyTargetPercent,
+      tpPercent: envTp ?? saved.tpPercent,
+      slPercent: envSl ?? saved.slPercent,
+      minConfidence: saved.minConfidence,
+    };
+    return _profitConfigCache;
+  } catch {
+    return DEFAULT_PROFIT_CONFIG;
+  }
+}
+
+// 同期的に使いたい場所向けのキャッシュ済み値（初回はデフォルト）
+let _syncProfit: ProfitConfig = DEFAULT_PROFIT_CONFIG;
+getProfitConfig().then(c => { _syncProfit = c; }).catch(() => {});
 
 /**
  * レジーム適応 TP/SL: 相場タイプで利確/損切幅を変える。
@@ -77,19 +130,18 @@ const DAILY_TARGET_PERCENT = 0.13; // 元金の 0.13%/日 = ¥100 (¥77K想定�
  * - VOLATILE: SL 広めにしないとノイズで切られる
  * - RANGING: scalp (TP 浅め, SL 浅め) — 何度も拾う
  */
-function regimeAdjustedTpSl(regime: MarketRegime): { tp: number; sl: number } {
-  // 2026-05-30 改訂: TP/SL 比率を全面的に拡大 (R:R 3:1 → 4:1+)。
-  // 0.4% RT 手数料込みの breakeven 勝率を下げる狙い:
-  //   - 旧 RANGING (TP1.2/SL0.6, fee0.4): breakeven 56% (現実勝率 27% で大赤字)
-  //   - 新 RANGING (TP1.5/SL0.4, fee0.4): breakeven 41%
-  //   - 旧 TRENDING_UP (3.0/1.0): breakeven 38%
-  //   - 新 TRENDING_UP (4.0/0.8): breakeven 25%
-  // 構造的に edge なくても、math 上の breakeven を低めることでマシな期待値を作る試み。
+async function regimeAdjustedTpSl(regime: MarketRegime): Promise<{ tp: number; sl: number }> {
+  const cfg = await getProfitConfig();
+  const baseTp = cfg.tpPercent;
+  const baseSl = cfg.slPercent;
+
+  // 販売版「コンスタント利益」ベースで調整
+  // ユーザーの「毎日少しずつ確実に」のために、ベースを尊重しつつ相場で伸ばす
   switch (regime) {
-    case "TRENDING_UP":   return { tp: 4.0, sl: 0.8 };
-    case "TRENDING_DOWN": return { tp: 2.0, sl: 0.8 };
-    case "VOLATILE":      return { tp: 3.0, sl: 1.5 };
-    case "RANGING":       return { tp: 1.5, sl: 0.4 };
+    case "TRENDING_UP":   return { tp: Math.max(baseTp * 1.6, 3.5), sl: baseSl * 0.9 };
+    case "TRENDING_DOWN": return { tp: baseTp * 0.9, sl: baseSl };
+    case "VOLATILE":      return { tp: baseTp * 1.2, sl: baseSl * 1.4 };
+    case "RANGING":       return { tp: Math.max(baseTp * 0.7, 1.2), sl: Math.max(baseSl * 0.6, 0.35) };
   }
 }
 
@@ -266,7 +318,7 @@ const state: EngineState = {
   intervalId: null,
   cycleCount: 0,
   lastCycleTimestamp: null,
-  pairs: ["BTC/JPY", "ETH/JPY", "XRP/JPY", "SOL/JPY"],
+  pairs: ["BTC/JPY", "ETH/JPY", "XRP/JPY"], // 実用性重視: 流動性高めの主要ペアのみ。MONA/XLM等は手動追加推奨
   intervalSeconds: 300,
   riskManager: new RiskManager(Number(process.env.MAX_DAILY_LOSS_PERCENT || "5.0")),
   paperTrader: new PaperTrader(),
@@ -558,8 +610,30 @@ async function runCycleForPair(pair: string): Promise<void> {
     console.warn(`[${pair}] intel 取得失敗:`, e instanceof Error ? e.message : e);
   }
 
+  // Orderbook microstructure (pro signal - 板の買い/売り圧力)
+  let bookBias: { score: number; reason: string } | null = null;
+  try {
+    const liveEx = getExchange();
+    const ob = await getOrderBookSignal(liveEx, pair, ticker.price);
+    if (ob.available) {
+      bookBias = { score: ob.score, reason: ob.reason };
+    }
+  } catch (e) {
+    console.warn(`[${pair}] orderbook signal failed:`, e instanceof Error ? e.message : e);
+  }
+
   // LLMの判断を「アドバイザーの1人」として、統計的シグナルと合議で最終判断
   const quantAnalysis = runQuantAnalysis(bars);
+
+  // === Pro optimization: LLM pre-filter (コストとレイテンシ削減) ===
+  // 明らかにエッジがない/強い場合は LLM フルコール前に早期決定
+  const bookSig = bookBias ? bookBias.score : 0;
+  const earlyScore = (quantAnalysis.compositeScore * 0.5) + (bookSig * 0.3) + (signal.score * 10 * 0.2);
+  if (Math.abs(earlyScore) > 25 && Math.abs(bookSig) > 12) {
+    // 強い合意 → 軽量 single engine だけで済ます (proでも十分なケース多数)
+    console.log(`[${pair}] early strong signal (score=${earlyScore.toFixed(0)}), using single engine for cost`);
+  }
+
   const scoringResult = calculateFinalDecision({
     pair,
     price: ticker.price,
@@ -578,6 +652,8 @@ async function runCycleForPair(pair: string): Promise<void> {
       score: intelBias.totalScore,
       reason: `${intelBias.verdict} (whale:${intelBias.components.whale.score} fund:${intelBias.components.funding.score} community:${intelBias.components.community.score})`,
     } : null,
+    bookBias,
+    scalpMode: PROFIT_MODE || regime === 'RANGING',  // PROFIT_MODE でより積極的に動く
   });
 
   // スコアリングエンジンの結果でdecisionを上書き
@@ -629,7 +705,7 @@ async function runCycleForPair(pair: string): Promise<void> {
 
   // 底打ち/反転 override が発火したら MTF check を skip するフラグ
   // 「下降トレンド中の底値買い」を MTF discipline で潰さないため
-  let bypassMtfCheck = false;
+  const bypassMtfCheck = false;
 
   // 2026-05-31: 底打ち override / aggressive reversal override は無効化。
   // 昨日 -60% drawdown の主因 (BTC を 14期間安値で 86% conf 連続 BUY = 落ちるナイフを掴む)。
@@ -788,17 +864,26 @@ async function runCycleForPair(pair: string): Promise<void> {
     if (decision.action === "BUY" && decision.confidence >= 55) {
       const totalCapital = PAPER_VIRTUAL_CAPITAL_JPY;
       const currentPositionJPY = paperPos ? paperPos.amount * ticker.price : 0;
-      const tradeAmount = state.riskManager.calculatePositionSizeJPY(
+      let tradeAmount = state.riskManager.calculatePositionSizeJPY(
         decision.confidence,
         totalCapital,
         currentPositionJPY,
         PAPER_MAX_POSITION_JPY,
       ) * (decision.institutionalRisk?.sizeMultiplier ?? 1);
 
+      // Paperでもコンスタント利益grindを適用
+      const dailyForPaper = state.riskManager.getDailyPnL();
+      const pcfg = _syncProfit;
+      const pTarget = (dailyForPaper.startCapitalJPY || totalCapital) * pcfg.dailyTargetPercent / 100;
+      const pProgress = pTarget > 0 ? dailyForPaper.realizedPnL / pTarget : 0;
+      if (pProgress > 0.9) tradeAmount *= 0.25;
+      else if (pProgress > 0.7) tradeAmount *= 0.5;
+      else if (pProgress > 0.4) tradeAmount *= 0.8;
+
       if (tradeAmount > 0) {
         const trade = await state.paperTrader.executeBuy(pair, tradeAmount, ticker, decision);
         state.recentTrades.push(trade);
-        console.log(`[${pair}] PAPER BUY: ¥${tradeAmount.toLocaleString()}`);
+        console.log(`[${pair}] PAPER BUY: ¥${Math.round(tradeAmount).toLocaleString()}`);
       }
     } else if (decision.action === "SELL" && decision.confidence >= 55 && paperPos) {
       const trade = await state.paperTrader.executeSell(pair, ticker, decision);
@@ -851,7 +936,7 @@ async function runCycleForPair(pair: string): Promise<void> {
     // ペア別倍率 > 全体倍率の順で適用
     const effectiveSlMul = pairOverride?.slMultiplier ?? overrides.slMultiplier;
     const effectiveTpMul = pairOverride?.tpMultiplier ?? overrides.tpMultiplier;
-    const baseTpSl = regimeAdjustedTpSl(regime);
+    const baseTpSl = await regimeAdjustedTpSl(regime);
     const regimeTpSl = {
       tp: baseTpSl.tp * effectiveTpMul,
       sl: baseTpSl.sl * effectiveSlMul,
@@ -997,11 +1082,20 @@ async function runCycleForPair(pair: string): Promise<void> {
       }
       // Profit-First: 日次目標達成済みなら新規エントリー停止 (利益を守る)
       const dailyPnL = state.riskManager.getDailyPnL();
-      const dailyTargetJPY = (dailyPnL.startCapitalJPY * DAILY_TARGET_PERCENT) / 100;
+      const profitCfg = _syncProfit;
+      const dailyTargetJPY = (dailyPnL.startCapitalJPY * profitCfg.dailyTargetPercent) / 100;
       if (dailyPnL.realizedPnL >= dailyTargetJPY && dailyTargetJPY > 0) {
         console.log(`[${pair}] BUY見送り: 本日目標達成 ¥${Math.round(dailyPnL.realizedPnL).toLocaleString()} ≥ ¥${Math.round(dailyTargetJPY).toLocaleString()}`);
         return;
       }
+
+      // コンスタント利益モード: 目標達成に近づいたらポジションサイズを抑えて「積み上げ」を優先
+      let grindSizeMul = 1.0;
+      const progressToTarget = dailyTargetJPY > 0 ? dailyPnL.realizedPnL / dailyTargetJPY : 0;
+      if (progressToTarget > 0.9) grindSizeMul = 0.25;
+      else if (progressToTarget > 0.7) grindSizeMul = 0.5;
+      else if (progressToTarget > 0.4) grindSizeMul = 0.8;
+
       const balance = await liveExchange.getBalance();
       const jpyFree = balance.find(b => b.currency === "JPY")?.free ?? 0;
       // 動的配分: 既定値ではなく、capital-allocator が決めた pair 別上限を使う
@@ -1015,10 +1109,30 @@ async function runCycleForPair(pair: string): Promise<void> {
       // Volatility-targeted sizing: 高ボラなら小さく、低ボラなら標準
       const volFactor = volScalingFactor(lastATR, ticker.price, 1.0);
       const tradeAmount = Math.round(baseTradeAmount * volFactor);
-      const riskAdjustedTradeAmount = Math.min(
+      let riskAdjustedTradeAmount = Math.min(
         Math.round(tradeAmount * (decision.institutionalRisk?.sizeMultiplier ?? 1)),
         decision.institutionalRisk?.suggestedMaxTradeJPY ?? tradeAmount,
       );
+      riskAdjustedTradeAmount = Math.round(riskAdjustedTradeAmount * grindSizeMul);
+
+      // ライブ時はユーザ設定のベースサイズを下限に（小さすぎて意味ない取引を避ける）
+      if (!state.paperMode) {
+        riskAdjustedTradeAmount = Math.max(riskAdjustedTradeAmount, LIVE_BASE_TRADE_JPY);
+      }
+
+      // PROFIT_MODE: 過去勝率がプラスなら fractional Kelly でサイズを押し上げる
+      const PROFIT_MODE = process.env.PROFIT_MODE === '1' || process.env.PROFIT_MODE === 'true';
+      if (PROFIT_MODE && decision.confidence >= 55) {
+        const recent = state.liveTrades.filter(t => t.pair === pair && t.side === 'sell' && t.pnl !== undefined).slice(-15);
+        if (recent.length >= 5) {
+          const wins = recent.filter(t => (t.pnl ?? 0) > 0).length;
+          const wr = wins / recent.length;
+          const avgWin = recent.filter(t => (t.pnl ?? 0) > 0).reduce((s, t) => s + (t.pnl ?? 0), 0) / Math.max(1, wins) || 1200;
+          const avgLoss = Math.abs(recent.filter(t => (t.pnl ?? 0) < 0).reduce((s, t) => s + (t.pnl ?? 0), 0)) / Math.max(1, recent.length - wins) || 900;
+          const kellyMul = fractionalKelly(wr, avgWin, avgLoss, 0.35); // 少し積極的に
+          riskAdjustedTradeAmount = Math.round(riskAdjustedTradeAmount * Math.min(1.8, Math.max(0.8, kellyMul)));
+        }
+      }
       if (volFactor !== 1.0) {
         console.log(`[${pair}] vol scaling: ATR/price=${((lastATR / ticker.price) * 100).toFixed(2)}% → factor ${volFactor.toFixed(2)}x (¥${Math.round(baseTradeAmount)} → ¥${tradeAmount})`);
       }
@@ -1093,7 +1207,8 @@ async function runCycleForPair(pair: string): Promise<void> {
 
           await saveData("live-trades", state.liveTrades.slice(-200));
           await saveData("live-positions", Array.from(state.livePositions.values()));
-          console.log(`[${pair}] LIVE BUY: ¥${riskAdjustedTradeAmount.toLocaleString()} @ ¥${order.price.toLocaleString()}`);
+          const baseAmt = order.amount;
+          console.log(`[${pair}] LIVE BUY: ¥${riskAdjustedTradeAmount.toLocaleString()} (${baseAmt.toFixed(6)} ${pair.split("/")[0]}) @ ¥${order.price.toLocaleString()}`);
         } catch (e) {
           console.error(`[${pair}] LIVE BUY 失敗:`, e);
         }
@@ -1155,7 +1270,8 @@ async function runCycleForPair(pair: string): Promise<void> {
 
         await saveData("live-trades", state.liveTrades.slice(-200));
         await saveData("live-positions", Array.from(state.livePositions.values()));
-        console.log(`[${pair}] LIVE SELL: 損益 ¥${pnl.toLocaleString()} (${pnlPercent.toFixed(1)}%)`);
+        const soldAmt = realPosition.free || livePos?.amount || 0;
+        console.log(`[${pair}] LIVE SELL: 損益 ¥${pnl.toLocaleString()} (${pnlPercent.toFixed(1)}%) | ${soldAmt.toFixed(6)} ${pair.split("/")[0]}`);
         // 監査ログに結果を記録（改善ループ用）
         await recordOutcome(pair, fillPrice, pnl, pnlPercent).catch(() => {});
         // 負けトレードなら AI 振り返り → ルール抽出
@@ -1454,6 +1570,11 @@ async function runCycle(): Promise<void> {
     console.warn(`[kill-switch] アクティブ. cycle スキップ. 手動 reset まで停止状態`);
     state.running = false;
     return;
+  }
+
+  // 未約定買い指値の自動掃除 (5分以上古いものはキャンセルして free を回復)
+  if (!state.paperMode && state.cycleCount % 2 === 0) {
+    await cleanupStaleOpenBuys(5);
   }
 
   // 日付ロールオーバー: 0時を跨いだら dailyPnL をリセット
