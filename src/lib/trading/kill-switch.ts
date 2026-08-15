@@ -9,6 +9,7 @@
  *
  * 環境変数:
  *   KILL_SWITCH_THRESHOLD_PCT  デフォルト 15 (= NAV が peak から -15% で発火)
+ *   KILL_SWITCH_COOLDOWN_HOURS デフォルト 12 (= 発火からこの時間で自動復帰。永久ブリック防止)
  *   KILL_SWITCH_DISABLED       "1" で無効化 (テスト用)
  */
 
@@ -42,6 +43,11 @@ function getThresholdPct(): number {
   return Number.isFinite(v) && v > 0 ? v : 15;
 }
 
+function getCooldownHours(): number {
+  const v = Number(process.env.KILL_SWITCH_COOLDOWN_HOURS);
+  return Number.isFinite(v) && v > 0 ? v : 12;
+}
+
 export async function getKillSwitchState(): Promise<KillSwitchState> {
   return await loadData<KillSwitchState>(STATE_FILE, DEFAULT_STATE);
 }
@@ -49,7 +55,33 @@ export async function getKillSwitchState(): Promise<KillSwitchState> {
 export async function isKillSwitchActive(): Promise<boolean> {
   if (process.env.KILL_SWITCH_DISABLED === "1") return false;
   const s = await getKillSwitchState();
-  return s.triggered;
+  if (!s.triggered) return false;
+
+  // 自動復帰: 発火から cooldown 経過したら解除して取引再開する。
+  // 手動 reset しない限り永久停止だった設計を修正 (小さな DD で数週間ブリックする事故を防ぐ)。
+  // peak は「発火後の直近 NAV」に引き直し、旧ピーク基準で即再発火しないようにする。
+  const cooldownMs = getCooldownHours() * 3_600_000;
+  if (s.triggeredAt) {
+    const elapsed = Date.now() - new Date(s.triggeredAt).getTime();
+    if (Number.isFinite(elapsed) && elapsed >= cooldownMs) {
+      const baseline = s.lastNAV > 1000 ? s.lastNAV : s.peakNAV;
+      const reset: KillSwitchState = {
+        ...DEFAULT_STATE,
+        peakNAV: baseline,
+        lastNAV: baseline,
+        lastEvaluatedAt: new Date().toISOString(),
+      };
+      await saveData(STATE_FILE, reset);
+      await sendAlert({
+        level: "info",
+        message: `kill switch 自動復帰: 発火から ${getCooldownHours()}h 経過したため解除。peak NAV を ¥${Math.round(baseline).toLocaleString()} に引き直して取引再開。`,
+        dedupeKey: "kill-switch:auto-reset",
+      });
+      console.log(`[kill-switch] 自動復帰 (cooldown ${getCooldownHours()}h 経過) → 解除`);
+      return false;
+    }
+  }
+  return true;
 }
 
 /**
