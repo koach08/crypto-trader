@@ -2497,15 +2497,9 @@ export async function startBot(options?: {
     console.error("[learning] 起動時失敗:", e);
   }
 
-  // Run immediately
-  await runCycle();
-
-  // Set interval
-  state.intervalId = setInterval(() => {
-    runCycle().catch(console.error);
-  }, state.intervalSeconds * 1000);
-
-  // 高速 TP/SL 監視 (ライブのみ)。判断サイクルとは独立。AI は呼ばないので課金は増えない。
+  // 高速 TP/SL 監視は「初回サイクルより先に」張る。
+  // 初回サイクルは 5 ペア分の AI 判断で数分かかることがあり、その間ノーガードで
+  // ポジションを晒すことになるため。価格取得のみで AI は呼ばない (課金増やさない)。
   if (!state.paperMode) {
     const fastSec = Math.max(30, Number(process.env.FAST_MONITOR_SECONDS ?? "60"));
     state.fastMonitorId = setInterval(() => {
@@ -2513,6 +2507,14 @@ export async function startBot(options?: {
     }, fastSec * 1000);
     console.log(`高速TP/SL監視: ${fastSec}秒間隔で稼働 (判断サイクルは${state.intervalSeconds}秒)`);
   }
+
+  // Run immediately
+  await runCycle();
+
+  // Set interval
+  state.intervalId = setInterval(() => {
+    runCycle().catch(console.error);
+  }, state.intervalSeconds * 1000);
 }
 
 export function stopBot(): void {
