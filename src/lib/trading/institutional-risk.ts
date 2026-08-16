@@ -65,8 +65,9 @@ export function assessPreTradeRisk(input: {
   const openRiskPercent = input.totalCapitalJPY > 0
     ? (input.currentPositionJPY * Math.max(currentAtrPercent, valueAtRisk95Percent) / 100 / input.totalCapitalJPY) * 100
     : 0;
+  // 日次損失は確定損益基準 (古い塩漬け含み損で恒久 AVOID にならないようにする)。
   const dailyLossPercent = input.dailyPnL.startCapitalJPY > 0
-    ? Math.abs(Math.min(0, input.dailyPnL.totalPnL) / input.dailyPnL.startCapitalJPY) * 100
+    ? Math.abs(Math.min(0, input.dailyPnL.realizedPnL) / input.dailyPnL.startCapitalJPY) * 100
     : 0;
 
   const riskPenalty =
@@ -131,8 +132,12 @@ export function buildPortfolioRiskOverlay(input: {
     return sum + Math.max(0, ((p.avgEntryPrice - p.stopLoss) / p.avgEntryPrice) * p.valueJPY);
   }, 0);
   const openRiskPercent = input.capitalJPY > 0 ? (openRiskJPY / input.capitalJPY) * 100 : 0;
+  // 「日次」損失は確定損益で測る (RiskManager の日次サーキットブレーカーと同じ定義)。
+  // totalPnL を使うと数ヶ月前から抱えている含み損 (塩漬けポジ) が毎日加算され、
+  // その含み損だけで恒久的に AVOID = 新規停止に張り付く。実際 MONA の古い含み損で
+  // 確定 1.94% しか無い日が 2.85% と判定され全 BUY が止まっていた。
   const dailyLossPercent = input.dailyPnL.startCapitalJPY > 0
-    ? Math.abs(Math.min(0, input.dailyPnL.totalPnL) / input.dailyPnL.startCapitalJPY) * 100
+    ? Math.abs(Math.min(0, input.dailyPnL.realizedPnL) / input.dailyPnL.startCapitalJPY) * 100
     : 0;
   const lowConfidenceTrades = input.recentDecisions.slice(-8).filter((d) => d.action !== "HOLD" && d.confidence < 60).length;
 

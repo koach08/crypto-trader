@@ -6,7 +6,8 @@ export async function POST() {
     const exchange = getExchange();
     await exchange.connect();
 
-    const pairs = ["BTC/JPY", "ETH/JPY", "XRP/JPY", "SOL/JPY"];
+    // ⚠️ SOL/JPY は BitFlyer に存在しない (BadSymbol) ため入れない。
+    const pairs = ["BTC/JPY", "ETH/JPY", "XRP/JPY", "XLM/JPY", "MONA/JPY"];
     let canceled = 0;
 
     for (const pair of pairs) {

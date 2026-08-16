@@ -50,7 +50,8 @@ async function cleanupStaleOpenBuys(maxAgeMinutes = 5) {
     await exchange.connect();
     // 取引対象 (state.pairs) だけでなく、過去に発注し得た既知の JPY ペアも sweep する。
     // pair から外れた後に孤児化した買い指値を取りこぼすと現金が永久ロックされるため。
-    const KNOWN_JPY_PAIRS = ["BTC/JPY", "ETH/JPY", "XRP/JPY", "SOL/JPY"];
+    // ⚠️ SOL/JPY は BitFlyer に存在しない (BadSymbol) ため入れない。
+    const KNOWN_JPY_PAIRS = ["BTC/JPY", "ETH/JPY", "XRP/JPY", "XLM/JPY", "MONA/JPY"];
     const pairs = [...new Set([...state.pairs, ...KNOWN_JPY_PAIRS])];
     let canceled = 0;
     for (const pair of pairs) {

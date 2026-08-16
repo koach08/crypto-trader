@@ -176,8 +176,10 @@ export function buildAdaptiveStrategyReport(input: {
 }): AdaptiveStrategyReport {
   const lossAnalysis = analyzeLossPatterns(input.trades, input.audits);
   const topLossPair = lossAnalysis.topPair?.pair ?? null;
+  // 日次損失は確定損益基準。totalPnL だと古い塩漬けポジの含み損が毎日乗って
+  // 恒久的に「防御優先 = 新規BUY停止」に張り付くため (institutional-risk と定義を統一)。
   const dailyLossPercent = input.dailyPnL.startCapitalJPY > 0
-    ? Math.abs(Math.min(0, input.dailyPnL.totalPnL) / input.dailyPnL.startCapitalJPY) * 100
+    ? Math.abs(Math.min(0, input.dailyPnL.realizedPnL) / input.dailyPnL.startCapitalJPY) * 100
     : 0;
 
   const positionPlans = input.positions.map((position) => {
@@ -201,7 +203,9 @@ export function buildAdaptiveStrategyReport(input: {
 
   const unrealizedPnLJPY = positionPlans.reduce((sum, plan) => sum + plan.unrealizedPnLJPY, 0);
   const netPnLJPY = input.dailyPnL.realizedPnL + unrealizedPnLJPY;
-  const portfolioPosture: AdaptiveStrategyReport["portfolioPosture"] = dailyLossPercent >= 1.2 || netPnLJPY < 0
+  // netPnLJPY < 0 は入れない: 含み損を抱えている限り永久に DEFENSIVE になり新規BUYが出せなくなる。
+  // 姿勢は「本日の確定損失」で決める。
+  const portfolioPosture: AdaptiveStrategyReport["portfolioPosture"] = dailyLossPercent >= 1.2
     ? "DEFENSIVE"
     : positionPlans.some((p) => p.plans.some((plan) => plan.action === "ADD_SMALL"))
     ? "RECOVERY"
