@@ -298,6 +298,8 @@ interface EngineState {
   running: boolean;
   paperMode: boolean;
   intervalId: ReturnType<typeof setInterval> | null;
+  /** 高速 TP/SL 監視ループ (AI を呼ばない) */
+  fastMonitorId: ReturnType<typeof setInterval> | null;
   cycleCount: number;
   lastCycleTimestamp: string | null;
   pairs: string[];
@@ -320,6 +322,7 @@ const state: EngineState = {
   running: false,
   paperMode: true,
   intervalId: null,
+  fastMonitorId: null,
   cycleCount: 0,
   lastCycleTimestamp: null,
   pairs: ["BTC/JPY", "ETH/JPY", "XRP/JPY"], // 実用性重視: 流動性高めの主要ペアのみ。MONA/XLM等は手動追加推奨
@@ -428,6 +431,144 @@ function isSellableAmount(
   if (amountBase <= 0 || currentPrice <= 0) return false;
   const minJPY = exchange.getMinOrderJPY?.(pair, currentPrice) ?? 0;
   return minJPY <= 0 || amountBase * currentPrice >= minJPY * 0.9;
+}
+
+/**
+ * SL 発動ラインを「エントリーからの変動率」に変換する。
+ *
+ * ⚠️ 保存されている stopLossPercent は "エントリーから何 % 下か" を **正の数** で持つ仕様
+ * (regimeAdjustedTpSl / position-style / discipline.ts が全てこの向き)。
+ * 一方 PTP や trailing が利益側にロックした場合だけ負値になり「エントリーから何 % 上」を意味する。
+ * したがって発動ラインは常に符号反転した値になる。
+ *   保存 +0.35 → 変動が -0.35% 以下で損切り
+ *   保存 -5.0  → 変動が +5.0% 以下に後退したら利確保護で決済
+ *
+ * 【重要】以前はここを反転せず `changePercent <= stopLossPercent` で比較していたため、
+ * 変動 0% でも `0 <= +0.35` が成立し、買った次のサイクルでほぼ必ず "stop_loss" が発動していた。
+ * 損切りが効かないのではなく「1時間後に相場がどこにいても投げる」動作になり、
+ * -3% でも -5% でもそのまま損失確定していた (損失の 98% が 1.5% 超だった原因)。
+ */
+export function slTriggerPercent(storedStopLossPercent: number): number {
+  return -storedStopLossPercent;
+}
+
+/**
+ * TP/SL 決済の実行本体。メインサイクルと高速監視ループの両方から呼ぶ共通処理。
+ * ペア単位ロックで二重売却を防ぐ (両ループが同時に同じポジションを売らないため)。
+ */
+const exitLocks = new Set<string>();
+
+async function closeLivePositionAtExit(
+  exchange: import("../exchanges/types").IExchange,
+  pair: string,
+  sellAmountBase: number,
+  referencePrice: number,
+  triggerType: "stop_loss" | "take_profit",
+): Promise<boolean> {
+  if (exitLocks.has(pair)) return false;
+  exitLocks.add(pair);
+  try {
+    // ロック取得後に再確認 (待っている間に他方が決済済みかもしれない)
+    const livePos = state.livePositions.get(pair);
+    if (!livePos) return false;
+
+    // SL は緊急性高い → 成行強制。TP は maker 試行 → timeout で成行フォールバック。
+    const { order } = await executeSell(exchange, pair, sellAmountBase, triggerType === "stop_loss");
+    // BitFlyer (ccxt) は order.average を 0 で返すことがある。参照価格で代替。
+    const fillPrice = order.price > 0 ? order.price : referencePrice;
+    const pnl = (fillPrice - livePos.entryPrice) * order.amount;
+    const pnlPercent = ((fillPrice - livePos.entryPrice) / livePos.entryPrice) * 100;
+
+    const trade: TradeRecord = {
+      id: `live-${Date.now()}`,
+      timestamp: new Date().toISOString(),
+      exchange: "bitflyer",
+      pair,
+      side: "sell",
+      type: triggerType,
+      amount: order.amount,
+      price: fillPrice,
+      valueJPY: order.amount * fillPrice,
+      orderId: order.id,
+      fee: order.fee ?? 0,
+      pnl,
+      pnlPercent,
+      paperTrade: false,
+    };
+    state.recentTrades.push(trade);
+    state.liveTrades.push(trade);
+    state.riskManager.recordTrade(pnl);
+    state.livePositions.delete(pair);
+    if (triggerType === "stop_loss" || pnl < 0) {
+      const cdMs = adaptiveCooldownMs(pnlPercent);
+      state.cooldownUntil.set(pair, Date.now() + cdMs);
+      await persistCooldowns();
+      console.log(`[${pair}] SL/負け確定 (${pnlPercent.toFixed(2)}%) → クールダウン ${cdMs / 60000}分セット`);
+    }
+
+    await saveData("live-trades", state.liveTrades.slice(-200));
+    await saveData("live-positions", Array.from(state.livePositions.values()));
+    console.log(`[${pair}] LIVE ${triggerType.toUpperCase()}: 損益 ¥${pnl.toLocaleString()} (${pnlPercent.toFixed(1)}%)`);
+    await recordOutcome(pair, fillPrice, pnl, pnlPercent).catch(() => {});
+    // 負けトレードなら AI 振り返り → ルール抽出 (学習機能。消さない)
+    triggerLossReflection(pair, pnl, pnlPercent, fillPrice, triggerType).catch(() => {});
+    return true;
+  } catch (e) {
+    console.error(`[${pair}] LIVE ${triggerType.toUpperCase()} 失敗:`, e);
+    return false;
+  } finally {
+    exitLocks.delete(pair);
+  }
+}
+
+/**
+ * 高速 TP/SL 監視ループ: 価格取得のみで AI を一切呼ばない (課金増やさない)。
+ *
+ * 【なぜ必要か】判断サイクルは 1 時間間隔だが、TP/SL もそこでしか評価されないと
+ * SCALP の SL 0.6% は「1 時間に 1 回しか見ない損切り」になり全く機能しない。
+ * 実績で 24h TP 0 回 / SL 6 回、損失の 98% が名目 0.6% を大きく超える 1.5%+ になっていた。
+ * ここで分単位に監視することで、初めて損切り幅が設計値どおりに効く。
+ */
+async function monitorPositionsFast(): Promise<void> {
+  if (!state.running || state.paperMode) return;
+  if (state.livePositions.size === 0) return;
+
+  const exchange = getExchange();
+  try {
+    await exchange.connect();
+  } catch {
+    return;
+  }
+
+  for (const [pair, livePos] of Array.from(state.livePositions.entries())) {
+    if (exitLocks.has(pair)) continue;
+    if (typeof livePos.stopLossPercent !== "number" || typeof livePos.takeProfitPercent !== "number") continue;
+    try {
+      const ticker = await exchange.getTicker(pair);
+      if (!ticker?.price || ticker.price <= 0) continue;
+
+      const changePercent = ((ticker.price - livePos.entryPrice) / livePos.entryPrice) * 100;
+      let triggerType: "stop_loss" | "take_profit" | null = null;
+      if (changePercent <= slTriggerPercent(livePos.stopLossPercent)) triggerType = "stop_loss";
+      else if (changePercent >= livePos.takeProfitPercent) triggerType = "take_profit";
+      if (!triggerType) continue;
+
+      // 部分利確が残っている場合はメインサイクルに任せる (段階利確ロジックを壊さない)
+      const ptpRemaining =
+        livePos.partialTakeProfits && livePos.partialTakeProfits.length > (livePos.ptpTriggeredCount ?? 0);
+      if (triggerType === "take_profit" && ptpRemaining) continue;
+
+      const balances = await exchange.getBalance();
+      const base = pair.split("/")[0];
+      const free = balances.find(b => b.currency === base)?.free ?? 0;
+      if (!isSellableAmount(exchange, pair, free, ticker.price)) continue;
+
+      console.log(`[${pair}] 高速監視 ${triggerType} 検知: ${changePercent.toFixed(2)}% (SL ${livePos.stopLossPercent}% / TP ${livePos.takeProfitPercent}%)`);
+      await closeLivePositionAtExit(exchange, pair, free, ticker.price, triggerType);
+    } catch {
+      // 個別ペアの失敗で監視全体を止めない
+    }
+  }
 }
 
 // Eagerly load saved data so the API can return history before the bot starts
@@ -1366,11 +1507,7 @@ async function runCycleForPair(pair: string): Promise<void> {
 
       // Final TP/SL チェック (PTP 全消化後 or PTP 無し)
       if (!triggerType) {
-        if (changePercent <= livePos.stopLossPercent) {
-          // SL は負値で扱う仕様 (PTP で SL を +X% にした時もこれで OK)
-          if (livePos.stopLossPercent < 0 && changePercent <= livePos.stopLossPercent) triggerType = "stop_loss";
-          else if (livePos.stopLossPercent >= 0 && changePercent <= livePos.stopLossPercent) triggerType = "stop_loss";
-        }
+        if (changePercent <= slTriggerPercent(livePos.stopLossPercent)) triggerType = "stop_loss";
         if (!triggerType && changePercent >= livePos.takeProfitPercent) {
           triggerType = "take_profit";
         }
@@ -1378,47 +1515,8 @@ async function runCycleForPair(pair: string): Promise<void> {
 
       if (triggerType) {
         try {
-          // SL は緊急性高い → maker timeout を短く (10s)、TP は通常 (30s)
-          // ただし TP/SL 両方とも maker 試行 → timeout で成行フォールバック
-          const { order } = await executeSell(liveExchange, pair, realPosition.free, triggerType === "stop_loss");
-          // BitFlyer (ccxt) は order.average を 0 で返すことがある。ticker.price で代替。
-          const fillPrice = order.price > 0 ? order.price : ticker.price;
-          const pnl = (fillPrice - livePos.entryPrice) * order.amount;
-          const pnlPercent = ((fillPrice - livePos.entryPrice) / livePos.entryPrice) * 100;
-
-          const trade: TradeRecord = {
-            id: `live-${Date.now()}`,
-            timestamp: new Date().toISOString(),
-            exchange: "bitflyer",
-            pair,
-            side: "sell",
-            type: triggerType,
-            amount: order.amount,
-            price: fillPrice,
-            valueJPY: order.amount * fillPrice,
-            orderId: order.id,
-            fee: order.fee ?? 0,
-            pnl,
-            pnlPercent,
-            paperTrade: false,
-          };
-          state.recentTrades.push(trade);
-          state.liveTrades.push(trade);
-          state.riskManager.recordTrade(pnl);
-          state.livePositions.delete(pair);
-          if (triggerType === "stop_loss" || pnl < 0) {
-            const cdMs = adaptiveCooldownMs(pnlPercent);
-            state.cooldownUntil.set(pair, Date.now() + cdMs);
-            await persistCooldowns();
-            console.log(`[${pair}] SL/負け確定 (${pnlPercent.toFixed(2)}%) → クールダウン ${cdMs / 60000}分セット`);
-          }
-
-          await saveData("live-trades", state.liveTrades.slice(-200));
-          await saveData("live-positions", Array.from(state.livePositions.values()));
-          console.log(`[${pair}] LIVE ${triggerType.toUpperCase()}: 損益 ¥${pnl.toLocaleString()} (${pnlPercent.toFixed(1)}%)`);
-          await recordOutcome(pair, fillPrice, pnl, pnlPercent).catch(() => {});
-          // 負けトレードなら AI 振り返り → ルール抽出
-          triggerLossReflection(pair, pnl, pnlPercent, fillPrice, triggerType).catch(() => {});
+          // 実行本体は高速監視ループと共通 (closeLivePositionAtExit)。
+          await closeLivePositionAtExit(liveExchange, pair, realPosition.free, ticker.price, triggerType);
         } catch (e) {
           console.error(`[${pair}] LIVE ${triggerType.toUpperCase()} 失敗:`, e);
         }
@@ -2406,6 +2504,15 @@ export async function startBot(options?: {
   state.intervalId = setInterval(() => {
     runCycle().catch(console.error);
   }, state.intervalSeconds * 1000);
+
+  // 高速 TP/SL 監視 (ライブのみ)。判断サイクルとは独立。AI は呼ばないので課金は増えない。
+  if (!state.paperMode) {
+    const fastSec = Math.max(30, Number(process.env.FAST_MONITOR_SECONDS ?? "60"));
+    state.fastMonitorId = setInterval(() => {
+      monitorPositionsFast().catch(console.error);
+    }, fastSec * 1000);
+    console.log(`高速TP/SL監視: ${fastSec}秒間隔で稼働 (判断サイクルは${state.intervalSeconds}秒)`);
+  }
 }
 
 export function stopBot(): void {
@@ -2414,6 +2521,10 @@ export function stopBot(): void {
   if (state.intervalId) {
     clearInterval(state.intervalId);
     state.intervalId = null;
+  }
+  if (state.fastMonitorId) {
+    clearInterval(state.fastMonitorId);
+    state.fastMonitorId = null;
   }
   console.log("Bot停止");
 }
