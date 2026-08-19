@@ -10,11 +10,20 @@
  *  - F&G 履歴は date → value で渡す (なければ neutral 50)
  */
 
-import type { OHLCVBar } from "../types";
+import type { CryptoAction, OHLCVBar } from "../types";
 import { runQuantAnalysis } from "../quant/signals";
 import { calculateFinalDecision } from "../quant/scoring-engine";
 import { detectRegime, generateCryptoSignal } from "../indicators";
 import { checkMTFAlignment, checkEdge, checkSentimentEdge } from "../trading/discipline";
+import { evaluateTrend } from "../trading/trend-gate";
+
+/**
+ * `quant` = 既存のクオンツ + スコアリング + 規律フィルタ一式。
+ * `trend`  = 移動平均だけの素朴なトレンドフォロー。既存スタックが本当に価値を
+ *            出しているかを測るための対照群 (control)。これに勝てない実装は
+ *            「複雑にした分だけ損している」ことになる。
+ */
+export type BacktestStrategy = "quant" | "trend";
 
 export interface BacktestConfig {
   pair: string;
@@ -24,6 +33,32 @@ export interface BacktestConfig {
   slippagePercent: number;
   feePercent: number;
   warmupBars?: number;
+  strategy?: BacktestStrategy;
+  /**
+   * 上位トレンドに逆らう BUY を禁止する。
+   * 実データで「F&G 恐怖 → 逆張り買い」が下落局面で 7戦0勝だったため、
+   * 「落ちるナイフを掴まない」ことだけを条件に足す。
+   */
+  trendGate?: boolean;
+  trendFast?: number;
+  trendSlow?: number;
+  /**
+   * 一度買ったら売らない (下落しても保有継続)。
+   * 「上昇トレンドでない間は現金で待つ」のと「暗号資産のまま持ち続ける」のを
+   * 比較するために使う。
+   */
+  holdForever?: boolean;
+  /**
+   * SELL シグナルでショートを建てる (BitFlyer Lightning FX 相当、レバレッジ 1x で保守的に評価)。
+   * 現物ロングだけでは下落局面で構造的に勝てないため、その分をここで測る。
+   */
+  allowShort?: boolean;
+  /**
+   * 上昇トレンドが確定しているときは F&G の「恐怖でなければ買うな」条件を外す。
+   * この条件があると上げ相場 (F&G 50-75) では BUY が 1 本も出ず、
+   * 結果として「恐怖で落ちている時にしか買わない」= 逆張り専用機になる。
+   */
+  trendFollowEntries?: boolean;
   emergencyLossPercent?: number;
   takeProfitPercent?: number;
   stopLossPercent?: number;
@@ -103,6 +138,13 @@ export function runBacktest(config: BacktestConfig): BacktestResult {
     quantOverrideThreshold = 25,
     skipMTF = false,
     skipEV = false,
+    strategy = "quant",
+    trendGate = false,
+    trendFast = 50,
+    trendSlow = 200,
+    allowShort = false,
+    trendFollowEntries = false,
+    holdForever = false,
   } = config;
 
   if (bars.length < warmupBars + 5) {
@@ -110,9 +152,76 @@ export function runBacktest(config: BacktestConfig): BacktestResult {
   }
 
   let cash = initialCapital;
-  let position: { amount: number; avgPrice: number; entryBarIdx: number } | null = null;
+  type SimPosition = { side: "long" | "short"; amount: number; avgPrice: number; entryBarIdx: number };
+  let position: SimPosition | null = null;
   const trades: SimTrade[] = [];
   const equityCurve: EquityPoint[] = [];
+
+  const slipUp = 1 + slippagePercent / 100;   // 買い側は不利に上へ滑る
+  const slipDown = 1 - slippagePercent / 100; // 売り側は不利に下へ滑る
+
+  /** エントリーからの損益率。ショートは価格が下がるほどプラス。 */
+  function changePercentOf(p: SimPosition, price: number): number {
+    const raw = ((price - p.avgPrice) / p.avgPrice) * 100;
+    return p.side === "long" ? raw : -raw;
+  }
+
+  // ヘルパーは position を直接書き換えず、新しい値を返す。
+  // (クロージャ内で let を代入すると TypeScript の絞り込みが効かなくなるため)
+  function openPosition(
+    side: "long" | "short",
+    barOpen: number,
+    date: string,
+    reason: string,
+    barIdx: number
+  ): SimPosition {
+    const fillPrice = side === "long" ? barOpen * slipUp : barOpen * slipDown;
+    const notional = cash;
+    const fee = notional * (feePercent / 100);
+    const amount = (notional - fee) / fillPrice;
+    trades.push({
+      side: side === "long" ? "buy" : "sell",
+      date,
+      price: fillPrice,
+      amount,
+      fee,
+      reason,
+    });
+    // ロングは現金を現物に変える。ショートは現金を証拠金として残し手数料だけ引く。
+    cash = side === "long" ? 0 : cash - fee;
+    return { side, amount, avgPrice: fillPrice, entryBarIdx: barIdx };
+  }
+
+  function closePosition(
+    p: SimPosition,
+    barOpen: number,
+    date: string,
+    reason: string,
+    exitType: SimTrade["exitType"]
+  ): null {
+    const fillPrice = p.side === "long" ? barOpen * slipDown : barOpen * slipUp;
+    const notional = p.amount * fillPrice;
+    const fee = notional * (feePercent / 100);
+    const gross =
+      p.side === "long"
+        ? (fillPrice - p.avgPrice) * p.amount
+        : (p.avgPrice - fillPrice) * p.amount;
+    const pnl = gross - fee;
+    // ロングは売却代金がまるごと現金に戻る。ショートは証拠金が残っているので損益だけ足す。
+    cash += p.side === "long" ? notional - fee : pnl;
+    trades.push({
+      side: p.side === "long" ? "sell" : "buy",
+      date,
+      price: fillPrice,
+      amount: p.amount,
+      fee,
+      pnl,
+      pnlPercent: (pnl / (p.avgPrice * p.amount)) * 100,
+      reason,
+      exitType,
+    });
+    return null;
+  }
 
   for (let i = warmupBars; i < bars.length - 1; i++) {
     const window = bars.slice(0, i + 1);
@@ -121,152 +230,105 @@ export function runBacktest(config: BacktestConfig): BacktestResult {
     const date = dateOf(currentBar);
     const fng = fngByDate?.get(date) ?? 50;
 
-    // 1) クオンツ + テクニカル + レジーム
-    const quantAnalysis = runQuantAnalysis(window);
-    const technical = generateCryptoSignal(window);
-    const regime = detectRegime(window);
+    // 0) 上位トレンド。本番エンジンと同じ定義を使う (trend-gate.ts が単一の出所)
+    const trend = evaluateTrend(window, trendFast, trendSlow);
+    const upTrend = trend?.upTrend ?? false;
+    const belowFast = trend?.belowFast ?? false;
+    const confirmedDownTrend = trend?.confirmedDownTrend ?? false;
 
-    // 2) スコアリングエンジン (AI は backtest では HOLD固定)
-    const scoring = calculateFinalDecision({
-      pair,
-      price: currentBar.close,
-      quantAnalysis,
-      aiAction: "HOLD",
-      aiConfidence: 50,
-      aiReason: "backtest (no AI)",
-      technicalScore: technical.score,
-      regime,
-      fearGreedIndex: fng,
-    });
+    let action: CryptoAction;
+    let reason: string;
 
-    let action = scoring.action;
-    let reason = scoring.reason;
+    if (strategy === "trend") {
+      // 対照群: 移動平均だけ。クオンツも AI も F&G も一切見ない。
+      action = upTrend ? "BUY" : belowFast && !holdForever ? "SELL" : "HOLD";
+      reason = `trend control: ${trend?.label ?? "トレンド判定不能"}`;
+    } else {
+      // 1) クオンツ + テクニカル + レジーム
+      const quantAnalysis = runQuantAnalysis(window);
+      const technical = generateCryptoSignal(window);
+      const regime = detectRegime(window);
 
-    // 3) 規律フィルタ
-    // F&G は Quant 強い (|score|≥25) ならスキップ (トレンドフォローモード)
-    if (action !== "HOLD") {
-      const quantStrong = Math.abs(quantAnalysis.compositeScore) >= 25;
-      if (!quantStrong) {
-        const sent = checkSentimentEdge(fng, action);
-        if (!sent.passed) action = "HOLD";
-        reason += ` | ${sent.reason}`;
-      } else {
-        reason += " | F&G スキップ (Quant強い)";
+      // 2) スコアリングエンジン (AI は backtest では HOLD固定)
+      const scoring = calculateFinalDecision({
+        pair,
+        price: currentBar.close,
+        quantAnalysis,
+        aiAction: "HOLD",
+        aiConfidence: 50,
+        aiReason: "backtest (no AI)",
+        technicalScore: technical.score,
+        regime,
+        fearGreedIndex: fng,
+      });
+
+      action = scoring.action;
+      reason = scoring.reason;
+
+      // 3) 規律フィルタ
+      // F&G は Quant 強い (|score|≥25) ならスキップ (トレンドフォローモード)
+      if (action !== "HOLD") {
+        const quantStrong = Math.abs(quantAnalysis.compositeScore) >= 25;
+        // 上昇トレンド確定中の BUY は F&G 条件を免除する (順張りモード)
+        const trendFollowBuy = trendFollowEntries && action === "BUY" && upTrend;
+        if (trendFollowBuy) {
+          reason += " | F&G スキップ (上昇トレンド確定の順張り)";
+        } else if (!quantStrong) {
+          const sent = checkSentimentEdge(fng, action);
+          if (!sent.passed) action = "HOLD";
+          reason += ` | ${sent.reason}`;
+        } else {
+          reason += " | F&G スキップ (Quant強い)";
+        }
       }
-    }
-    if (action !== "HOLD") {
-      const mtf = checkMTFAlignment(window, action);
-      if (!mtf.aligned) action = "HOLD";
-      reason += ` | ${mtf.reason}`;
-    }
-    if (action !== "HOLD") {
-      const edge = checkEdge(scoring.confidence, takeProfitPercent, stopLossPercent);
-      if (!edge.passed) action = "HOLD";
+      if (action !== "HOLD") {
+        const mtf = checkMTFAlignment(window, action);
+        if (!mtf.aligned) action = "HOLD";
+        reason += ` | ${mtf.reason}`;
+      }
+      if (action !== "HOLD") {
+        const edge = checkEdge(scoring.confidence, takeProfitPercent, stopLossPercent);
+        if (!edge.passed) action = "HOLD";
+      }
+      // 落ちるナイフを掴まない: 上位トレンドが下向きの間は新規 BUY を出さない
+      if (trendGate && action === "BUY" && !upTrend) {
+        action = "HOLD";
+        reason += ` | trendGate: 上位トレンド下向き (MA${trendFast} 割れ/デッドクロス) のため BUY 見送り`;
+      }
     }
 
     // 4) ポジション管理 (SL/TP/緊急ロスカット)
-    if (position) {
-      const currentChange = ((currentBar.close - position.avgPrice) / position.avgPrice) * 100;
-
-      // 緊急ロスカット
+    if (position && !holdForever) {
+      const currentChange = changePercentOf(position, currentBar.close);
       if (currentChange <= -emergencyLossPercent) {
-        const fillPrice = nextBar.open * (1 - slippagePercent / 100);
-        const proceeds = position.amount * fillPrice;
-        const fee = proceeds * (feePercent / 100);
-        const pnl = proceeds - position.avgPrice * position.amount - fee;
-        cash += proceeds - fee;
-        trades.push({
-          side: "sell",
-          date: dateOf(nextBar),
-          price: fillPrice,
-          amount: position.amount,
-          fee,
-          pnl,
-          pnlPercent: (pnl / (position.avgPrice * position.amount)) * 100,
-          reason: `緊急ロスカット ${currentChange.toFixed(2)}%`,
-          exitType: "emergency",
-        });
-        position = null;
-      }
-      // テイクプロフィット
-      else if (currentChange >= takeProfitPercent) {
-        const fillPrice = nextBar.open * (1 - slippagePercent / 100);
-        const proceeds = position.amount * fillPrice;
-        const fee = proceeds * (feePercent / 100);
-        const pnl = proceeds - position.avgPrice * position.amount - fee;
-        cash += proceeds - fee;
-        trades.push({
-          side: "sell",
-          date: dateOf(nextBar),
-          price: fillPrice,
-          amount: position.amount,
-          fee,
-          pnl,
-          pnlPercent: (pnl / (position.avgPrice * position.amount)) * 100,
-          reason: `TP +${currentChange.toFixed(2)}%`,
-          exitType: "take_profit",
-        });
-        position = null;
-      }
-      // SL ガード (config 指定)
-      else if (currentChange <= -stopLossPercent) {
-        const fillPrice = nextBar.open * (1 - slippagePercent / 100);
-        const proceeds = position.amount * fillPrice;
-        const fee = proceeds * (feePercent / 100);
-        const pnl = proceeds - position.avgPrice * position.amount - fee;
-        cash += proceeds - fee;
-        trades.push({
-          side: "sell",
-          date: dateOf(nextBar),
-          price: fillPrice,
-          amount: position.amount,
-          fee,
-          pnl,
-          pnlPercent: (pnl / (position.avgPrice * position.amount)) * 100,
-          reason: `SL ${currentChange.toFixed(2)}%`,
-          exitType: "stop_loss",
-        });
-        position = null;
+        position = closePosition(position, nextBar.open, dateOf(nextBar), `緊急ロスカット ${currentChange.toFixed(2)}%`, "emergency");
+      } else if (currentChange >= takeProfitPercent) {
+        position = closePosition(position, nextBar.open, dateOf(nextBar), `TP +${currentChange.toFixed(2)}%`, "take_profit");
+      } else if (currentChange <= -stopLossPercent) {
+        position = closePosition(position, nextBar.open, dateOf(nextBar), `SL ${currentChange.toFixed(2)}%`, "stop_loss");
       }
     }
 
-    // 5) AI/quant 判断によるエントリー/イグジット
-    if (action === "BUY" && !position && cash > 1000) {
-      const fillPrice = nextBar.open * (1 + slippagePercent / 100);
-      const fee = cash * (feePercent / 100);
-      const amount = (cash - fee) / fillPrice;
-      trades.push({
-        side: "buy",
-        date: dateOf(nextBar),
-        price: fillPrice,
-        amount,
-        fee,
-        reason,
-      });
-      position = { amount, avgPrice: fillPrice, entryBarIdx: i };
-      cash = 0;
-    } else if (action === "SELL" && position) {
-      const fillPrice = nextBar.open * (1 - slippagePercent / 100);
-      const proceeds = position.amount * fillPrice;
-      const fee = proceeds * (feePercent / 100);
-      const pnl = proceeds - position.avgPrice * position.amount - fee;
-      cash += proceeds - fee;
-      trades.push({
-        side: "sell",
-        date: dateOf(nextBar),
-        price: fillPrice,
-        amount: position.amount,
-        fee,
-        pnl,
-        pnlPercent: (pnl / (position.avgPrice * position.amount)) * 100,
-        reason,
-        exitType: "ai_sell",
-      });
-      position = null;
+    // 5) 判断によるエントリー/イグジット
+    // 反対シグナルが出たら、まず今のポジションを閉じてから逆側を建てる (同バー内でドテン)。
+    if (position && ((action === "SELL" && position.side === "long") || (action === "BUY" && position.side === "short"))) {
+      position = closePosition(position, nextBar.open, dateOf(nextBar), reason, "ai_sell");
+    }
+    if (!position && cash > 1000) {
+      if (action === "BUY") {
+        position = openPosition("long", nextBar.open, dateOf(nextBar), reason, i);
+      } else if (action === "SELL" && allowShort && confirmedDownTrend) {
+        position = openPosition("short", nextBar.open, dateOf(nextBar), `${reason} | 確定下降トレンドのみショート`, i);
+      }
     }
 
     // 6) Equity
-    const positionValue = position ? position.amount * currentBar.close : 0;
+    const positionValue = position
+      ? position.side === "long"
+        ? position.amount * currentBar.close
+        : // ショートは cash を証拠金として置いたままなので、含み損益だけ足す
+          (position.avgPrice - currentBar.close) * position.amount
+      : 0;
     equityCurve.push({
       date,
       equity: cash + positionValue,
@@ -278,22 +340,7 @@ export function runBacktest(config: BacktestConfig): BacktestResult {
   // 最終バーで強制クローズ
   if (position) {
     const lastBar = bars[bars.length - 1];
-    const fillPrice = lastBar.close * (1 - slippagePercent / 100);
-    const proceeds = position.amount * fillPrice;
-    const fee = proceeds * (feePercent / 100);
-    const pnl = proceeds - position.avgPrice * position.amount - fee;
-    cash += proceeds - fee;
-    trades.push({
-      side: "sell",
-      date: dateOf(lastBar),
-      price: fillPrice,
-      amount: position.amount,
-      fee,
-      pnl,
-      pnlPercent: (pnl / (position.avgPrice * position.amount)) * 100,
-      reason: "バックテスト終了強制クローズ",
-      exitType: "ai_sell",
-    });
+    position = closePosition(position, lastBar.close, dateOf(lastBar), "バックテスト終了強制クローズ", "ai_sell");
   }
 
   // === 統計算出 ===
@@ -334,13 +381,15 @@ export function runBacktest(config: BacktestConfig): BacktestResult {
   }
 
   // 勝率と Profit Factor
-  const sells = trades.filter((t) => t.side === "sell" && t.pnl !== undefined);
-  const wins = sells.filter((t) => (t.pnl ?? 0) > 0);
-  const losses = sells.filter((t) => (t.pnl ?? 0) < 0);
-  const numTrades = sells.length;
+  // ショートの決済は side="buy" になるので、side ではなく exitType の有無で決済を判定する。
+  const exits = trades.filter((t) => t.exitType !== undefined && t.pnl !== undefined);
+  const wins = exits.filter((t) => (t.pnl ?? 0) > 0);
+  const losses = exits.filter((t) => (t.pnl ?? 0) < 0);
+  const numTrades = exits.length;
   const winRate = numTrades > 0 ? (wins.length / numTrades) * 100 : 0;
   const grossWin = wins.reduce((s, t) => s + (t.pnl ?? 0), 0);
   const grossLoss = Math.abs(losses.reduce((s, t) => s + (t.pnl ?? 0), 0));
+  const sells = exits; // 平均保有日数の算出で使う
   const profitFactor = grossLoss > 0 ? grossWin / grossLoss : grossWin > 0 ? 999 : 0;
   const avgWinPercent = wins.length
     ? wins.reduce((s, t) => s + (t.pnlPercent ?? 0), 0) / wins.length
@@ -349,7 +398,7 @@ export function runBacktest(config: BacktestConfig): BacktestResult {
     ? losses.reduce((s, t) => s + (t.pnlPercent ?? 0), 0) / losses.length
     : 0;
   // 平均保有日数
-  const buys = trades.filter((t) => t.side === "buy");
+  const buys = trades.filter((t) => t.exitType === undefined);
   let totalHoldDays = 0;
   let pairs = 0;
   for (let bi = 0, si = 0; bi < buys.length; bi++) {

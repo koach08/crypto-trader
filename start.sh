@@ -21,8 +21,11 @@ done
 if [ "$AUTO_START_LIVE" = "true" ]; then
   (
     sleep 5
-    # SOL/JPY は BitFlyer に存在しない (BadSymbol エラーで毎サイクル失敗) ため除外
-    PAIRS=${TRADING_PAIRS:-"BTC/JPY,ETH/JPY,XRP/JPY,XLM/JPY,MONA/JPY"}
+    # SOL/JPY は BitFlyer に存在しない (BadSymbol エラーで毎サイクル失敗) ため除外。
+    # XLM/MONA も除外: MA ルールで回しても 5y/2y/1y すべての期間で負ける
+    # (XLM -44.5%/-32.3%/-45.2%、MONA -71.2%/-29.9%/-5.4%)。
+    # 5 ペアにすると 3 ペアの +46.2% が +4.6% まで落ちる (5y、ポートフォリオ検証)。
+    PAIRS=${TRADING_PAIRS:-"BTC/JPY,ETH/JPY,XRP/JPY"}
     INTERVAL=${BOT_INTERVAL_SECONDS:-300}
     PAIRS_JSON=$(echo "$PAIRS" | sed 's/,/","/g' | sed 's/^/["/' | sed 's/$/"]/')
     echo "[start.sh] Starting live bot: pairs=$PAIRS interval=${INTERVAL}s"
