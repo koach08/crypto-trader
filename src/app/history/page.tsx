@@ -12,7 +12,7 @@ export default function HistoryPage() {
     const fetchData = async () => {
       try {
         const [tradesRes, statusRes] = await Promise.all([
-          fetch("/api/trades"),
+          fetch("/api/trades?limit=0"), // 履歴ページは全件必要
           fetch("/api/bot/status"),
         ]);
         if (tradesRes.ok) {

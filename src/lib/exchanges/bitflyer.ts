@@ -7,6 +7,16 @@ const MIN_BASE_AMOUNT: Record<string, number> = {
   SOL: 0.01, // BitFlyer 現物 SOL 0.01 単位
 };
 
+/**
+ * 各タイムフレームが「基準足の何本分か」。
+ * CryptoCompare の histominute/histohour/histoday は 1 分/1 時間/1 日が基準なので、
+ * 4h なら 1 時間足を 4 本、15m なら 1 分足を 15 本まとめる必要がある。
+ */
+const AGGREGATE_BY_TIMEFRAME: Record<string, number> = {
+  "1m": 1, "5m": 5, "15m": 15,
+  "1h": 1, "4h": 4, "1d": 1,
+};
+
 export class BitFlyerExchange implements IExchange {
   id = "bitflyer";
   private exchange: CcxtExchange;
@@ -74,12 +84,18 @@ export class BitFlyerExchange implements IExchange {
     };
     const endpoint = tfMap[timeframe] || "histohour";
 
+    // ⚠️ 以前は aggregate を渡していなかったため、"4h" を要求しても 1 時間足が返っていた。
+    // マルチタイムフレーム整合性チェックが実質「1h 対 1h」を比べていたことになる。
+    // CryptoCompare は aggregate、BitFlyer chart API は grouping で足をまとめる。
+    const aggregate = AGGREGATE_BY_TIMEFRAME[timeframe] ?? 1;
+
     const params = new URLSearchParams({
       fsym: base, tsym: quote, limit: String(limit),
     });
+    if (aggregate > 1) params.set("aggregate", String(aggregate));
 
     // Try CryptoCompare with retry, then fallback to CoinGecko
-    const data = await this.fetchOHLCVWithFallback(endpoint, params, base, quote, limit);
+    const data = await this.fetchOHLCVWithFallback(endpoint, params, base, quote, limit, aggregate);
 
     return data
       .map((d: { time: number; open: number; high: number; low: number; close: number; volumefrom: number }) => ({
@@ -98,7 +114,8 @@ export class BitFlyerExchange implements IExchange {
     params: URLSearchParams,
     base: string,
     quote: string,
-    limit: number
+    limit: number,
+    aggregate = 1
   ): Promise<{ time: number; open: number; high: number; low: number; close: number; volumefrom: number }[]> {
     // === Primary: BitFlyer 公式 chart API (実出来高あり) ===
     // フォーマット: [ts_ms, open, high, low, close, volume, ...] 配列
@@ -110,7 +127,7 @@ export class BitFlyerExchange implements IExchange {
       const symbol = `${base}_${quote}`;
       const before = Date.now();
       const resp = await fetch(
-        `https://lightchart.bitflyer.com/api/ohlc?symbol=${symbol}&period=${bfPeriod}&before=${before}&type=full&grouping=1`,
+        `https://lightchart.bitflyer.com/api/ohlc?symbol=${symbol}&period=${bfPeriod}&before=${before}&type=full&grouping=${aggregate}`,
         {
           signal: AbortSignal.timeout(15000),
           headers: { "User-Agent": "Mozilla/5.0 crypto-trader", "Accept": "application/json" },

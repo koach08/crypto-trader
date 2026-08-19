@@ -79,9 +79,9 @@ describe("calculateFinalDecision", () => {
       technicalScore: 3,
       regime: "TRENDING_UP",
     });
-    expect(r.audit.votes).toHaveLength(6);
+    expect(r.audit.votes).toHaveLength(7);
     const sources = r.audit.votes.map((v) => v.source).sort();
-    expect(sources).toEqual(["ai", "external", "intel", "quant", "regime", "technical"]);
+    expect(sources).toEqual(["ai", "book", "external", "intel", "quant", "regime", "technical"]);
   });
 
   it("ウェイト合計 ≈ 1.0", () => {

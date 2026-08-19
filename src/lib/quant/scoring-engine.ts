@@ -249,6 +249,18 @@ export function calculateFinalDecision(input: ScoringInput): ScoringResult {
         weight: WEIGHTS.intel,
         reasons: input.intelBias ? [input.intelBias.reason] : ["intel 取得失敗"],
       },
+      // 板情報 (orderbook imbalance)。compositeScore には WEIGHTS.book = 10% で
+      // 効いているのに、ここに無いせいで監査ログにだけ残らなかった。
+      // 監査を材料にする signal-learning / retrospective が板の寄与を学習できず、
+      // ウェイト合計も 0.9 にしか見えない状態だった。
+      {
+        source: "book",
+        action: bookScore > 15 ? "BUY" : bookScore < -15 ? "SELL" : "HOLD",
+        score: bookScore,
+        confidence: input.bookBias ? 70 : 0,
+        weight: WEIGHTS.book,
+        reasons: input.bookBias ? [input.bookBias.reason] : ["orderbook 取得失敗"],
+      },
     ],
     marketState: {
       price: input.price,
