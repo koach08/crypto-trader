@@ -1944,7 +1944,13 @@ async function readPortfolioSnapshot(
       prices[pair] = cached.price;
       continue;
     }
-    if (!fetchMissingPrices) continue;
+    if (!fetchMissingPrices) {
+      // 画面からの呼び出しでは ticker を待たせない。ただし古い価格でも 0 よりはるかにまし。
+      // ここを落とすと、保有しているのに「評価額 ¥0 / 充足 0%」と表示され、
+      // NAV もその分だけ小さく出る (XRP を ¥2,997 積んだ直後に踏んだ)。
+      if (cached && cached.price > 0) prices[pair] = cached.price;
+      continue;
+    }
     try {
       const t = await exchange.getTicker(pair);
       if (t?.price > 0) {
