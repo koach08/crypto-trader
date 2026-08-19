@@ -32,6 +32,8 @@ import { evaluateTrend, decideByTrend, type TrendState } from "./trend-gate";
 import {
   loadCoreConfig,
   planCoreBuy,
+  planCoreTakeProfit,
+  applyCoreSell,
   applyCoreFill,
   clampCoreToBalance,
   mergeCoreConfig,
@@ -2000,6 +2002,48 @@ async function maintainCoreHolding(): Promise<void> {
       minOrderJPY[pair] = exchange.getMinOrderJPY?.(pair, price) ?? 0;
     }
 
+    // 先に利確を見る。上がった分を現金に戻してから、その現金で足りない枠を積む。
+    // 1 サイクルにつき売りか買いのどちらか 1 件だけ。
+    const tp = planCoreTakeProfit({ state: state.coreHolding, cfg, prices, minOrderJPY });
+    if (tp.plan) {
+      const tpPlan = tp.plan;
+      // 台帳ではなく取引所の実残高を上限にする。手動売却などで台帳が実残高を
+      // 上回っていると、そのまま投げて注文が弾かれる。
+      const base = tpPlan.pair.split("/")[0];
+      const free = balances.find((b) => b.currency === base)?.free ?? 0;
+      const sellAmount = Math.min(tpPlan.amountBase, free);
+      if (sellAmount > 0 && sellAmount * tpPlan.priceJPY >= Math.max(minOrderJPY[tpPlan.pair] ?? 0, cfg.minTrancheJPY)) {
+        console.log(`[core] 利確実行: ${tpPlan.pair} ${sellAmount} @ ¥${Math.round(tpPlan.priceJPY).toLocaleString()} (${tpPlan.reason})`);
+        const { order } = await executeSell(exchange, tpPlan.pair, sellAmount);
+        const sellPrice = order.price > 0 ? order.price : tpPlan.priceJPY;
+        const soldAt = new Date().toISOString();
+        const res = applyCoreSell(state.coreHolding, tpPlan.pair, order.amount || sellAmount, sellPrice);
+        state.coreHolding = res.state;
+        await saveData("core-holding", state.coreHolding);
+        console.log(`[core] 利確確定: ${tpPlan.pair} ¥${Math.round(res.realizedJPY).toLocaleString()} (累計 ¥${Math.round(state.coreHolding.realizedJPY ?? 0).toLocaleString()})`);
+
+        const sellTrade: TradeRecord = {
+          id: `core-tp-${Date.now()}`,
+          timestamp: soldAt,
+          exchange: "bitflyer",
+          pair: tpPlan.pair,
+          side: "sell",
+          type: "market",
+          amount: order.amount || sellAmount,
+          price: sellPrice,
+          valueJPY: (order.amount || sellAmount) * sellPrice,
+          orderId: order.id,
+          fee: order.fee ?? 0,
+          paperTrade: false,
+        };
+        state.recentTrades.push(sellTrade);
+        state.liveTrades.push(sellTrade);
+        await saveData("live-trades", state.liveTrades);
+        state.lastCoreSkip = null;
+        return;
+      }
+    }
+
     const { plan, skip } = planCoreBuy({
       navJPY,
       jpyFree,
@@ -2076,7 +2120,14 @@ async function maintainCoreHolding(): Promise<void> {
  */
 export async function updateCoreConfig(patch: CoreConfigOverride): Promise<CoreHoldConfig> {
   await ensureDataLoaded();
-  const next: CoreConfigOverride = { ...(state.coreConfigOverride ?? {}), ...patch };
+  // undefined のキーを落としてから重ねる。API ルートは送られなかった項目を
+  // 明示的に undefined で埋めてくるので、そのまま展開すると保存済みの値を
+  // undefined で上書きし、env 既定に戻ってしまう。
+  // 実害: 比率だけ変えた POST で enabled が false に戻り、積立が黙って止まった。
+  const defined = Object.fromEntries(
+    Object.entries(patch).filter(([, v]) => v !== undefined)
+  ) as CoreConfigOverride;
+  const next: CoreConfigOverride = { ...(state.coreConfigOverride ?? {}), ...defined };
   state.coreConfigOverride = next;
   await saveData("core-config", next);
   const cfg = currentCoreConfig();
@@ -2120,6 +2171,8 @@ export async function getCoreHoldingReport(): Promise<{
   totalValueJPY: number;
   totalCostJPY: number;
   totalTargetJPY: number;
+  /** 利確で現金に戻した確定損益の累計 */
+  realizedJPY: number;
   lastSkip: (CoreSkip & { at: string }) | null;
 }> {
   await ensureDataLoaded();
@@ -2145,6 +2198,7 @@ export async function getCoreHoldingReport(): Promise<{
     totalValueJPY: rows.reduce((s, r) => s + r.valueJPY, 0),
     totalCostJPY: rows.reduce((s, r) => s + r.costJPY, 0),
     totalTargetJPY: rows.reduce((s, r) => s + r.targetJPY, 0),
+    realizedJPY: state.coreHolding.realizedJPY ?? 0,
     lastSkip: state.lastCoreSkip,
   };
 }

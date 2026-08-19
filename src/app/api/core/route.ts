@@ -23,6 +23,9 @@ export async function POST(req: Request) {
       tranches: typeof body.tranches === "number" ? body.tranches : undefined,
       intervalHours: typeof body.intervalHours === "number" ? body.intervalHours : undefined,
       minTrancheJPY: typeof body.minTrancheJPY === "number" ? body.minTrancheJPY : undefined,
+      takeProfitPct: typeof body.takeProfitPct === "number" ? body.takeProfitPct : undefined,
+      takeProfitFraction: typeof body.takeProfitFraction === "number" ? body.takeProfitFraction : undefined,
+      reentryDiscountPct: typeof body.reentryDiscountPct === "number" ? body.reentryDiscountPct : undefined,
     });
     return NextResponse.json({ ok: true, config: cfg });
   } catch (e) {

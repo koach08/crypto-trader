@@ -3,6 +3,8 @@ import {
   loadCoreConfig,
   computeCoreTargetsJPY,
   planCoreBuy,
+  planCoreTakeProfit,
+  applyCoreSell,
   applyCoreFill,
   sellableAmount,
   coreAmount,
@@ -27,6 +29,9 @@ const cfg: CoreHoldConfig = {
   tranches: 4,
   intervalHours: 24,
   minTrancheJPY: 3000,
+  takeProfitPct: 0.2,
+  takeProfitFraction: 0.25,
+  reentryDiscountPct: 0.05,
 };
 
 const prices = { "BTC/JPY": 10_000_000, "ETH/JPY": 300_000, "XRP/JPY": 160 };
@@ -170,6 +175,73 @@ describe("planCoreBuy", () => {
     });
     expect(plan).toBeNull();
     expect(skip?.reason).toContain("到達");
+  });
+});
+
+describe("planCoreTakeProfit / applyCoreSell", () => {
+  const tpState: CoreHoldingState = {
+    lots: [
+      { at: "2026-08-01T00:00:00.000Z", pair: "ETH/JPY", amountBase: 0.02, priceJPY: 250_000, costJPY: 5_000 },
+      { at: "2026-08-10T00:00:00.000Z", pair: "ETH/JPY", amountBase: 0.02, priceJPY: 300_000, costJPY: 6_000 },
+    ],
+    lastBuyAt: { "ETH/JPY": "2026-08-10T00:00:00.000Z" },
+  };
+
+  it("含み益が閾値を超えたら一部だけ売る (枠ごと畳まない)", () => {
+    // 取得平均 = 11,000 / 0.04 = ¥275,000。+20% = ¥330,000
+    const { plan } = planCoreTakeProfit({
+      state: tpState, cfg, prices: { "ETH/JPY": 350_000 }, minOrderJPY,
+    });
+    expect(plan?.pair).toBe("ETH/JPY");
+    expect(plan!.amountBase).toBeCloseTo(0.04 * 0.25, 8);
+    expect(plan!.gainPercent).toBeGreaterThan(20);
+  });
+
+  it("閾値に届かなければ売らない", () => {
+    const { plan } = planCoreTakeProfit({
+      state: tpState, cfg, prices: { "ETH/JPY": 300_000 }, minOrderJPY,
+    });
+    expect(plan).toBeNull();
+  });
+
+  it("売却額が最小注文に届かないなら見送る", () => {
+    const tiny: CoreHoldingState = {
+      lots: [{ at: "2026-08-01T00:00:00.000Z", pair: "ETH/JPY", amountBase: 0.001, priceJPY: 250_000, costJPY: 250 }],
+      lastBuyAt: {},
+    };
+    const { plan } = planCoreTakeProfit({
+      state: tiny, cfg, prices: { "ETH/JPY": 350_000 }, minOrderJPY,
+    });
+    expect(plan).toBeNull();
+  });
+
+  it("約定を反映すると古いロットから減り、確定損益が積まれる", () => {
+    const { state: after, realizedJPY } = applyCoreSell(tpState, "ETH/JPY", 0.02, 350_000);
+    expect(coreAmount(after, "ETH/JPY")).toBeCloseTo(0.02, 8);
+    // 古いロット (原価 ¥5,000) が消える → 0.02 × 350,000 - 5,000 = ¥2,000
+    expect(realizedJPY).toBeCloseTo(2_000, 6);
+    expect(after.realizedJPY).toBeCloseTo(2_000, 6);
+    expect(after.lastSellPrice?.["ETH/JPY"]).toBe(350_000);
+  });
+
+  it("利確直後は同じ値段で買い戻さない (往復コストだけ払う動きを防ぐ)", () => {
+    const { state: after } = applyCoreSell(tpState, "ETH/JPY", 0.02, 350_000);
+    const { plan } = planCoreBuy({
+      navJPY: 63_000, jpyFree: 63_000, cfg: { ...cfg, weights: { "ETH/JPY": 1 } },
+      state: after, prices: { "ETH/JPY": 349_000 }, minOrderJPY,
+      nowMs: Date.parse("2026-08-20T00:00:00.000Z"),
+    });
+    expect(plan).toBeNull();
+  });
+
+  it("売値から割引分まで下がれば買い直す", () => {
+    const { state: after } = applyCoreSell(tpState, "ETH/JPY", 0.02, 350_000);
+    const { plan } = planCoreBuy({
+      navJPY: 63_000, jpyFree: 63_000, cfg: { ...cfg, weights: { "ETH/JPY": 1 } },
+      state: after, prices: { "ETH/JPY": 330_000 }, minOrderJPY,
+      nowMs: Date.parse("2026-08-20T00:00:00.000Z"),
+    });
+    expect(plan?.pair).toBe("ETH/JPY");
   });
 });
 

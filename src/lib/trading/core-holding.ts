@@ -32,6 +32,16 @@ export interface CoreHoldConfig {
   intervalHours: number;
   /** これ未満の発注はしない (取引所の最小注文とは別に、手数料負けを避ける下限) */
   minTrancheJPY: number;
+  /**
+   * 利確。ペアの含み益率がこれを超えたら一部だけ売って現金に戻す。0 で無効。
+   * コア枠は本来「売らない」枠だが、現金のまま置くと何も起きないという理由で
+   * 積んでいる以上、利益が出た分を確定させる出口が要る。
+   */
+  takeProfitPct: number;
+  /** 利確で売る割合 (そのペアのコア保有数量に対して) */
+  takeProfitFraction: number;
+  /** 利確後、売値からこの率だけ下がるまで買い戻さない (売った直後に同値で買い直さないため) */
+  reentryDiscountPct: number;
 }
 
 export interface CoreLot {
@@ -46,9 +56,13 @@ export interface CoreHoldingState {
   lots: CoreLot[];
   /** pair → 直近の買付時刻 (ISO) */
   lastBuyAt: Record<string, string>;
+  /** pair → 直近の利確売値。ここから reentryDiscountPct 下がるまで買い戻さない */
+  lastSellPrice?: Record<string, number>;
+  /** 利確で確定させた損益の累計 (JPY) */
+  realizedJPY?: number;
 }
 
-export const EMPTY_CORE_STATE: CoreHoldingState = { lots: [], lastBuyAt: {} };
+export const EMPTY_CORE_STATE: CoreHoldingState = { lots: [], lastBuyAt: {}, lastSellPrice: {}, realizedJPY: 0 };
 
 /** 既定の比重。長期で持ち切る枠なので時価総額上位 2 つに絞る。XRP は戦術枠のみ。 */
 const DEFAULT_WEIGHTS: Record<string, number> = { "BTC/JPY": 0.6, "ETH/JPY": 0.4 };
@@ -76,6 +90,9 @@ export function loadCoreConfig(env: CoreEnv = process.env): CoreHoldConfig {
     tranches: Math.max(1, Number(env.CORE_HOLD_TRANCHES ?? "4")),
     intervalHours: Math.max(0, Number(env.CORE_HOLD_INTERVAL_HOURS ?? "24")),
     minTrancheJPY: Math.max(0, Number(env.CORE_HOLD_MIN_JPY ?? "3000")),
+    takeProfitPct: Math.max(0, Number(env.CORE_TAKE_PROFIT_PCT ?? "0.2")),
+    takeProfitFraction: Math.min(Math.max(Number(env.CORE_TAKE_PROFIT_FRACTION ?? "0.25"), 0), 1),
+    reentryDiscountPct: Math.max(0, Number(env.CORE_REENTRY_DISCOUNT_PCT ?? "0.05")),
   };
 }
 
@@ -198,6 +215,14 @@ export function planCoreBuy(input: PlanCoreBuyInput): { plan: CoreBuyPlan | null
     // 5% の許容幅。価格変動のたびに端数を買い足さない。
     if (shortfallJPY <= targetJPY * 0.05) continue;
 
+    // 利確した直後に同じ値段で買い戻さない。売値から reentryDiscountPct 下がるまで待つ。
+    // これが無いと「+20% で売って次のサイクルで買い直す」を繰り返し、
+    // 往復のスプレッドと手数料だけ払って数量が減っていく。
+    const soldAt = state.lastSellPrice?.[pair];
+    if (soldAt && soldAt > 0 && cfg.reentryDiscountPct > 0) {
+      if (price > soldAt * (1 - cfg.reentryDiscountPct)) continue;
+    }
+
     const last = state.lastBuyAt[pair];
     if (last && cfg.intervalHours > 0) {
       const elapsedH = (nowMs - Date.parse(last)) / 3_600_000;
@@ -250,8 +275,125 @@ export function applyCoreFill(
   fill: { pair: string; amountBase: number; priceJPY: number; costJPY: number; at: string }
 ): CoreHoldingState {
   return {
+    ...state,
     lots: [...state.lots, { ...fill }],
     lastBuyAt: { ...state.lastBuyAt, [fill.pair]: fill.at },
+  };
+}
+
+export interface CoreTakeProfitPlan {
+  pair: string;
+  amountBase: number;
+  priceJPY: number;
+  proceedsJPY: number;
+  avgCostJPY: number;
+  gainPercent: number;
+  reason: string;
+}
+
+/**
+ * 利確できるペアを 1 件返す。
+ *
+ * 【なぜコア枠に出口を付けるか】この枠は「現金のまま置いても何も起きない」という
+ * 理由で積んでいる。値上がりしても一度も売らなければ、増えたのは含み益だけで
+ * 現金にはならない。上がったところで一部だけ現金に戻し、押したところで買い直す。
+ *
+ * 【何を守るか】売るのは常に一部 (takeProfitFraction) だけで、枠ごと畳むことはしない。
+ * 判断はコア台帳の取得原価に対してのみ行い、戦術枠の SL/TP とは独立している。
+ * 戦術枠から見た売却可能数量 (sellableAmount) は従来どおりコアを引いたままなので、
+ * 「戦術枠の損切りがコアを巻き込む」経路は塞がれたまま。
+ */
+export function planCoreTakeProfit(input: {
+  state: CoreHoldingState;
+  cfg: CoreHoldConfig;
+  prices: Record<string, number>;
+  minOrderJPY: Record<string, number>;
+}): { plan: CoreTakeProfitPlan | null; skip: CoreSkip | null } {
+  const { state, cfg, prices, minOrderJPY } = input;
+  if (!cfg.enabled) return { plan: null, skip: { reason: "コア保有は無効" } };
+  if (cfg.takeProfitPct <= 0 || cfg.takeProfitFraction <= 0) {
+    return { plan: null, skip: { reason: "コア利確は無効 (takeProfitPct = 0)" } };
+  }
+
+  const candidates: CoreTakeProfitPlan[] = [];
+  for (const pair of new Set(state.lots.map((l) => l.pair))) {
+    const price = prices[pair];
+    if (!price || price <= 0) continue;
+    const amount = coreAmount(state, pair);
+    const cost = coreCostJPY(state, pair);
+    if (amount <= 0 || cost <= 0) continue;
+
+    const avgCost = cost / amount;
+    const gain = (price - avgCost) / avgCost;
+    if (gain < cfg.takeProfitPct) continue;
+
+    const sellAmount = amount * cfg.takeProfitFraction;
+    const proceeds = sellAmount * price;
+    const minOrder = Math.max(minOrderJPY[pair] ?? 0, cfg.minTrancheJPY);
+    // 最小注文に届かないなら見送る。刻めない量を投げても約定しない。
+    if (proceeds < minOrder) continue;
+
+    candidates.push({
+      pair,
+      amountBase: sellAmount,
+      priceJPY: price,
+      proceedsJPY: proceeds,
+      avgCostJPY: avgCost,
+      gainPercent: gain * 100,
+      reason: `[コア利確] 取得平均 ¥${Math.round(avgCost).toLocaleString()} に対し ¥${Math.round(price).toLocaleString()} (+${(gain * 100).toFixed(1)}%)`,
+    });
+  }
+
+  if (candidates.length === 0) return { plan: null, skip: { reason: "利確条件に届いているペアなし" } };
+  // 利が乗っている順。1 サイクル 1 件だけ。
+  candidates.sort((a, b) => b.gainPercent - a.gainPercent);
+  return { plan: candidates[0], skip: null };
+}
+
+/**
+ * 利確の約定を台帳に反映する。古いロットから減らす (FIFO)。
+ * 確定した損益を realizedJPY に積み、売値を lastSellPrice に残して買い戻し価格の基準にする。
+ */
+export function applyCoreSell(
+  state: CoreHoldingState,
+  pair: string,
+  amountBase: number,
+  priceJPY: number
+): { state: CoreHoldingState; realizedJPY: number } {
+  let remaining = amountBase;
+  let costRemoved = 0;
+  const lots: CoreLot[] = [];
+
+  for (const lot of state.lots) {
+    if (lot.pair !== pair || remaining <= 0) {
+      lots.push(lot);
+      continue;
+    }
+    if (lot.amountBase <= remaining) {
+      remaining -= lot.amountBase;
+      costRemoved += lot.costJPY;
+      continue; // ロットごと消える
+    }
+    const ratio = remaining / lot.amountBase;
+    costRemoved += lot.costJPY * ratio;
+    lots.push({
+      ...lot,
+      amountBase: lot.amountBase - remaining,
+      costJPY: lot.costJPY * (1 - ratio),
+    });
+    remaining = 0;
+  }
+
+  const sold = amountBase - remaining;
+  const realized = sold * priceJPY - costRemoved;
+  return {
+    state: {
+      ...state,
+      lots,
+      lastSellPrice: { ...(state.lastSellPrice ?? {}), [pair]: priceJPY },
+      realizedJPY: (state.realizedJPY ?? 0) + realized,
+    },
+    realizedJPY: realized,
   };
 }
 
@@ -342,6 +484,7 @@ export function clampCoreToBalance(
 export type CoreConfigOverride = Partial<Pick<
   CoreHoldConfig,
   "enabled" | "targetPct" | "weights" | "tranches" | "intervalHours" | "minTrancheJPY"
+  | "takeProfitPct" | "takeProfitFraction" | "reentryDiscountPct"
 >>;
 
 export function mergeCoreConfig(base: CoreHoldConfig, override: CoreConfigOverride | null | undefined): CoreHoldConfig {
@@ -361,5 +504,12 @@ export function mergeCoreConfig(base: CoreHoldConfig, override: CoreConfigOverri
   if (typeof override.tranches === "number" && override.tranches >= 1) merged.tranches = Math.floor(override.tranches);
   if (typeof override.intervalHours === "number" && override.intervalHours >= 0) merged.intervalHours = override.intervalHours;
   if (typeof override.minTrancheJPY === "number" && override.minTrancheJPY >= 0) merged.minTrancheJPY = override.minTrancheJPY;
+  if (typeof override.takeProfitPct === "number" && override.takeProfitPct >= 0) merged.takeProfitPct = override.takeProfitPct;
+  if (typeof override.takeProfitFraction === "number" && override.takeProfitFraction > 0 && override.takeProfitFraction <= 1) {
+    merged.takeProfitFraction = override.takeProfitFraction;
+  }
+  if (typeof override.reentryDiscountPct === "number" && override.reentryDiscountPct >= 0) {
+    merged.reentryDiscountPct = override.reentryDiscountPct;
+  }
   return merged;
 }
