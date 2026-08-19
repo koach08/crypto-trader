@@ -165,7 +165,15 @@ export function planCoreBuy(input: PlanCoreBuyInput): { plan: CoreBuyPlan | null
     if (!price || price <= 0) continue;
     const remaining = targetJPY - coreAmount(state, pair) * price;
     const minOrder = Math.max(minOrderJPY[pair] ?? 0, cfg.minTrancheJPY);
-    if (remaining > targetJPY * 0.05 && remaining < minOrder) stuck.push(pair);
+    // 「端数」と呼べるのは 1 トランシェ未満まで。ここを minOrder だけで判定すると、
+    // 目標が最小注文の 2 倍程度しかないペア (BTC 目標 ¥22,930 / 最小 ¥11,639) で
+    // 1 回積んだ直後の残り ¥11,323 まで「刻めない端数」に化け、目標のほぼ半分が
+    // 他ペアに流れて比重が逆転する (BTC 0.6 / ETH 0.4 のはずが 3:7 になる)。
+    // コアは売らない枠なので、一度流れた分は元に戻せない。
+    // 残りが 1 トランシェを超えるうちは待つ。目標は NAV に連動して動くので、
+    // NAV が 1-2% 増えるか価格が下がれば最小注文に届いて再開する。
+    const crumb = remaining <= targetJPY / Math.max(1, cfg.tranches);
+    if (remaining > targetJPY * 0.05 && remaining < minOrder && crumb) stuck.push(pair);
     else if (remaining >= minOrder) receivers.push(pair);
   }
   if (stuck.length > 0 && receivers.length > 0) {

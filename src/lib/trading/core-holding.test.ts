@@ -120,6 +120,44 @@ describe("planCoreBuy", () => {
     expect(plan?.pair).toBe("ETH/JPY");
   });
 
+  it("1 トランシェを超える残りは端数扱いにしない (比重が逆転するため)", () => {
+    // 2026-08-19 の本番で踏んだ形。NAV ¥63,695 / 目標 60% / BTC 0.6:ETH 0.4 →
+    // BTC 目標 ¥22,930。BTC を 1 回 (¥11,607) 積んだ直後、残り ¥11,323 が
+    // 最小注文 ¥11,639 をわずかに下回る。ここを「刻めない端数」として
+    // ETH に回すと、ETH 目標が ¥15,287 → ¥26,605 に膨らみ、
+    // 指定した 6:4 が実際には 3:7 になる。コアは売らないので取り返せない。
+    const liveCfg: CoreHoldConfig = { ...cfg, targetPct: 0.6 };
+    const livePrices = { "BTC/JPY": 10_580_000, "ETH/JPY": 306_764 };
+    const liveMin = { "BTC/JPY": 11_639, "ETH/JPY": 3_375 };
+    const state: CoreHoldingState = {
+      lots: [{ at: "2026-08-19T15:20:00.000Z", pair: "BTC/JPY", amountBase: 0.00109863, priceJPY: 10_565_000, costJPY: 11_607 }],
+      lastBuyAt: { "BTC/JPY": "2026-08-19T15:20:00.000Z" },
+    };
+    const { plan } = planCoreBuy({
+      navJPY: 63_695, jpyFree: 36_407, cfg: liveCfg, state,
+      prices: livePrices, minOrderJPY: liveMin,
+      nowMs: Date.parse("2026-08-19T16:20:00.000Z"),
+    });
+    // ETH は自分の目標 (63,695 × 0.6 × 0.4 ≒ ¥15,287) の範囲で積む
+    expect(plan?.pair).toBe("ETH/JPY");
+    expect(plan!.targetJPY).toBeLessThan(16_000);
+  });
+
+  it("1 トランシェ未満の端数は従来どおり他ペアに回す", () => {
+    // 積み切りかけの状態。BTC 目標 ¥26,460 に対し ¥23,000 まで積むと
+    // 残り ¥3,460 は最小注文 ¥11,000 に永久に届かない = 本物の端数。
+    const state: CoreHoldingState = {
+      lots: [{ at: "2026-08-17T09:00:00.000Z", pair: "BTC/JPY", amountBase: 0.0023, priceJPY: 10_000_000, costJPY: 23_000 }],
+      lastBuyAt: { "BTC/JPY": "2026-08-17T09:00:00.000Z" },
+    };
+    const { plan } = planCoreBuy({
+      navJPY: 63_000, jpyFree: 40_000, cfg, state, prices, minOrderJPY, nowMs: NOW,
+    });
+    // ETH 単独の目標は ¥17,640。端数 ¥3,460 が乗って ¥21,100 前後になる
+    expect(plan?.pair).toBe("ETH/JPY");
+    expect(plan!.targetJPY).toBeGreaterThan(17_640);
+  });
+
   it("目標に到達していれば買い増さない", () => {
     // ETH 目標 = 63,000 × 0.7 = ¥44,100。0.15 ETH = ¥45,000 で到達済み
     const state: CoreHoldingState = {
