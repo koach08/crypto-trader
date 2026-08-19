@@ -1,0 +1,357 @@
+/**
+ * コア保有 (売らない長期枠)。
+ *
+ * 【なぜ必要か】2026-08-19 の実測。
+ * 日足トレンドゲート (trend-gate.ts) を入れた結果、BTC/ETH/XRP の 3 ペア全てが
+ * `buyAllowed=false` となり、残高 ¥63,015 が**全額 JPY のまま**動かなくなった。
+ * これは設計どおりの待機であって不具合ではない。ただし bitFlyer に置いた JPY は
+ * 銀行に出金しない限り生活資金として使えるわけでもなく、「上昇トレンドが来るまで
+ * 何ヶ月でも遊ばせる」のは本人の資金用途と噛み合っていない。
+ *
+ * そこで資金を 2 つに分ける。
+ *   - コア枠   : 目標比率まで暗号資産で持ち続ける。売らない。トレンドゲートの対象外。
+ *   - 戦術枠   : 従来どおり MA ルール (ENTRY_MODE=trend) が売買する。
+ *
+ * コア枠は「上がるまで待つ」のではなく「上がる時に持っていなかった」を防ぐための枠なので、
+ * SL も TP も置かない。代わりに一括で入れず分割して積む (下降局面での一括投入を避ける)。
+ *
+ * ⚠️ これは勝ちを保証する仕組みではない。下落局面ではそのまま含み損になる。
+ *    バックテストで確認できているのは「現行の逆張りより確実にマシ」までであって、
+ *    コア保有そのものの期待値を検証したわけではない。ドローダウンは受け入れる前提の枠。
+ */
+
+export interface CoreHoldConfig {
+  enabled: boolean;
+  /** 総資産 (JPY + 暗号資産評価額) に対するコア枠の目標比率 0-1 */
+  targetPct: number;
+  /** ペアごとの比重。合計 1 に正規化して使う */
+  weights: Record<string, number>;
+  /** 目標額を何回に分けて積むか */
+  tranches: number;
+  /** トランシェ間の最小間隔 (時間)。同じペアを連続で買わないための間隔 */
+  intervalHours: number;
+  /** これ未満の発注はしない (取引所の最小注文とは別に、手数料負けを避ける下限) */
+  minTrancheJPY: number;
+}
+
+export interface CoreLot {
+  at: string;
+  pair: string;
+  amountBase: number;
+  priceJPY: number;
+  costJPY: number;
+}
+
+export interface CoreHoldingState {
+  lots: CoreLot[];
+  /** pair → 直近の買付時刻 (ISO) */
+  lastBuyAt: Record<string, string>;
+}
+
+export const EMPTY_CORE_STATE: CoreHoldingState = { lots: [], lastBuyAt: {} };
+
+/** 既定の比重。長期で持ち切る枠なので時価総額上位 2 つに絞る。XRP は戦術枠のみ。 */
+const DEFAULT_WEIGHTS: Record<string, number> = { "BTC/JPY": 0.6, "ETH/JPY": 0.4 };
+
+function parseWeights(raw: string | undefined): Record<string, number> {
+  if (!raw) return { ...DEFAULT_WEIGHTS };
+  const out: Record<string, number> = {};
+  for (const part of raw.split(",")) {
+    const [pair, w] = part.split(":").map((s) => s.trim());
+    const num = Number(w);
+    if (pair && Number.isFinite(num) && num > 0) out[pair] = num;
+  }
+  return Object.keys(out).length > 0 ? out : { ...DEFAULT_WEIGHTS };
+}
+
+export type CoreEnv = Record<string, string | undefined>;
+
+export function loadCoreConfig(env: CoreEnv = process.env): CoreHoldConfig {
+  const pct = Number(env.CORE_HOLD_PCT ?? "0.7");
+  return {
+    // 実弾が動くので既定は OFF。Railway 側で明示的に true にして初めて積み始める。
+    enabled: env.CORE_HOLD_ENABLED === "true",
+    targetPct: Number.isFinite(pct) ? Math.min(Math.max(pct, 0), 0.95) : 0.7,
+    weights: parseWeights(env.CORE_HOLD_WEIGHTS),
+    tranches: Math.max(1, Number(env.CORE_HOLD_TRANCHES ?? "4")),
+    intervalHours: Math.max(0, Number(env.CORE_HOLD_INTERVAL_HOURS ?? "24")),
+    minTrancheJPY: Math.max(0, Number(env.CORE_HOLD_MIN_JPY ?? "3000")),
+  };
+}
+
+/** コアとして確保している数量。売却経路はこの分を必ず残す。 */
+export function coreAmount(state: CoreHoldingState, pair: string): number {
+  return state.lots
+    .filter((l) => l.pair === pair)
+    .reduce((s, l) => s + l.amountBase, 0);
+}
+
+export function coreCostJPY(state: CoreHoldingState, pair: string): number {
+  return state.lots
+    .filter((l) => l.pair === pair)
+    .reduce((s, l) => s + l.costJPY, 0);
+}
+
+/** 正規化した比重。設定に無いペアは 0。 */
+export function normalizedWeights(cfg: CoreHoldConfig): Record<string, number> {
+  const total = Object.values(cfg.weights).reduce((s, w) => s + w, 0);
+  if (total <= 0) return {};
+  const out: Record<string, number> = {};
+  for (const [pair, w] of Object.entries(cfg.weights)) out[pair] = w / total;
+  return out;
+}
+
+export function computeCoreTargetsJPY(navJPY: number, cfg: CoreHoldConfig): Record<string, number> {
+  const weights = normalizedWeights(cfg);
+  const budget = Math.max(0, navJPY) * cfg.targetPct;
+  const out: Record<string, number> = {};
+  for (const [pair, w] of Object.entries(weights)) out[pair] = budget * w;
+  return out;
+}
+
+export interface CoreBuyPlan {
+  pair: string;
+  amountJPY: number;
+  targetJPY: number;
+  currentJPY: number;
+  shortfallJPY: number;
+  reason: string;
+}
+
+export interface CoreSkip {
+  reason: string;
+  /** 参考情報。画面に「なぜ買っていないか」を出すために使う */
+  detail?: Record<string, number | string>;
+}
+
+export interface PlanCoreBuyInput {
+  navJPY: number;
+  jpyFree: number;
+  cfg: CoreHoldConfig;
+  state: CoreHoldingState;
+  /** pair → 現在値 */
+  prices: Record<string, number>;
+  /** pair → 取引所が受け付ける最小注文 JPY (bitFlyer は BTC 0.001 = 約 ¥11,000) */
+  minOrderJPY: Record<string, number>;
+  nowMs: number;
+}
+
+/**
+ * 次に積むべき 1 件を返す。1 サイクルにつき最大 1 件しか出さない
+ * (同じサイクルで複数ペアに連続発注して現金を一気に使い切らないため)。
+ *
+ * 選び方は「目標に対する充足率が最も低いペア」。金額ではなく率で見るので、
+ * 比重どおりに揃っていく。
+ */
+export function planCoreBuy(input: PlanCoreBuyInput): { plan: CoreBuyPlan | null; skip: CoreSkip | null } {
+  const { navJPY, jpyFree, cfg, state, prices, minOrderJPY, nowMs } = input;
+
+  if (!cfg.enabled) return { plan: null, skip: { reason: "コア保有は無効 (CORE_HOLD_ENABLED != true)" } };
+  if (cfg.targetPct <= 0) return { plan: null, skip: { reason: "目標比率が 0" } };
+  if (navJPY <= 0) return { plan: null, skip: { reason: "総資産を評価できない" } };
+
+  const rawTargets = computeCoreTargetsJPY(navJPY, cfg);
+
+  // 【端数の再配分】bitFlyer の BTC は 0.001 刻み (≒ ¥11,000) なので、
+  // 目標額が最小注文の整数倍から外れると端数が永久に埋まらない。
+  // 例: 目標 ¥26,516 → ¥11,265 × 2 = ¥22,530 まで積んだ後、残り ¥3,986 は
+  // 最小注文未満で発注できず、「70% 指定なのに 64% で止まる」ことになる。
+  // 刻めない端数は他のペアの目標に回して、指定した比率まで積み切れるようにする。
+  const targets: Record<string, number> = { ...rawTargets };
+  const stuck: string[] = [];
+  const receivers: string[] = [];
+  for (const [pair, targetJPY] of Object.entries(rawTargets)) {
+    const price = prices[pair];
+    if (!price || price <= 0) continue;
+    const remaining = targetJPY - coreAmount(state, pair) * price;
+    const minOrder = Math.max(minOrderJPY[pair] ?? 0, cfg.minTrancheJPY);
+    if (remaining > targetJPY * 0.05 && remaining < minOrder) stuck.push(pair);
+    else if (remaining >= minOrder) receivers.push(pair);
+  }
+  if (stuck.length > 0 && receivers.length > 0) {
+    let spill = 0;
+    for (const pair of stuck) {
+      const price = prices[pair];
+      spill += targets[pair] - coreAmount(state, pair) * price;
+      targets[pair] = coreAmount(state, pair) * price; // これ以上は刻めない = 到達扱い
+    }
+    const share = spill / receivers.length;
+    for (const pair of receivers) targets[pair] += share;
+  }
+
+  const candidates: Array<CoreBuyPlan & { fillRatio: number }> = [];
+
+  for (const [pair, targetJPY] of Object.entries(targets)) {
+    const price = prices[pair];
+    if (!price || price <= 0) continue;
+
+    const currentJPY = coreAmount(state, pair) * price;
+    const shortfallJPY = targetJPY - currentJPY;
+    // 5% の許容幅。価格変動のたびに端数を買い足さない。
+    if (shortfallJPY <= targetJPY * 0.05) continue;
+
+    const last = state.lastBuyAt[pair];
+    if (last && cfg.intervalHours > 0) {
+      const elapsedH = (nowMs - Date.parse(last)) / 3_600_000;
+      if (Number.isFinite(elapsedH) && elapsedH < cfg.intervalHours) continue;
+    }
+
+    // トランシェ額。取引所の最小注文を下回るなら最小注文まで引き上げる
+    // (BTC は 0.001 単位 = 約 ¥11,000 なので、4 分割だと 1 回では発注できない)。
+    const minOrder = minOrderJPY[pair] ?? 0;
+    let amountJPY = Math.max(targetJPY / cfg.tranches, minOrder, cfg.minTrancheJPY);
+    // 目標を超えて買わない。ただし最小注文を割るなら見送り。
+    amountJPY = Math.min(amountJPY, shortfallJPY);
+    if (amountJPY < Math.max(minOrder, cfg.minTrancheJPY)) continue;
+    if (amountJPY > jpyFree) continue;
+
+    candidates.push({
+      pair,
+      amountJPY: Math.floor(amountJPY),
+      targetJPY,
+      currentJPY,
+      shortfallJPY,
+      fillRatio: targetJPY > 0 ? currentJPY / targetJPY : 1,
+      reason: `[コア積立] 目標 ¥${Math.round(targetJPY).toLocaleString()} に対し現在 ¥${Math.round(currentJPY).toLocaleString()}`,
+    });
+  }
+
+  if (candidates.length === 0) {
+    const totalTarget = Object.values(targets).reduce((s, v) => s + v, 0);
+    const totalCurrent = Object.entries(targets).reduce(
+      (s, [pair]) => s + coreAmount(state, pair) * (prices[pair] ?? 0),
+      0
+    );
+    const filled = totalTarget > 0 && totalCurrent >= totalTarget * 0.95;
+    return {
+      plan: null,
+      skip: {
+        reason: filled ? "コア目標に到達済み" : "今サイクルで積める候補なし (間隔待ち / 現金不足 / 最小注文未満)",
+        detail: { 目標JPY: Math.round(totalTarget), 現在JPY: Math.round(totalCurrent), 現金JPY: Math.round(jpyFree) },
+      },
+    };
+  }
+
+  candidates.sort((a, b) => a.fillRatio - b.fillRatio);
+  const { fillRatio: _fillRatio, ...plan } = candidates[0];
+  return { plan, skip: null };
+}
+
+export function applyCoreFill(
+  state: CoreHoldingState,
+  fill: { pair: string; amountBase: number; priceJPY: number; costJPY: number; at: string }
+): CoreHoldingState {
+  return {
+    lots: [...state.lots, { ...fill }],
+    lastBuyAt: { ...state.lastBuyAt, [fill.pair]: fill.at },
+  };
+}
+
+/**
+ * 売却可能数量。取引所の実残高からコア確保分を引く。
+ *
+ * 【重要】ここを通さずに `realPosition.free` をそのまま売ると、コア枠ごと投げ売る。
+ * 過去に「判断ロジックだけ直して発注経路が素通り」を踏んでいるので、
+ * 売却系は全てこの関数を経由させること。
+ */
+export function sellableAmount(state: CoreHoldingState, pair: string, exchangeFree: number): number {
+  return Math.max(0, exchangeFree - coreAmount(state, pair));
+}
+
+export interface CoreSummaryRow {
+  pair: string;
+  amountBase: number;
+  costJPY: number;
+  valueJPY: number;
+  targetJPY: number;
+  fillPercent: number;
+  unrealizedPnLJPY: number;
+  unrealizedPnLPercent: number;
+}
+
+export function summarizeCore(
+  state: CoreHoldingState,
+  cfg: CoreHoldConfig,
+  navJPY: number,
+  prices: Record<string, number>
+): CoreSummaryRow[] {
+  const targets = computeCoreTargetsJPY(navJPY, cfg);
+  const pairs = new Set([...Object.keys(targets), ...state.lots.map((l) => l.pair)]);
+  return Array.from(pairs).map((pair) => {
+    const amountBase = coreAmount(state, pair);
+    const costJPY = coreCostJPY(state, pair);
+    const price = prices[pair] ?? 0;
+    const valueJPY = amountBase * price;
+    const targetJPY = targets[pair] ?? 0;
+    const pnl = valueJPY > 0 ? valueJPY - costJPY : 0;
+    return {
+      pair,
+      amountBase,
+      costJPY,
+      valueJPY,
+      targetJPY,
+      fillPercent: targetJPY > 0 ? Math.min(100, (valueJPY / targetJPY) * 100) : 0,
+      unrealizedPnLJPY: pnl,
+      unrealizedPnLPercent: costJPY > 0 ? (pnl / costJPY) * 100 : 0,
+    };
+  });
+}
+
+/**
+ * 台帳を取引所の実残高に合わせる。
+ *
+ * 【なぜ必要か】コア台帳はアプリ側の記録でしかない。本人が bitFlyer の画面から
+ * 直接売ってしまえば、台帳だけが残る。その状態を放置すると `sellableAmount` が
+ * 「実残高 - 過大なコア」= 0 を返し続け、**そのペアが二度と売れなくなる**。
+ * 実残高を上限として按分で切り詰めることで、取得原価の比率を保ったまま整合させる。
+ */
+export function clampCoreToBalance(
+  state: CoreHoldingState,
+  pair: string,
+  exchangeTotal: number
+): { state: CoreHoldingState; adjusted: boolean } {
+  const held = coreAmount(state, pair);
+  if (held <= exchangeTotal + 1e-12) return { state, adjusted: false };
+
+  const ratio = held > 0 ? Math.max(0, exchangeTotal) / held : 0;
+  const lots = state.lots
+    .map((l) =>
+      l.pair === pair
+        ? { ...l, amountBase: l.amountBase * ratio, costJPY: l.costJPY * ratio }
+        : l
+    )
+    .filter((l) => l.amountBase > 1e-12);
+  return { state: { ...state, lots }, adjusted: true };
+}
+
+/**
+ * 画面から変更した設定 (data/core-config.json) を env 既定に重ねる。
+ *
+ * Railway の環境変数をいじらないと比率も ON/OFF も変えられない状態は、
+ * 本人が「今すぐ現金を止めたい / 増やしたい」と思ったときに操作できない。
+ * 保存された値があればそちらを優先する。
+ */
+export type CoreConfigOverride = Partial<Pick<
+  CoreHoldConfig,
+  "enabled" | "targetPct" | "weights" | "tranches" | "intervalHours" | "minTrancheJPY"
+>>;
+
+export function mergeCoreConfig(base: CoreHoldConfig, override: CoreConfigOverride | null | undefined): CoreHoldConfig {
+  if (!override) return base;
+  const merged: CoreHoldConfig = { ...base };
+  if (typeof override.enabled === "boolean") merged.enabled = override.enabled;
+  if (typeof override.targetPct === "number" && Number.isFinite(override.targetPct)) {
+    merged.targetPct = Math.min(Math.max(override.targetPct, 0), 0.95);
+  }
+  if (override.weights && Object.keys(override.weights).length > 0) {
+    const cleaned: Record<string, number> = {};
+    for (const [pair, w] of Object.entries(override.weights)) {
+      if (Number.isFinite(w) && w > 0) cleaned[pair] = w;
+    }
+    if (Object.keys(cleaned).length > 0) merged.weights = cleaned;
+  }
+  if (typeof override.tranches === "number" && override.tranches >= 1) merged.tranches = Math.floor(override.tranches);
+  if (typeof override.intervalHours === "number" && override.intervalHours >= 0) merged.intervalHours = override.intervalHours;
+  if (typeof override.minTrancheJPY === "number" && override.minTrancheJPY >= 0) merged.minTrancheJPY = override.minTrancheJPY;
+  return merged;
+}

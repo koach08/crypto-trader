@@ -232,11 +232,12 @@ export const ENGINE_CONFIG: Record<EngineId, {
 };
 
 // === bitFlyer Pairs ===
+// ⚠️ SOL/JPY は BitFlyer に存在しない (ccxt が BadSymbol を返す)。
+// 入れておくとダッシュボードが 15 秒ごとに ticker で 500 を出し続ける。足さないこと。
 export const BITFLYER_PAIRS = [
   "BTC/JPY",
   "ETH/JPY",
   "XRP/JPY",
-  "SOL/JPY",
   "XLM/JPY",
   "MONA/JPY",
 ] as const;

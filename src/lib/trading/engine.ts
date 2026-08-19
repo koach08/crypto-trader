@@ -28,6 +28,22 @@ import { getActiveLessons, matchLessons, rebuildLessonsFromReflections } from ".
 import { computeAllocations, fractionalKelly, type ForwardSignal, type PairAllocation } from "./capital-allocator";
 import { evaluateTier } from "./capital-policy";
 import { evaluateKillSwitch, isKillSwitchActive } from "./kill-switch";
+import { evaluateTrend, decideByTrend, type TrendState } from "./trend-gate";
+import {
+  loadCoreConfig,
+  planCoreBuy,
+  applyCoreFill,
+  clampCoreToBalance,
+  mergeCoreConfig,
+  sellableAmount as coreSellableAmount,
+  coreAmount,
+  summarizeCore,
+  EMPTY_CORE_STATE,
+  type CoreHoldingState,
+  type CoreSkip,
+  type CoreHoldConfig,
+  type CoreConfigOverride,
+} from "./core-holding";
 import { sendAlert } from "../alerts";
 import { checkOpportunities } from "../opportunity-detector";
 import { shouldFireCommentary, runDailyCommentary } from "../ai-commentary";
@@ -83,6 +99,17 @@ const PAPER_MAX_POSITION_JPY = 200_000;      // ペアあたり最大ポジシ�
 
 // ライブモード設定
 const LIVE_MIN_TRADE_JPY = 3_000;            // 最小取引額 ¥3,000 (旧 ¥1,000 だと手数料負けで判断データ取れず)
+// 日足トレンドゲート。既定 ON。比較検証したいときだけ TREND_GATE=false で切る
+const TREND_GATE_ENABLED = process.env.TREND_GATE !== "false";
+// エントリー判断の出所。"trend" = 日足 MA ルール (既定)、"quant" = 旧クオンツ判断
+const ENTRY_MODE = process.env.ENTRY_MODE === "quant" ? "quant" : "trend";
+// MA ルールの判断は確信度で強弱を測らないので、実行閾値を通る固定値を使う
+const TREND_ENTRY_CONFIDENCE = 75;
+// バックテストの C+SL8 と同じ: 保険の損切り -8%、利確は事実上使わずトレンド割れで撤退
+const TREND_ENTRY_SL_PERCENT = Number(process.env.TREND_ENTRY_SL_PERCENT ?? "8");
+const TREND_ENTRY_TP_PERCENT = Number(process.env.TREND_ENTRY_TP_PERCENT ?? "30");
+// 売買が発生しないサイクルで AI 照会を省く (課金抑制)。SKIP_AI_WHEN_IDLE=false で無効化
+const SKIP_AI_WHEN_IDLE = process.env.SKIP_AI_WHEN_IDLE !== "false";
 const LIVE_BASE_TRADE_JPY = Number(process.env.LIVE_BASE_TRADE_JPY || 15000); // 1回あたり目安サイズ（ユーザ設定可能）
 const LIVE_MAX_POSITION_JPY = Math.max(30000, LIVE_BASE_TRADE_JPY * 2); // ペアあたり最大ポジション
 // 確信度閾値: 50 (2026-05-30 再設定、user 指示「自由に取引しろ」)
@@ -316,6 +343,27 @@ interface EngineState {
   pairAllocations: Map<string, number>;
   /** 直近の配分計算結果 (dashboard 表示用) */
   lastAllocationDetails: PairAllocation[];
+  /**
+   * ペアごとの直近の日足トレンド判定 (dashboard 表示用)。
+   * 下降トレンド中は新規 BUY を出さない設計なので、「取引していない」が
+   * 不具合ではなく判断の結果だと画面から分かるようにする。
+   */
+  trendByPair: Map<string, TrendState & { at: string }>;
+  /**
+   * ペアごとの直近価格。ポジション表示とリスク計算に使う。
+   * これが無かったため getPositions() が常に currentPrice=0 / valueJPY=0 を返し、
+   * 画面上のポジションが「評価額 ¥0」に見えていた (リスク計算も 0 で走っていた)。
+   */
+  lastPriceByPair: Map<string, { price: number; at: string }>;
+  /**
+   * コア保有 (売らない長期枠)。トレンドゲートで新規 BUY が止まっている間も
+   * ここだけは目標比率まで積む。売却経路は必ずこの数量を残す。
+   */
+  coreHolding: CoreHoldingState;
+  /** 画面から変更したコア設定 (env 既定に重ねる) */
+  coreConfigOverride: CoreConfigOverride | null;
+  /** 直近のコア積立判断 (画面に「なぜ積んでいないか」を出すため) */
+  lastCoreSkip: (CoreSkip & { at: string }) | null;
 }
 
 const state: EngineState = {
@@ -336,7 +384,27 @@ const state: EngineState = {
   cooldownUntil: new Map(),
   pairAllocations: new Map(),
   lastAllocationDetails: [],
+  trendByPair: new Map(),
+  lastPriceByPair: new Map(),
+  coreHolding: { lots: [], lastBuyAt: {} },
+  coreConfigOverride: null,
+  lastCoreSkip: null,
 };
+
+/** env 既定 + 画面で保存した設定。コア関連は必ずここから読む。 */
+function currentCoreConfig(): CoreHoldConfig {
+  return mergeCoreConfig(loadCoreConfig(), state.coreConfigOverride);
+}
+
+/**
+ * 売却可能数量。取引所の実残高からコア確保分を必ず差し引く。
+ *
+ * ⚠️ 売却系は全部ここを通すこと。`realPosition.free` を直接売ると長期枠ごと投げ売る。
+ * (過去に「判断ロジックだけ直して発注経路が素通り」を踏んでいる)
+ */
+function sellableFree(pair: string, exchangeFree: number): number {
+  return coreSellableAmount(state.coreHolding, pair, exchangeFree);
+}
 
 // 連敗ガード: SL や負け確定後、同じペアを一定時間 BUY 禁止 (リベンジ買い防止)
 // 損失額に比例: 小さい損 = 短い cooldown (scalp 対応)、大きい損 = 長い cooldown
@@ -546,6 +614,7 @@ async function monitorPositionsFast(): Promise<void> {
     try {
       const ticker = await exchange.getTicker(pair);
       if (!ticker?.price || ticker.price <= 0) continue;
+      state.lastPriceByPair.set(pair, { price: ticker.price, at: new Date().toISOString() });
 
       const changePercent = ((ticker.price - livePos.entryPrice) / livePos.entryPrice) * 100;
       let triggerType: "stop_loss" | "take_profit" | null = null;
@@ -560,7 +629,8 @@ async function monitorPositionsFast(): Promise<void> {
 
       const balances = await exchange.getBalance();
       const base = pair.split("/")[0];
-      const free = balances.find(b => b.currency === base)?.free ?? 0;
+      // コア枠を除いた売却可能数量。長期枠は高速監視の SL/TP でも売らない。
+      const free = sellableFree(pair, balances.find(b => b.currency === base)?.free ?? 0);
       if (!isSellableAmount(exchange, pair, free, ticker.price)) continue;
 
       console.log(`[${pair}] 高速監視 ${triggerType} 検知: ${changePercent.toFixed(2)}% (SL ${livePos.stopLossPercent}% / TP ${livePos.takeProfitPercent}%)`);
@@ -610,6 +680,15 @@ async function ensureDataLoaded(): Promise<void> {
       for (const [pair, until] of savedCooldowns) {
         if (until > now) state.cooldownUntil.set(pair, until);
       }
+      // コア保有 (売らない長期枠) を復元。ここが空だと全量が売却可能扱いになるので、
+      // 再起動時に必ず読み直す。
+      state.coreConfigOverride = await loadData<CoreConfigOverride | null>("core-config", null);
+      state.coreHolding = await loadData<CoreHoldingState>("core-holding", EMPTY_CORE_STATE);
+      if (!state.coreHolding?.lots) state.coreHolding = { lots: [], lastBuyAt: {} };
+      const coreLots = state.coreHolding.lots.length;
+      if (coreLots > 0) {
+        console.log(`[core] コア保有 ${coreLots} ロット復元`);
+      }
     })();
   }
   return _initPromise;
@@ -650,7 +729,8 @@ async function runCycleForPair(pair: string): Promise<void> {
     exchange.getTicker(pair),
     exchange.getOHLCV(pair, "1h", 100),
     exchange.getOHLCV(pair, "4h", 100).catch(() => emptyBars),
-    exchange.getOHLCV(pair, "1d", 100).catch(() => emptyBars),
+    // 日足は 250 本。MA200 を計算してトレンドゲート (evaluateTrend) に使う
+    exchange.getOHLCV(pair, "1d", 250).catch(() => emptyBars),
     exchange.getBalance(),
     exchange.getPosition(pair),
     getFearGreedIndex(),
@@ -662,6 +742,20 @@ async function runCycleForPair(pair: string): Promise<void> {
     console.log(`[${pair}] bars 不足 (${bars?.length ?? 0}本)、サイクルスキップ`);
     return;
   }
+
+  if (ticker?.price > 0) {
+    state.lastPriceByPair.set(pair, { price: ticker.price, at: new Date().toISOString() });
+  }
+
+  // 日足トレンドは毎サイクル評価して保持する。BUY ゲートの判定と、
+  // 「なぜ取引していないのか」を画面に出すための両方に使う。
+  const dailyTrend = evaluateTrend(dailyBars);
+  if (dailyTrend) {
+    state.trendByPair.set(pair, { ...dailyTrend, at: new Date().toISOString() });
+  } else {
+    state.trendByPair.delete(pair);
+  }
+  console.log(`[${pair}] 日足トレンド: ${dailyTrend ? `${dailyTrend.upTrend ? "上昇" : "上昇でない"} (${dailyTrend.label})` : "判定不能"}`);
 
   // === 緊急ロスカット番兵: pipeline 前に独立判定 ===
   // AI 判断・規律フィルタ・確信度閾値とは無関係に、含み損が閾値超えたら強制売却
@@ -726,9 +820,33 @@ async function runCycleForPair(pair: string): Promise<void> {
   });
 
   // Run AI - full consensus for borderline signals, single engine otherwise
+  //
+  // 【コスト】MA ルール運用中 (ENTRY_MODE=trend) は、入る/出るの判断に AI を使わない。
+  // それでも毎サイクル 5 ペア分の LLM を呼ぶと、判断に使わない出力に課金し続けることになる
+  // (1 サイクル 5-15 回 × 24 サイクル/日)。運用コストはそのまま損益を削る。
+  // そこで「MA ルールの結論が HOLD = 何もしない」サイクルでは AI 照会を省く。
+  // 実際に売買するサイクルでは従来どおり呼び、監査ログと学習の材料を残す。
+  // コア枠は「売らない長期枠」なので、MA ルールの保有判定には数えない。
+  // 数えるとコアを積んだ瞬間に「保有あり」となり、戦術枠が新規に買えなくなる。
+  const tacticalAmount = Math.max(0, position.amount - coreAmount(state.coreHolding, pair));
+  const maPreview = ENTRY_MODE === "trend"
+    ? decideByTrend(dailyTrend, tacticalAmount * ticker.price >= 500)
+    : null;
+  const skipAI = maPreview !== null && maPreview.action === "HOLD" && SKIP_AI_WHEN_IDLE;
+
   const useFull = signal.score >= -1 && signal.score <= 1; // borderline
   let decision: AIDecision;
-  if (useFull) {
+  if (skipAI) {
+    const stub: import("../types").EngineResult = {
+      engine: "claude",
+      status: "success",
+      action: "HOLD",
+      confidence: 50,
+      summary: "MA ルール運用中かつ売買不要のサイクルのため AI 照会を省略 (課金抑制)",
+      duration: 0,
+    };
+    decision = buildConsensus([stub], pair, "bitflyer", signal.score, fearGreed.value, state.paperMode);
+  } else if (useFull) {
     const results = await runAllEngines(prompt, "STANDARD");
     decision = buildConsensus(results, pair, "bitflyer", signal.score, fearGreed.value, state.paperMode);
   } else {
@@ -898,8 +1016,45 @@ async function runCycleForPair(pair: string): Promise<void> {
   // 勝ち取引の率を上げるため、期待値マイナスの取引を排除する
   const disciplineNotes: string[] = [];
 
+  // === エントリー判断: MA ルール (ENTRY_MODE=trend、既定) ===
+  //
+  // 【根拠】2026-08-17 のバックテスト (3ペア × 3期間 = 9条件、手数料+スリッページ込み)。
+  //   クオンツ + AI + F&G 一式 (V0)          平均 -17.5%  … 9条件すべてマイナス
+  //   日足 MA50/200 だけ + SL8% (C+SL8)      平均 +23.7%
+  // クオンツ側のエントリー信号にはエッジが確認できなかった (F&G 条件を外して
+  // 順張り可にした V3 も -2.6%)。逆に MA ルールだけは 9条件中 6条件で buy&hold にも勝った。
+  // したがって**入る/出るの判断は MA ルールに任せ**、クオンツ・AI・F&G は
+  // エントリー判断から降ろす。学習系・監査ログ・リスクゲートはそのまま動かす。
+  //
+  // ⚠️ 「確実に勝つ」ものではない。同じ 9条件で最悪の年は -26.9%、
+  //    MA を 30/150 にすると平均 -9.5% まで落ちる。頑健なエッジではなく
+  //    「現行より確実にマシ」という位置づけ。だから SL とキルスイッチは残す。
+  //
+  // ENTRY_MODE=quant で元のクオンツ判断に戻せる。
+  // 保有判定は取引所の実残高で見る (追跡漏れがあっても二重に買わないため)。
+  // ただしダスト (< ¥500) は「保有」に数えない。数えると売れない残骸のせいで
+  // そのペアが永久に買えなくなる (過去に ¥0.17 の XRP 残骸が発生している)。
+  const holdsPosition = state.paperMode
+    ? (state.paperTrader.getPosition(pair)?.amount ?? 0) > 0
+    : tacticalAmount * ticker.price >= 500;
+  const trendEntryOverride = ENTRY_MODE === "trend";
+  if (trendEntryOverride) {
+    const td = decideByTrend(dailyTrend, holdsPosition);
+    decision.action = td.action;
+    decision.reason = td.reason;
+    if (td.action !== "HOLD") {
+      decision.confidence = TREND_ENTRY_CONFIDENCE;
+    }
+    if (td.action === "BUY") {
+      decision.suggestedStopLossPercent = TREND_ENTRY_SL_PERCENT;
+      decision.suggestedTakeProfitPercent = TREND_ENTRY_TP_PERCENT;
+    }
+    disciplineNotes.push("[エントリー] MA ルール判断 (クオンツ/F&G/EV は参照のみ)");
+  }
+
   // 1. 信頼度キャリブレーション: 過去の判断と実績から確信度を補正
-  if (decision.action !== "HOLD") {
+  // (MA ルール判断のときは確信度が判断根拠ではないので補正しない)
+  if (decision.action !== "HOLD" && !trendEntryOverride) {
     const allAudits = await getAudits(500).catch(() => []);
     const cal = calibrateConfidence(allAudits, decision.confidence);
     if (cal.calibrated !== cal.raw) {
@@ -908,12 +1063,42 @@ async function runCycleForPair(pair: string): Promise<void> {
     }
   }
 
+  // 1.2. 日足トレンドゲート: 上位トレンドに逆らう新規 BUY を止める
+  //
+  // 【根拠】2026-08-17 のバックテスト実測 (3ペア × 3期間 = 9条件)。
+  // 現行のクオンツ + F&G 逆張りは 9条件すべてマイナス (平均 -17.5%)、
+  // BTC/JPY 直近1年は 7戦0勝7敗。エントリー理由は毎回「F&G 恐怖 → 逆張り買い」で、
+  // 下降トレンドで落ちるナイフを掴み続けていた。
+  // 同条件で「日足 MA50/200 が上向きの時だけロング」した対照群は平均 +24.1%。
+  // ここは方向を直すゲートであって、サイズや TP/SL には触らない。
+  //
+  // TREND_GATE=false で無効化できる (検証・比較用)。
+  // (MA ルール判断のときは同じトレンドで既に決めているので二重判定しない)
+  if (decision.action === "BUY" && TREND_GATE_ENABLED && !trendEntryOverride) {
+    const trend = dailyTrend;
+    if (!trend) {
+      // 日足が取れないときは判断材料が無い。既定は「見送り」で資金を守る。
+      decision.action = "HOLD";
+      decision.confidence = Math.min(decision.confidence, 40);
+      disciplineNotes.push(`[トレンド] 日足バー不足 (${dailyBars?.length ?? 0}本) で判定不能 → BUY 見送り`);
+    } else if (!trend.upTrend) {
+      decision.action = "HOLD";
+      decision.confidence = Math.min(decision.confidence, 40);
+      disciplineNotes.push(`[トレンド] 日足が上昇トレンドでない (${trend.label}) → BUY 見送り`);
+    } else {
+      disciplineNotes.push(`[トレンド] 日足 上昇トレンド (${trend.label})${trend.degraded ? " ※簡易判定" : ""}`);
+    }
+  }
+
   // 1.5. F&G フィルタ 再有効化 (2026-05-30, user 指示「全 feature 動かす」)
   // BUY 時は Fear 帯 (≤35) を要求、SELL 時は Greed 帯 (≥65) を要求
+  // ⚠️ この F&G 条件こそが「BUY には恐怖 (≤35) が必要」= 逆張り専用機の正体だった。
+  //    上げ相場の F&G は 50-75 なので、上昇トレンドでは 1 本も買えなくなる。
+  //    MA ルール判断のときは適用しない (参照として理由だけ残す)。
   if (decision.action !== "HOLD") {
     const sentimentCheck = checkSentimentEdge(fearGreed.value, decision.action);
-    disciplineNotes.push(`[F&G] ${sentimentCheck.reason}`);
-    if (!sentimentCheck.passed) {
+    disciplineNotes.push(`[F&G] ${sentimentCheck.reason}${trendEntryOverride ? " (MAルールのため不適用)" : ""}`);
+    if (!sentimentCheck.passed && !trendEntryOverride) {
       decision.action = "HOLD";
       decision.confidence = Math.min(decision.confidence, 40);
       disciplineNotes.push(`[F&G] フィルタで HOLD 化`);
@@ -924,7 +1109,7 @@ async function runCycleForPair(pair: string): Promise<void> {
   //    MTF は警告のみで block しない (旧設計: 下降トレンド逆張りを全部潰してた).
   //    判断は score 側 (Quant + Tech) に任せ、MTF は disciplineNotes に記録するのみ.
   //    例外: confidence 50% 未満 + MTF 不一致 = 弱い判断 → HOLD (両方妥当な場合のみ却下)
-  if (decision.action !== "HOLD") {
+  if (decision.action !== "HOLD" && !trendEntryOverride) {
     const mtf = checkMTFAlignment(bars, decision.action);
     disciplineNotes.push(`[MTF] ${mtf.reason}`);
     if (!mtf.aligned && decision.confidence < 50 && !bypassMtfCheck) {
@@ -939,7 +1124,9 @@ async function runCycleForPair(pair: string): Promise<void> {
   }
 
   // 3. 期待値ゲート: 手数料を引いてもプラスEVか確認
-  if (decision.action !== "HOLD") {
+  // (MA ルールは勝率推定を前提にしないので適用しない。EV 式が要求する
+  //  「確信度=勝率」という仮定が成り立たないため、掛けると常に落ちてしまう)
+  if (decision.action !== "HOLD" && !trendEntryOverride) {
     const tp = decision.suggestedTakeProfitPercent ?? 3.0;
     const sl = decision.suggestedStopLossPercent ?? 2.0;
     const edge = checkEdge(decision.confidence, tp, sl);
@@ -1065,7 +1252,12 @@ async function runCycleForPair(pair: string): Promise<void> {
     const liveExchange = getExchange();
     const realPosition = await liveExchange.getPosition(pair);
     let livePos = state.livePositions.get(pair);
-    const currentPositionJPY = realPosition.amount * ticker.price;
+    // コア枠 (売らない長期枠) を除いた、戦術枠として売却できる数量。
+    // 以降の SELL / SL / TP / PTP は全てこの値を使う。取引所残高をそのまま売ると
+    // 「上昇しないなら仮想通貨で持っておく」ために積んだ分まで投げてしまう。
+    const sellableNow = sellableFree(pair, realPosition.free);
+    const coreHeld = coreAmount(state.coreHolding, pair);
+    const currentPositionJPY = Math.max(0, realPosition.amount - coreHeld) * ticker.price;
 
     // 現サイクルの ATR を計算 (vol scaling / regime SL の根拠に使う)
     const atrValsForBuy = atrIndicator(
@@ -1096,7 +1288,18 @@ async function runCycleForPair(pair: string): Promise<void> {
 
     // 残高はあるが livePos が無い → BitFlyer 約定履歴から FIFO で真の avg を計算
     // (旧実装は ticker.price を fake entry にしていて、TP/SL が経済実態と乖離してた)
-    if (!livePos && realPosition.amount > 0 && ticker.price > 0) {
+    // ⚠️ ダスト (最小注文額未満の残骸) では再構築しない。
+    //    起動時の reconcile が「dust → livePositions から除外」した直後に、ここが
+    //    同じサイクルで作り直していたため、¥58 や ¥46 の残骸が毎サイクル復活し、
+    //    画面には評価額 ¥0 のポジションとして並び、高速監視ループと緊急ロスカットが
+    //    毎分それをポーリングして「売却可能数量未満」を出し続けていた。
+    //    コアのみのペアも同様に戦術ポジションではないので作らない (sellableNow で控除済み)。
+    if (
+      !livePos &&
+      realPosition.amount > 0 &&
+      ticker.price > 0 &&
+      isSellableAmount(liveExchange, pair, sellableNow, ticker.price)
+    ) {
       let trueAvgPrice = ticker.price; // フォールバック
       try {
         if (liveExchange.fetchExecutions) {
@@ -1156,7 +1359,11 @@ async function runCycleForPair(pair: string): Promise<void> {
       console.log(`[${pair}] hold-only モード: 新規 BUY 停止 (${pairOverride?.reasoning ?? ""})`);
       return;
     }
-    if (decision.action === "BUY" && decision.confidence >= effectiveThreshold) {
+    // MA ルールの確信度 (75) は勝率推定ではなく固定値なので、閾値比較の対象にしない。
+    // retrospective の confidenceBonus は AI が自動で上げ下げしており、
+    // これが +26 以上になると閾値 (50+26=76) が 75 を超えて**買えなくなる**。
+    // 判断根拠が確信度でない以上、ここで足切りされるのは筋が通らない。
+    if (decision.action === "BUY" && (trendEntryOverride || decision.confidence >= effectiveThreshold)) {
       // Cooldown: 直近 SL や負け確定があったペアはしばらく BUY 禁止 (リベンジ買い防止)
       const cdUntil = state.cooldownUntil.get(pair) ?? 0;
       if (Date.now() < cdUntil) {
@@ -1190,7 +1397,13 @@ async function runCycleForPair(pair: string): Promise<void> {
       });
       // 適応ガードレール: 厳格化済 (volume<0.1x + BUY票0 等の極端時のみ block).
       // override や強い判断時は警告のみで続行.
-      if (adaptiveBlocks.length > 0 && !bypassMtfCheck && decision.confidence < 70) {
+      // MA ルール運用中は「警告」に留める。
+      // これらのガードレールは損切り符号バグ (2026-08-16 修正) の時期に出た損失から
+      // 学習されたもので、当時の「1時間後に必ず投げ売り」する挙動を前提にしている。
+      // 例: 「TRENDING_UP 局面が損失の 80% → 上昇トレンドの閾値を厳格化」。
+      // MA ルールは上昇トレンドでしか買わないので、これを効かせると自分の首を絞める。
+      // 学習は止めず (記録・表示は継続)、判断の拒否権だけ外す。
+      if (adaptiveBlocks.length > 0 && !bypassMtfCheck && decision.confidence < 70 && !trendEntryOverride) {
         console.log(`[${pair}] BUY見送り(REJECT): 適応ガードレール ${adaptiveBlocks.join(" / ")} | conf${decision.confidence}% < 70`);
         return;
       } else if (adaptiveBlocks.length > 0) {
@@ -1215,11 +1428,17 @@ async function runCycleForPair(pair: string): Promise<void> {
             activeLessons,
           );
           if (check.blocked) {
-            console.log(`[${pair}] BUY見送り: 学習ルール ${check.matched.length}件 hit`);
+            // 学習ルールも同じ理由で拒否権を外す (記録と表示は残す)。
+            // 現に active な `regime::BUY::TRENDING_UP` / `timing::BUY::TRENDING_UP` は
+            // 「quant/technical/intel の 2 つ以上が HOLD か SELL なら買うな」という条件で、
+            // クオンツの同意を必要としない MA ルールでは日常的に成立してしまう。
+            // ここを効かせたままだと、相場が上昇に転じた最初の買いが黙って消える。
+            const verb = trendEntryOverride ? "警告(続行)" : "見送り";
+            console.log(`[${pair}] BUY${verb}: 学習ルール ${check.matched.length}件 hit`);
             for (const m of check.matched) {
               console.log(`  → ${m.rule.slice(0, 80)} (${m.reason})`);
             }
-            return;
+            if (!trendEntryOverride) return;
           }
         }
       } catch (e) {
@@ -1314,13 +1533,27 @@ async function runCycleForPair(pair: string): Promise<void> {
           state.liveTrades.push(trade);
 
           // ポジション追跡 — style 分類 (SCALP/SWING/HOLD) で TP/SL + PTP 決定
-          const styleParams = classifyPositionStyle({
+          const classified = classifyPositionStyle({
             composite: scoringResult.audit.votes.reduce((s, v) => s + v.score * v.weight, 0),
             regime,
             fearGreed: fearGreed.value,
             mtf: mtfForPrompt,
             bottomOp,
           });
+          // MA ルールで入った玉は、バックテストで検証した設定 (SL -8% / TP 30% / 部分利確なし)
+          // をそのまま使う。style 分類に任せると SCALP 判定で SL 0.6% になり、
+          // 往復コスト 0.3% に対して薄すぎてノイズで刈られる。
+          // 「検証した設定」と「実際に執行される設定」がズレると検証の意味が無くなる。
+          const styleParams = trendEntryOverride
+            ? {
+                ...classified,
+                style: "HOLD" as const,
+                slPercent: decision.suggestedStopLossPercent ?? TREND_ENTRY_SL_PERCENT,
+                tpPercent: decision.suggestedTakeProfitPercent ?? TREND_ENTRY_TP_PERCENT,
+                partialTakeProfits: [],
+                reasoning: `MAルール建玉: SL/TP はバックテスト検証値を使用 (style 分類 ${classified.style} は不適用)`,
+              }
+            : classified;
           const existing = state.livePositions.get(pair);
           if (existing) {
             const totalAmount = existing.amount + order.amount;
@@ -1364,7 +1597,11 @@ async function runCycleForPair(pair: string): Promise<void> {
     // TP/SL/PTP/kill switch/緊急ロスカット は別経路で常時 fire 可。
     if (decision.action === "SELL" && livePos?.entryTimestamp) {
       const holdHours = (Date.now() - new Date(livePos.entryTimestamp).getTime()) / (60 * 60 * 1000);
-      const isTopOverride = decision.reason.startsWith("[MTF天井") || decision.reason.startsWith("[天井override");
+      // MA ルールの撤退は「相場がトレンドを割った」判断なので min hold で握り続けない
+      const isTopOverride =
+        decision.reason.startsWith("[MTF天井") ||
+        decision.reason.startsWith("[天井override") ||
+        decision.reason.startsWith("[MAルール撤退");
       if (holdHours < MIN_HOLD_HOURS && !isTopOverride) {
         console.log(`[${pair}] AI SELL → HOLD 変換 (min hold): ${holdHours.toFixed(1)}h / ${MIN_HOLD_HOURS}h. TP/SL/天井 は引き続き有効`);
         decision.action = "HOLD";
@@ -1375,11 +1612,11 @@ async function runCycleForPair(pair: string): Promise<void> {
     if (
       decision.action === "SELL" &&
       decision.confidence >= LIVE_CONFIDENCE_THRESHOLD &&
-      realPosition.free > 0 &&
-      isSellableAmount(liveExchange, pair, realPosition.free, ticker.price)
+      sellableNow > 0 &&
+      isSellableAmount(liveExchange, pair, sellableNow, ticker.price)
     ) {
       try {
-        const { order } = await executeSell(liveExchange, pair, realPosition.free);
+        const { order } = await executeSell(liveExchange, pair, sellableNow);
         const fillPrice = order.price > 0 ? order.price : ticker.price;
         const entryPrice = livePos?.entryPrice ?? 0;
         const pnl = entryPrice > 0 ? (fillPrice - entryPrice) * order.amount : 0;
@@ -1415,7 +1652,7 @@ async function runCycleForPair(pair: string): Promise<void> {
 
         await saveData("live-trades", state.liveTrades.slice(-200));
         await saveData("live-positions", Array.from(state.livePositions.values()));
-        const soldAmt = realPosition.free || livePos?.amount || 0;
+        const soldAmt = sellableNow || livePos?.amount || 0;
         console.log(`[${pair}] LIVE SELL: 損益 ¥${pnl.toLocaleString()} (${pnlPercent.toFixed(1)}%) | ${soldAmt.toFixed(6)} ${pair.split("/")[0]}`);
         // 監査ログに結果を記録（改善ループ用）
         await recordOutcome(pair, fillPrice, pnl, pnlPercent).catch(() => {});
@@ -1427,7 +1664,7 @@ async function runCycleForPair(pair: string): Promise<void> {
     }
 
     // ライブ SL/TP チェック（トレーリングストップ込み）
-    if (livePos && realPosition.free > 0 && isSellableAmount(liveExchange, pair, realPosition.free, ticker.price)) {
+    if (livePos && sellableNow > 0 && isSellableAmount(liveExchange, pair, sellableNow, ticker.price)) {
       // トレーリングストップ: 含み益が出たら SL をブレイクイーブン → ATR追従で引き上げ
       const atrVals = atrIndicator(
         bars.map(b => b.high),
@@ -1463,9 +1700,9 @@ async function runCycleForPair(pair: string): Promise<void> {
       if (livePos.partialTakeProfits && livePos.partialTakeProfits.length > 0) {
         const nextPtpIndex = livePos.ptpTriggeredCount ?? 0;
         const nextPtp = livePos.partialTakeProfits[nextPtpIndex];
-        if (nextPtp && changePercent >= nextPtp.triggerPercent && realPosition.free > 0 && isSellableAmount(liveExchange, pair, realPosition.free, ticker.price)) {
+        if (nextPtp && changePercent >= nextPtp.triggerPercent && sellableNow > 0 && isSellableAmount(liveExchange, pair, sellableNow, ticker.price)) {
           // 部分売却実行
-          const sellAmount = realPosition.free * nextPtp.sellRatio;
+          const sellAmount = sellableNow * nextPtp.sellRatio;
           try {
             const { order: ptpOrder } = await executeSell(liveExchange, pair, sellAmount);
             const fillPrice = ptpOrder.price > 0 ? ptpOrder.price : ticker.price;
@@ -1516,7 +1753,7 @@ async function runCycleForPair(pair: string): Promise<void> {
       if (triggerType) {
         try {
           // 実行本体は高速監視ループと共通 (closeLivePositionAtExit)。
-          await closeLivePositionAtExit(liveExchange, pair, realPosition.free, ticker.price, triggerType);
+          await closeLivePositionAtExit(liveExchange, pair, sellableNow, ticker.price, triggerType);
         } catch (e) {
           console.error(`[${pair}] LIVE ${triggerType.toUpperCase()} 失敗:`, e);
         }
@@ -1603,12 +1840,17 @@ async function closeAllLivePositions(reason: string): Promise<void> {
   for (const [pair, livePos] of [...state.livePositions]) {
     try {
       const realPos = await exchange.getPosition(pair);
-      if (realPos.free <= 0.0000001) {
+      // コア枠 (売らない長期枠) は kill-switch でも投げない。閉じるのは戦術枠だけ。
+      const sellQty = sellableFree(pair, realPos.free);
+      if (sellQty <= 0.0000001) {
+        if (realPos.free > 0.0000001) {
+          console.log(`[kill-switch] ${pair} はコア保有のみ (${realPos.free}) → 決済しない`);
+        }
         state.livePositions.delete(pair);
         continue;
       }
       const ticker = await exchange.getTicker(pair);
-      const order = await exchange.marketSell(pair, realPos.free);
+      const order = await exchange.marketSell(pair, sellQty);
       const fillPrice = order.price > 0 ? order.price : ticker.price;
       const pnl = (fillPrice - livePos.entryPrice) * order.amount;
       const pnlPercent = livePos.entryPrice > 0 ? ((fillPrice - livePos.entryPrice) / livePos.entryPrice) * 100 : 0;
@@ -1637,6 +1879,274 @@ async function closeAllLivePositions(reason: string): Promise<void> {
       console.error(`[kill-switch] ${pair} closeout 失敗:`, e instanceof Error ? e.message : e);
     }
   }
+}
+
+/**
+ * 残高の短期キャッシュ。
+ *
+ * 画面は status を数秒おきにポーリングし、その 1 リクエストの中で
+ * 「JPY 残高」と「コア保有サマリ」が別々に getBalance を叩いていた。
+ * bitFlyer への往復は 1 回あたり数秒かかるので、そのままだと画面表示が
+ * 待たされる分だけ遅くなる。数十秒の粒度で足りる用途なので短くキャッシュする。
+ * 発注判断 (maintainCoreHolding) は maxAgeMs=0 で必ず実測を取る。
+ */
+let _balanceCache: { at: number; balance: Awaited<ReturnType<import("../exchanges/types").IExchange["getBalance"]>> } | null = null;
+
+export async function getBalanceCached(
+  exchange: import("../exchanges/types").IExchange,
+  maxAgeMs = 20_000
+): Promise<Awaited<ReturnType<import("../exchanges/types").IExchange["getBalance"]>>> {
+  if (maxAgeMs > 0 && _balanceCache && Date.now() - _balanceCache.at < maxAgeMs) {
+    return _balanceCache.balance;
+  }
+  const balance = await exchange.getBalance();
+  _balanceCache = { at: Date.now(), balance };
+  return balance;
+}
+
+/**
+ * 総資産 (JPY + 保有暗号資産の評価額) と JPY free、各ペアの現在値をまとめて取る。
+ * コア積立の目標額はここを基準に決める。
+ */
+async function readPortfolioSnapshot(
+  exchange: import("../exchanges/types").IExchange,
+  pairs: string[],
+  /** キャッシュに無い価格を取引所に取りに行くか。画面からの呼び出しでは false にして待たせない */
+  fetchMissingPrices = true,
+  /** 残高キャッシュの許容鮮度。発注判断では 0 (必ず実測) */
+  balanceMaxAgeMs = 0
+): Promise<{
+  navJPY: number;
+  jpyFree: number;
+  prices: Record<string, number>;
+  balances: Awaited<ReturnType<import("../exchanges/types").IExchange["getBalance"]>>;
+}> {
+  const balance = await getBalanceCached(exchange, balanceMaxAgeMs);
+  const jpy = balance.find((b) => b.currency === "JPY");
+  const jpyFree = jpy?.free ?? 0;
+  let navJPY = jpy?.total ?? 0;
+
+  const prices: Record<string, number> = {};
+  const wanted = new Set<string>(pairs);
+  for (const bal of balance) {
+    if (bal.currency === "JPY" || bal.total <= 0.0000001) continue;
+    wanted.add(`${bal.currency}/JPY`);
+  }
+  // 直近サイクルで記録した価格を先に使う。ここで毎回全ペアの ticker を叩くと
+  // 1 リクエストに数十秒かかり、画面のポーリングまで巻き添えで遅くなる。
+  const FRESH_MS = 10 * 60 * 1000;
+  const now = Date.now();
+  for (const pair of wanted) {
+    const cached = state.lastPriceByPair.get(pair);
+    if (cached && now - Date.parse(cached.at) < FRESH_MS && cached.price > 0) {
+      prices[pair] = cached.price;
+      continue;
+    }
+    if (!fetchMissingPrices) continue;
+    try {
+      const t = await exchange.getTicker(pair);
+      if (t?.price > 0) {
+        prices[pair] = t.price;
+        state.lastPriceByPair.set(pair, { price: t.price, at: new Date().toISOString() });
+      }
+    } catch {
+      // 板が無いペア (SOL/JPY 等) は無視する
+    }
+  }
+  for (const bal of balance) {
+    if (bal.currency === "JPY" || bal.total <= 0.0000001) continue;
+    const price = prices[`${bal.currency}/JPY`];
+    if (price) navJPY += bal.total * price;
+  }
+  return { navJPY, jpyFree, prices, balances: balance };
+}
+
+/**
+ * コア枠 (売らない長期枠) を目標比率まで積む。
+ *
+ * 【配置の理由】kill-switch 判定より **前** に呼ぶ。
+ * kill-switch はドローダウン時に戦術枠の新規エントリを止めるための仕組みで、
+ * 「上昇するまで現金で待たない」というコア枠の趣旨とは別の話。ここで止めると
+ * 下落局面で積立が全部飛び、結局また全額 JPY で寝る状態に戻る。
+ *
+ * ⚠️ 1 サイクル 1 件しか発注しない。まとめ買いで現金を一気に使わないため。
+ */
+async function maintainCoreHolding(): Promise<void> {
+  const cfg = currentCoreConfig();
+  if (!cfg.enabled || state.paperMode) return;
+
+  try {
+    const exchange = getExchange();
+    await exchange.connect();
+    const { navJPY, jpyFree, prices, balances } = await readPortfolioSnapshot(exchange, state.pairs);
+
+    // 台帳を実残高に合わせる。本人が bitFlyer 側で直接売った場合、台帳だけが残ると
+    // そのペアが二度と売れなくなる (sellableFree が 0 を返し続ける)。
+    let clamped = false;
+    for (const pair of new Set(state.coreHolding.lots.map((l) => l.pair))) {
+      const base = pair.split("/")[0];
+      const total = balances.find((b) => b.currency === base)?.total ?? 0;
+      const res = clampCoreToBalance(state.coreHolding, pair, total);
+      if (res.adjusted) {
+        console.warn(`[core] ${pair} 台帳を実残高に合わせて修正 (実残高 ${total})`);
+        state.coreHolding = res.state;
+        clamped = true;
+      }
+    }
+    if (clamped) await saveData("core-holding", state.coreHolding);
+
+    const minOrderJPY: Record<string, number> = {};
+    for (const [pair, price] of Object.entries(prices)) {
+      minOrderJPY[pair] = exchange.getMinOrderJPY?.(pair, price) ?? 0;
+    }
+
+    const { plan, skip } = planCoreBuy({
+      navJPY,
+      jpyFree,
+      cfg,
+      state: state.coreHolding,
+      prices,
+      minOrderJPY,
+      nowMs: Date.now(),
+    });
+
+    if (!plan) {
+      state.lastCoreSkip = skip ? { ...skip, at: new Date().toISOString() } : null;
+      if (skip) console.log(`[core] 積立なし: ${skip.reason}`);
+      return;
+    }
+
+    console.log(
+      `[core] 積立実行: ${plan.pair} ¥${plan.amountJPY.toLocaleString()} ` +
+        `(目標 ¥${Math.round(plan.targetJPY).toLocaleString()} / 現在 ¥${Math.round(plan.currentJPY).toLocaleString()})`
+    );
+    const { order } = await executeBuy(exchange, plan.pair, plan.amountJPY);
+    const fillPrice = order.price > 0 ? order.price : prices[plan.pair];
+    const at = new Date().toISOString();
+    // 約定数量は取引所の実残高で裏取りする。maker 指値の部分約定などで order.amount が
+    // 実際の増分を上回ると、台帳が実残高を超えて「売れないペア」を作ってしまう。
+    let recordedAmount = order.amount;
+    try {
+      const after = await exchange.getPosition(plan.pair);
+      const room = Math.max(0, after.amount - coreAmount(state.coreHolding, plan.pair));
+      if (room > 0) recordedAmount = Math.min(order.amount, room);
+    } catch {
+      // 残高が取れなければ order.amount のまま (次サイクルの clamp で整合させる)
+    }
+    state.coreHolding = applyCoreFill(state.coreHolding, {
+      pair: plan.pair,
+      amountBase: recordedAmount,
+      priceJPY: fillPrice,
+      costJPY: recordedAmount * fillPrice,
+      at,
+    });
+    await saveData("core-holding", state.coreHolding);
+
+    const trade: TradeRecord = {
+      id: `core-${Date.now()}`,
+      timestamp: at,
+      exchange: "bitflyer",
+      pair: plan.pair,
+      side: "buy",
+      type: "market",
+      amount: order.amount,
+      price: fillPrice,
+      valueJPY: order.amount * fillPrice,
+      orderId: order.id,
+      fee: order.fee ?? 0,
+      paperTrade: false,
+    };
+    state.recentTrades.push(trade);
+    state.liveTrades.push(trade);
+    await saveData("live-trades", state.liveTrades.slice(-200));
+    state.lastCoreSkip = null;
+    console.log(
+      `[core] CORE BUY 約定: ${plan.pair} ${order.amount} @ ¥${Math.round(fillPrice).toLocaleString()}`
+    );
+  } catch (e) {
+    console.error("[core] 積立失敗:", e instanceof Error ? e.message : e);
+    state.lastCoreSkip = { reason: `積立失敗: ${e instanceof Error ? e.message : String(e)}`, at: new Date().toISOString() };
+  }
+}
+
+/**
+ * 画面からコア設定を変更する。保存した内容は再起動後も効く。
+ *
+ * ⚠️ enabled を true にすると次サイクルから実弾で積み始める。
+ */
+export async function updateCoreConfig(patch: CoreConfigOverride): Promise<CoreHoldConfig> {
+  await ensureDataLoaded();
+  const next: CoreConfigOverride = { ...(state.coreConfigOverride ?? {}), ...patch };
+  state.coreConfigOverride = next;
+  await saveData("core-config", next);
+  const cfg = currentCoreConfig();
+  console.log(
+    `[core] 設定更新: ${cfg.enabled ? "有効" : "停止"} / 目標 ${Math.round(cfg.targetPct * 100)}% / ` +
+      `${Object.entries(cfg.weights).map(([p, w]) => `${p.split("/")[0]}:${w}`).join(" ")}`
+  );
+  return cfg;
+}
+
+/** 次に積む予定の 1 件を、発注せずに返す (画面の事前確認用)。 */
+export async function previewCoreBuy(): Promise<{
+  cfg: CoreHoldConfig;
+  navJPY: number;
+  jpyFree: number;
+  plan: ReturnType<typeof planCoreBuy>["plan"];
+  skip: ReturnType<typeof planCoreBuy>["skip"];
+}> {
+  await ensureDataLoaded();
+  const cfg = currentCoreConfig();
+  const exchange = getExchange();
+  await exchange.connect();
+  const { navJPY, jpyFree, prices } = await readPortfolioSnapshot(exchange, state.pairs, false, 20_000);
+  const minOrderJPY: Record<string, number> = {};
+  for (const [pair, price] of Object.entries(prices)) {
+    minOrderJPY[pair] = exchange.getMinOrderJPY?.(pair, price) ?? 0;
+  }
+  // enabled を無視して「有効ならこう積む」を見せる。ON にする前の確認用。
+  const { plan, skip } = planCoreBuy({
+    navJPY, jpyFree, cfg: { ...cfg, enabled: true },
+    state: state.coreHolding, prices, minOrderJPY, nowMs: Date.now(),
+  });
+  return { cfg, navJPY, jpyFree, plan, skip };
+}
+
+/** 画面/API 用のコア保有サマリ。価格は現在値で引き直す。 */
+export async function getCoreHoldingReport(): Promise<{
+  enabled: boolean;
+  targetPct: number;
+  rows: ReturnType<typeof summarizeCore>;
+  totalValueJPY: number;
+  totalCostJPY: number;
+  totalTargetJPY: number;
+  lastSkip: (CoreSkip & { at: string }) | null;
+}> {
+  await ensureDataLoaded();
+  const cfg = currentCoreConfig();
+  let navJPY = 0;
+  let prices: Record<string, number> = {};
+  if (!state.paperMode) {
+    try {
+      const exchange = getExchange();
+      await exchange.connect();
+      const snap = await readPortfolioSnapshot(exchange, state.pairs, false, 20_000);
+      navJPY = snap.navJPY;
+      prices = snap.prices;
+    } catch {
+      // 取引所に繋がらないときは保有分だけ返す
+    }
+  }
+  const rows = summarizeCore(state.coreHolding, cfg, navJPY, prices);
+  return {
+    enabled: cfg.enabled,
+    targetPct: cfg.targetPct,
+    rows,
+    totalValueJPY: rows.reduce((s, r) => s + r.valueJPY, 0),
+    totalCostJPY: rows.reduce((s, r) => s + r.costJPY, 0),
+    totalTargetJPY: rows.reduce((s, r) => s + r.targetJPY, 0),
+    lastSkip: state.lastCoreSkip,
+  };
 }
 
 async function runCycle(): Promise<void> {
@@ -1674,6 +2184,11 @@ async function runCycle(): Promise<void> {
   if (!state.paperMode) {
     await cleanupStaleOpenBuys(3);
   }
+
+  // コア枠 (売らない長期枠) の積立。
+  // ⚠️ kill-switch 判定より前に置く。トレンドゲートで戦術枠が止まっている間も
+  //    「全額 JPY で寝かせない」ための枠なので、ここを止めると意味が無くなる。
+  await maintainCoreHolding();
 
   // === Kill switch: 既に発火済みなら cycle 全スキップ (新規エントリ防止) ===
   if (await isKillSwitchActive()) {
@@ -2027,8 +2542,9 @@ async function runCycle(): Promise<void> {
           marketSell: async (pair, baseAmount) => {
             try {
               const realPos = await exchange.getPosition(pair);
-              if (realPos.free < baseAmount) return { ok: false };
-              const order = await exchange.marketSell(pair, Math.min(realPos.free, baseAmount));
+              const gridSellable = sellableFree(pair, realPos.free);
+              if (gridSellable < baseAmount) return { ok: false };
+              const order = await exchange.marketSell(pair, Math.min(gridSellable, baseAmount));
               const fillPrice = order.price > 0 ? order.price : (tickerMap[pair] ?? 0);
               const trade: TradeRecord = {
                 id: `grid-${Date.now()}-${pair.replace("/", "")}-s`,
@@ -2109,9 +2625,20 @@ async function runCycle(): Promise<void> {
         : 0;
 
       // pair scores
+      //
+      // ⚠️ 2026-08-17: 直近の LIVE BUY は 3 件とも `alloc-` 由来だった。
+      // 目標現金比率に戻すためのリバランスが、下降トレンド中のペアに現金を
+      // 突っ込み続けていた (AI 判断側にトレンドゲートを入れても、買っていたのは
+      // こちらなので効かない)。ここでも同じトレンド条件を適用する。
+      // trendByPair が空 (初回サイクル等) の場合は候補ゼロ = 買わない側に倒す。
       const pairScores: { pair: string; compositeScore: number; price: number }[] = [];
+      const allocSkipped: string[] = [];
       for (const pair of state.pairs) {
         try {
+          if (TREND_GATE_ENABLED && !state.trendByPair.get(pair)?.upTrend) {
+            allocSkipped.push(pair);
+            continue;
+          }
           const bars = barsMap[pair] ?? await exchange.getOHLCV(pair, "1h", 100);
           if (!bars || bars.length < 50) continue;
           const qa = runQuantAnalysis(bars);
@@ -2121,6 +2648,9 @@ async function runCycle(): Promise<void> {
             price: tickerMap[pair] ?? bars[bars.length - 1].close,
           });
         } catch { /* skip */ }
+      }
+      if (allocSkipped.length > 0) {
+        console.log(`[alloc] トレンドゲートで除外: ${allocSkipped.join(", ")} (上昇トレンドのペアのみ買い増し対象)`);
       }
 
       const fgData = await getFearGreedIndex().catch(() => ({ value: 50, label: "Neutral" }));
@@ -2187,6 +2717,16 @@ async function runCycle(): Promise<void> {
         console.log(`[alloc] cash ${(decision.diagnostics.cashRatio * 100).toFixed(1)}% → target ${(decision.diagnostics.targetCashRatio * 100).toFixed(0)}% | ${decision.diagnostics.targetReason}`);
       }
 
+      // 二重の歯止め: 候補の絞り込みを抜けても、発注直前にもう一度トレンドを見る
+      if (
+        decision.shouldBuy &&
+        decision.pair &&
+        TREND_GATE_ENABLED &&
+        !state.trendByPair.get(decision.pair)?.upTrend
+      ) {
+        console.log(`[alloc] ${decision.pair} 買い増し中止: 日足が上昇トレンドでない`);
+        decision.shouldBuy = false;
+      }
       if (decision.shouldBuy && decision.pair && decision.amountJPY) {
         try {
           const { order } = await executeBuy(exchange, decision.pair, decision.amountJPY);
@@ -2344,9 +2884,11 @@ async function emergencyLossCut(pair: string, currentPrice: number): Promise<boo
   try {
     const exchange = getExchange();
     const realPos = await exchange.getPosition(pair);
-    if (realPos.free <= 0.0000001) return false;
-    if (!isSellableAmount(exchange, pair, realPos.free, currentPrice)) {
-      console.log(`[${pair}] 緊急ロスカット対象だが売却可能数量未満: amount=${realPos.free}`);
+    // コア枠は緊急ロスカットの対象外 (売らない前提で積んでいる枠なので投げない)
+    const cutQty = sellableFree(pair, realPos.free);
+    if (cutQty <= 0.0000001) return false;
+    if (!isSellableAmount(exchange, pair, cutQty, currentPrice)) {
+      console.log(`[${pair}] 緊急ロスカット対象だが売却可能数量未満: amount=${cutQty}`);
       return false;
     }
 
@@ -2359,7 +2901,7 @@ async function emergencyLossCut(pair: string, currentPrice: number): Promise<boo
     console.log(
       `[${pair}] 🚨 緊急ロスカット発動: 含み損 ${lossPercent.toFixed(2)}% (${-EMERGENCY_LOSS_PERCENT}% 閾値超え)`
     );
-    const order = await exchange.marketSell(pair, realPos.free);
+    const order = await exchange.marketSell(pair, cutQty);
     const fillPrice = order.price > 0 ? order.price : currentPrice;
     const pnl = (fillPrice - livePos.entryPrice) * order.amount;
     const pnlPercent = ((fillPrice - livePos.entryPrice) / livePos.entryPrice) * 100;
@@ -2552,6 +3094,51 @@ export function getBotStatus(): BotStatus {
   };
 }
 
+/**
+ * ペアごとの日足トレンド判定。
+ * 下降トレンド中は設計どおり新規 BUY を出さないので、「動いていない」のか
+ * 「待っている」のかを画面で区別できるようにこれを返す。
+ */
+export function getTrendStates(): Array<{
+  pair: string;
+  upTrend: boolean;
+  close: number;
+  ma50: number | null;
+  ma200: number | null;
+  degraded: boolean;
+  buyAllowed: boolean;
+  label: string;
+  at: string;
+}> {
+  return state.pairs.map((pair) => {
+    const t = state.trendByPair.get(pair);
+    if (!t) {
+      return {
+        pair,
+        upTrend: false,
+        close: 0,
+        ma50: null,
+        ma200: null,
+        degraded: false,
+        buyAllowed: false,
+        label: "日足トレンド未評価 (次サイクルで判定)",
+        at: "",
+      };
+    }
+    return {
+      pair,
+      upTrend: t.upTrend,
+      close: t.close,
+      ma50: t.fast,
+      ma200: t.slow,
+      degraded: t.degraded,
+      buyAllowed: !TREND_GATE_ENABLED || t.upTrend,
+      label: t.label,
+      at: t.at,
+    };
+  });
+}
+
 export function getDecisions(): AIDecision[] {
   return state.decisions;
 }
@@ -2567,19 +3154,30 @@ export function getPositions() {
   if (state.paperMode) {
     return state.paperTrader.getAllPositions();
   }
-  return Array.from(state.livePositions.values()).map(p => ({
-    pair: p.pair,
-    exchange: "bitflyer",
-    amount: p.amount,
-    avgEntryPrice: p.entryPrice,
-    currentPrice: 0, // updated by cycle
-    unrealizedPnL: 0,
-    unrealizedPnLPercent: 0,
-    valueJPY: 0,
-    stopLoss: p.entryPrice * (1 - p.stopLossPercent / 100),
-    takeProfit: p.entryPrice * (1 + p.takeProfitPercent / 100),
-    entryTimestamp: p.entryTimestamp,
-  }));
+  return Array.from(state.livePositions.values()).map(p => {
+    // 直近サイクル / 高速監視で記録した価格を使う。以前はここが 0 固定で、
+    // 画面のポジションが常に「評価額 ¥0・含み損益 0」に見えていた。
+    const last = state.lastPriceByPair.get(p.pair);
+    const currentPrice = last?.price ?? 0;
+    const valueJPY = currentPrice > 0 ? p.amount * currentPrice : 0;
+    const unrealizedPnL = currentPrice > 0 ? (currentPrice - p.entryPrice) * p.amount : 0;
+    const unrealizedPnLPercent =
+      currentPrice > 0 && p.entryPrice > 0 ? ((currentPrice - p.entryPrice) / p.entryPrice) * 100 : 0;
+    return {
+      pair: p.pair,
+      exchange: "bitflyer",
+      amount: p.amount,
+      avgEntryPrice: p.entryPrice,
+      currentPrice,
+      unrealizedPnL,
+      unrealizedPnLPercent,
+      valueJPY,
+      priceAt: last?.at ?? null,
+      stopLoss: p.entryPrice * (1 - p.stopLossPercent / 100),
+      takeProfit: p.entryPrice * (1 + p.takeProfitPercent / 100),
+      entryTimestamp: p.entryTimestamp,
+    };
+  });
 }
 
 export function getDailyPnL() {

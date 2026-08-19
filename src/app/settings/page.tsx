@@ -3,6 +3,23 @@
 import { useState, useEffect } from "react";
 import type { BotStatus, ProfitConfig } from "@/lib/types";
 
+/** コア保有 (売らない長期枠) の状態と、次に積む予定 */
+interface CoreView {
+  report: {
+    enabled: boolean;
+    targetPct: number;
+    rows: Array<{ pair: string; valueJPY: number; targetJPY: number; fillPercent: number }>;
+    totalValueJPY: number;
+    totalTargetJPY: number;
+  };
+  preview: {
+    navJPY: number;
+    jpyFree: number;
+    plan: { pair: string; amountJPY: number; targetJPY: number; currentJPY: number } | null;
+    skip: { reason: string } | null;
+  } | null;
+}
+
 export default function SettingsPage() {
   const [status, setStatus] = useState<BotStatus | null>(null);
   const [profit, setProfit] = useState<ProfitConfig>({
@@ -13,6 +30,9 @@ export default function SettingsPage() {
   });
   const [saving, setSaving] = useState(false);
   const [saveMsg, setSaveMsg] = useState<string | null>(null);
+  const [core, setCore] = useState<CoreView | null>(null);
+  const [coreSaving, setCoreSaving] = useState(false);
+  const [coreMsg, setCoreMsg] = useState<string | null>(null);
 
   useEffect(() => {
     fetch("/api/bot/status")
@@ -25,7 +45,35 @@ export default function SettingsPage() {
       .then(r => r.json())
       .then((cfg: ProfitConfig) => setProfit(cfg))
       .catch(() => {});
+
+    loadCore();
   }, []);
+
+  const loadCore = () =>
+    fetch("/api/core")
+      .then(r => r.json())
+      .then(setCore)
+      .catch(() => {});
+
+  const saveCore = async (patch: Record<string, unknown>) => {
+    setCoreSaving(true);
+    setCoreMsg(null);
+    try {
+      const res = await fetch("/api/core", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+      const data = await res.json();
+      setCoreMsg(data.ok ? "保存しました。次サイクルから反映されます。" : `保存失敗: ${data.error}`);
+      await loadCore();
+    } catch (e) {
+      setCoreMsg("保存失敗: " + String(e));
+    } finally {
+      setCoreSaving(false);
+      setTimeout(() => setCoreMsg(null), 4000);
+    }
+  };
 
   const saveProfit = async (preset?: Partial<ProfitConfig>) => {
     setSaving(true);
@@ -77,6 +125,83 @@ export default function SettingsPage() {
           <div className="text-zinc-500">通貨ペア</div>
           <div>{status?.activePairs?.join(", ") || "BTC/JPY, ETH/JPY, XRP/JPY"}</div>
         </div>
+      </div>
+
+      {/* コア保有: 上昇トレンドを待つ間、現金のまま寝かせないための長期枠 */}
+      <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4 space-y-4">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h3 className="font-medium text-zinc-300">コア保有（売らない長期枠）</h3>
+            <div className="text-xs text-zinc-500 mt-0.5">
+              日足トレンドが上向くまで戦術枠は買いません。その間も資産の一定割合を暗号資産で持ち続ける枠です。
+            </div>
+          </div>
+          <button
+            onClick={() => saveCore({ enabled: !core?.report.enabled })}
+            disabled={coreSaving || !core}
+            className={`text-xs px-3 py-1.5 rounded-lg shrink-0 ${
+              core?.report.enabled
+                ? "bg-zinc-700 hover:bg-zinc-600"
+                : "bg-sky-700 hover:bg-sky-600"
+            } disabled:opacity-50`}
+          >
+            {core?.report.enabled ? "積立を止める" : "積立を始める"}
+          </button>
+        </div>
+
+        {core && (
+          <>
+            <div className="grid grid-cols-2 gap-x-4 gap-y-3 text-sm items-center">
+              <label className="text-zinc-500">目標比率（総資産の何 %）</label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="range" min={0} max={95} step={5}
+                  value={Math.round(core.report.targetPct * 100)}
+                  onChange={e => setCore({ ...core, report: { ...core.report, targetPct: Number(e.target.value) / 100 } })}
+                  onMouseUp={e => saveCore({ targetPct: Number((e.target as HTMLInputElement).value) / 100 })}
+                  onTouchEnd={e => saveCore({ targetPct: Number((e.target as HTMLInputElement).value) / 100 })}
+                  className="flex-1"
+                />
+                <span className="tabular-nums w-12 text-right">{Math.round(core.report.targetPct * 100)}%</span>
+              </div>
+            </div>
+
+            <div className="text-sm space-y-1">
+              {core.report.rows.map(r => (
+                <div key={r.pair} className="flex items-center gap-2 text-xs">
+                  <span className="w-10 text-zinc-400">{r.pair.split("/")[0]}</span>
+                  <div className="flex-1 h-1.5 bg-zinc-800 rounded-full overflow-hidden">
+                    <div className="h-full bg-sky-500/70" style={{ width: `${Math.min(100, r.fillPercent)}%` }} />
+                  </div>
+                  <span className="text-zinc-500 tabular-nums">
+                    ¥{Math.round(r.valueJPY).toLocaleString()} / ¥{Math.round(r.targetJPY).toLocaleString()}
+                  </span>
+                </div>
+              ))}
+            </div>
+
+            {core.preview && (
+              <div className="text-xs bg-zinc-950/70 border border-zinc-800 rounded-lg px-3 py-2 space-y-1">
+                <div className="text-zinc-500">
+                  総資産 ¥{Math.round(core.preview.navJPY).toLocaleString()} / 現金 ¥{Math.round(core.preview.jpyFree).toLocaleString()}
+                </div>
+                {core.preview.plan ? (
+                  <div className="text-sky-300">
+                    次に積む予定: {core.preview.plan.pair.split("/")[0]} ¥{core.preview.plan.amountJPY.toLocaleString()}
+                    {!core.report.enabled && <span className="text-zinc-500">（積立を始めると次サイクルで発注）</span>}
+                  </div>
+                ) : (
+                  <div className="text-zinc-500">次に積む予定: なし{core.preview.skip ? ` — ${core.preview.skip.reason}` : ""}</div>
+                )}
+              </div>
+            )}
+
+            <div className="text-xs text-amber-400/80">
+              下落局面ではそのまま含み損になります。損切りもキルスイッチもこの枠には効きません。
+            </div>
+          </>
+        )}
+        {coreMsg && <div className="text-xs text-emerald-400">{coreMsg}</div>}
       </div>
 
       <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4 space-y-4">

@@ -29,6 +29,42 @@ interface StatusData {
   };
   riskOverlay: PortfolioRiskOverlay;
   recentDecisions: AIDecision[];
+  trendStates?: TrendStateView[];
+  coreHolding?: CoreHoldingView | null;
+  jpyBalance?: { free: number; used: number; total: number };
+}
+
+/** コア保有 (売らない長期枠)。「全額 JPY で寝ている」を画面で潰すためのパネル */
+interface CoreHoldingView {
+  enabled: boolean;
+  targetPct: number;
+  rows: Array<{
+    pair: string;
+    amountBase: number;
+    costJPY: number;
+    valueJPY: number;
+    targetJPY: number;
+    fillPercent: number;
+    unrealizedPnLJPY: number;
+    unrealizedPnLPercent: number;
+  }>;
+  totalValueJPY: number;
+  totalCostJPY: number;
+  totalTargetJPY: number;
+  lastSkip: { reason: string; at: string } | null;
+}
+
+/** ペアごとの日足トレンド。買わない理由を画面に出すために使う */
+interface TrendStateView {
+  pair: string;
+  upTrend: boolean;
+  close: number;
+  ma50: number | null;
+  ma200: number | null;
+  degraded: boolean;
+  buyAllowed: boolean;
+  label: string;
+  at: string;
 }
 
 interface OHLCVBar {
@@ -239,7 +275,7 @@ export default function Dashboard() {
     try {
       const [statusRes, tradesRes, ...tickerResults] = await Promise.all([
         fetch("/api/bot/status"),
-        fetch("/api/trades"),
+        fetch("/api/trades?limit=200"),
         ...BITFLYER_PAIRS.map(pair =>
           fetch(`/api/exchange/ticker?pair=${encodeURIComponent(pair)}`).catch(() => null)
         ),
@@ -247,8 +283,11 @@ export default function Dashboard() {
 
       if (statusRes.ok) setData(await statusRes.json());
       if (tradesRes.ok) {
+        // /api/trades は { trades: [...] } を返す。以前は配列前提で読んでいたため
+        // 毎回 141KB を取得しては捨てていた (画面の約定履歴が常に空だった)。
         const t = await tradesRes.json();
-        setTrades(Array.isArray(t) ? t : []);
+        const list = Array.isArray(t) ? t : Array.isArray(t?.trades) ? t.trades : [];
+        setTrades(list);
       }
 
       const newTickers: Record<string, TickerData> = {};
@@ -375,7 +414,7 @@ export default function Dashboard() {
     fetchLearning();
     fetchTiming();
     fetchAdaptiveStrategy();
-    const fast = setInterval(fetchData, 15000);
+    const fast = setInterval(fetchData, 30000); // status が数秒かかるので 15s だと詰まる
     const slow = setInterval(fetchSlowData, 300000); // 5分ごと
     const navInt = setInterval(fetchNav, 60_000); // 1分ごと
     const diagInt = setInterval(fetchDiagnostics, 60_000); // 1分ごと
@@ -458,6 +497,58 @@ export default function Dashboard() {
         )}
         <span className="text-xs text-zinc-600 ml-auto">Cycle #{status?.cycleCount ?? 0}</span>
       </div>
+
+      {/* 資産構成: 「全額 JPY で寝ている」のか「持っている」のかを最初に出す */}
+      {data?.jpyBalance && (() => {
+        const cash = data.jpyBalance.total;
+        const core = data.coreHolding?.totalValueJPY ?? 0;
+        const tactical = (data.positions ?? []).reduce((s, p) => s + (p.valueJPY ?? 0), 0);
+        const nav = cash + core + tactical;
+        if (nav <= 0) return null;
+        const pct = (v: number) => (v / nav) * 100;
+        return (
+          <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
+            <div className="flex items-baseline justify-between gap-2 flex-wrap mb-3">
+              <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold">資産構成</div>
+              <div className="text-sm">
+                <span className="text-zinc-500">総資産 </span>
+                <span className="font-mono">¥{Math.round(nav).toLocaleString()}</span>
+              </div>
+            </div>
+            <div className="flex h-3 rounded-full overflow-hidden bg-zinc-950">
+              <div className="bg-zinc-600" style={{ width: `${pct(cash)}%` }} title="現金" />
+              <div className="bg-sky-600" style={{ width: `${pct(core)}%` }} title="コア保有" />
+              <div className="bg-emerald-600" style={{ width: `${pct(tactical)}%` }} title="戦術枠" />
+            </div>
+            <div className="mt-2 flex gap-4 text-xs flex-wrap">
+              <span className="flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-zinc-600" />
+                <span className="text-zinc-400">現金</span>
+                <span className="font-mono text-zinc-300">¥{Math.round(cash).toLocaleString()}</span>
+                <span className="text-zinc-600">{pct(cash).toFixed(0)}%</span>
+              </span>
+              <span className="flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-sky-600" />
+                <span className="text-zinc-400">コア保有</span>
+                <span className="font-mono text-zinc-300">¥{Math.round(core).toLocaleString()}</span>
+                <span className="text-zinc-600">{pct(core).toFixed(0)}%</span>
+              </span>
+              <span className="flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-emerald-600" />
+                <span className="text-zinc-400">戦術枠</span>
+                <span className="font-mono text-zinc-300">¥{Math.round(tactical).toLocaleString()}</span>
+                <span className="text-zinc-600">{pct(tactical).toFixed(0)}%</span>
+              </span>
+            </div>
+            {pct(cash) >= 90 && (
+              <div className="mt-2 text-xs text-amber-300/90">
+                資産のほぼ全部が bitFlyer の JPY のままです。
+                {data.coreHolding?.enabled === false && "「設定 → コア保有」で長期枠の積立を始められます。"}
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
       {risk && (
         <div className={`rounded-xl border p-4 ${riskGateClass(risk.gate)}`}>
@@ -1284,6 +1375,85 @@ export default function Dashboard() {
               </div>
             ))}
           </div>
+        </div>
+      )}
+
+      {/* 日足トレンド: 買える相場かどうか。買わないのは仕様であって不具合ではない */}
+      {data?.trendStates && data.trendStates.length > 0 && (
+        <div>
+          <h2 className="text-sm font-medium text-zinc-400 mb-2">
+            日足トレンド
+            <span className="ml-2 text-xs text-zinc-600">
+              終値 &gt; MA50 &gt; MA200 のときだけ新規買い
+            </span>
+          </h2>
+          {data.trendStates.every((t) => !t.buyAllowed) && (
+            <div className="mb-2 text-xs bg-amber-950/40 border border-amber-900/40 text-amber-300 rounded-lg px-3 py-2">
+              全ペアが上昇トレンドではないため、新規買いを見送っています。故障ではなく待機です。
+            </div>
+          )}
+          <div className="space-y-1">
+            {data.trendStates.map((t) => (
+              <div key={t.pair} className="flex items-center gap-2 text-xs bg-zinc-900/50 rounded-lg px-3 py-1.5">
+                <span className={`font-mono font-bold shrink-0 ${t.buyAllowed ? "text-green-400" : "text-zinc-500"}`}>
+                  {t.buyAllowed ? "買える" : "待機"}
+                </span>
+                <span className="text-zinc-400 shrink-0">{t.pair.split("/")[0]}</span>
+                <span className="text-zinc-500 truncate">{t.label}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* コア保有: トレンドゲートで戦術枠が止まっている間も、ここは目標比率まで積む枠 */}
+      {data?.coreHolding && (
+        <div>
+          <h2 className="text-sm font-medium text-zinc-400 mb-2">
+            コア保有
+            <span className="ml-2 text-xs text-zinc-600">
+              売らない長期枠 / 目標 {Math.round(data.coreHolding.targetPct * 100)}%
+            </span>
+          </h2>
+          {!data.coreHolding.enabled ? (
+            <div className="mb-2 text-xs bg-zinc-900/60 border border-zinc-800 text-zinc-400 rounded-lg px-3 py-2">
+              コア保有は停止中です。CORE_HOLD_ENABLED=true で積立を開始します。
+            </div>
+          ) : (
+            <div className="mb-2 flex items-center gap-3 text-xs bg-zinc-900/50 rounded-lg px-3 py-2">
+              <span className="text-zinc-400">
+                評価額 ¥{Math.round(data.coreHolding.totalValueJPY).toLocaleString()}
+                <span className="text-zinc-600"> / 目標 ¥{Math.round(data.coreHolding.totalTargetJPY).toLocaleString()}</span>
+              </span>
+              {data.coreHolding.totalCostJPY > 0 && (
+                <span className={data.coreHolding.totalValueJPY >= data.coreHolding.totalCostJPY ? "text-green-400" : "text-red-400"}>
+                  {data.coreHolding.totalValueJPY >= data.coreHolding.totalCostJPY ? "+" : ""}
+                  ¥{Math.round(data.coreHolding.totalValueJPY - data.coreHolding.totalCostJPY).toLocaleString()}
+                </span>
+              )}
+            </div>
+          )}
+          <div className="space-y-1">
+            {data.coreHolding.rows.map((r) => (
+              <div key={r.pair} className="flex items-center gap-2 text-xs bg-zinc-900/50 rounded-lg px-3 py-1.5">
+                <span className="text-zinc-400 shrink-0 w-10">{r.pair.split("/")[0]}</span>
+                <div className="flex-1 h-1.5 bg-zinc-800 rounded-full overflow-hidden">
+                  <div className="h-full bg-sky-500/70" style={{ width: `${Math.min(100, r.fillPercent)}%` }} />
+                </div>
+                <span className="text-zinc-500 shrink-0 tabular-nums">
+                  ¥{Math.round(r.valueJPY).toLocaleString()} / ¥{Math.round(r.targetJPY).toLocaleString()}
+                </span>
+                {r.costJPY > 0 && (
+                  <span className={`shrink-0 tabular-nums ${r.unrealizedPnLJPY >= 0 ? "text-green-400" : "text-red-400"}`}>
+                    {r.unrealizedPnLPercent >= 0 ? "+" : ""}{r.unrealizedPnLPercent.toFixed(1)}%
+                  </span>
+                )}
+              </div>
+            ))}
+          </div>
+          {data.coreHolding.lastSkip && (
+            <div className="mt-1 text-xs text-zinc-600">積立見送り: {data.coreHolding.lastSkip.reason}</div>
+          )}
         </div>
       )}
 
