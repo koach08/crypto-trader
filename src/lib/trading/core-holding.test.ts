@@ -10,6 +10,7 @@ import {
   coreAmount,
   summarizeCore,
   clampCoreToBalance,
+  tacticalBasis,
   mergeCoreConfig,
   EMPTY_CORE_STATE,
   type CoreHoldConfig,
@@ -405,5 +406,39 @@ describe("端数の再配分", () => {
     });
     expect(plan).toBeNull();
     expect(skip).not.toBeNull();
+  });
+});
+
+describe("tacticalBasis", () => {
+  it("コアの数量と原価を差し引いた戦術枠だけを返す", () => {
+    // 本番で踏んだ形: XRP 実残高 95.763686 / FIFO 平均 ¥187.95 のうち
+    // コアが 31.5 XRP・原価 ¥5,997。残りが戦術枠。
+    const r = tacticalBasis({
+      exchangeAmount: 95.763686, fifoAvgPrice: 187.95,
+      coreAmountBase: 31.5, coreCostJPY: 5_997,
+    });
+    expect(r!.amount).toBeCloseTo(64.263686, 6);
+    // (95.763686 × 187.95 - 5,997) / 64.263686
+    expect(r!.avgPrice).toBeCloseTo((95.763686 * 187.95 - 5_997) / 64.263686, 6);
+    // コアの取得平均は 5,997 / 31.5 = ¥190.4 で全体平均より高い。
+    // その分を抜くので戦術枠の平均は下がる (¥186.76)。
+    expect(r!.avgPrice).toBeLessThan(187.95);
+  });
+
+  it("コアしか無いなら戦術ポジションは無い", () => {
+    const r = tacticalBasis({
+      exchangeAmount: 0.0011, fifoAvgPrice: 10_500_000,
+      coreAmountBase: 0.0011, coreCostJPY: 11_550,
+    });
+    expect(r).toBeNull();
+  });
+
+  it("差し引きが壊れるなら全体平均に落とす (負の取得単価を作らない)", () => {
+    const r = tacticalBasis({
+      exchangeAmount: 1, fifoAvgPrice: 100,
+      coreAmountBase: 0.5, coreCostJPY: 90, // コアを高値で積んだ形
+    });
+    expect(r!.amount).toBeCloseTo(0.5, 8);
+    expect(r!.avgPrice).toBeGreaterThan(0);
   });
 });

@@ -513,3 +513,38 @@ export function mergeCoreConfig(base: CoreHoldConfig, override: CoreConfigOverri
   }
   return merged;
 }
+
+/**
+ * 戦術枠だけの数量と取得平均を出す。
+ *
+ * 【なぜ要るか】取引所の約定履歴には戦術枠の売買もコア積立も同じように並ぶ。
+ * 取引所側にどちらの枠かという情報は無いので、残高から FIFO 平均を取り直すと
+ * **コアの買いが戦術ポジションに混ざる**。実際 XRP で
+ * 「livePos.amount 60.83 ≠ realPosition 95.76 → 同期完了 95.76 @ ¥187.95」と
+ * なり、コアの約31 XRP を戦術枠として抱えた状態でトレーリング SL が
+ * 動いていた (売却自体は sellableFree が塞ぐが、SL/TP の基準値と
+ * 実現損益の帰属が狂う)。
+ *
+ * コア台帳は数量も取得原価もこちらで持っているので、全体から差し引く。
+ */
+export function tacticalBasis(input: {
+  /** 取引所の実残高 */
+  exchangeAmount: number;
+  /** 約定履歴から出した FIFO 平均取得単価 (コア込み) */
+  fifoAvgPrice: number;
+  /** コア台帳の数量 */
+  coreAmountBase: number;
+  /** コア台帳の取得原価合計 */
+  coreCostJPY: number;
+}): { amount: number; avgPrice: number } | null {
+  const { exchangeAmount, fifoAvgPrice, coreAmountBase, coreCostJPY } = input;
+  const amount = exchangeAmount - coreAmountBase;
+  if (!(amount > 0) || !(fifoAvgPrice > 0)) return null;
+
+  const tacticalCost = exchangeAmount * fifoAvgPrice - coreCostJPY;
+  const avgPrice = tacticalCost / amount;
+  // コアを高値で積んでいると差し引きが壊れることがある。その場合は
+  // 全体平均のほうがまだ実態に近いので、そちらを使う。
+  if (!Number.isFinite(avgPrice) || avgPrice <= 0) return { amount, avgPrice: fifoAvgPrice };
+  return { amount, avgPrice };
+}

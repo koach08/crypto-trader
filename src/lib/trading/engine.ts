@@ -39,6 +39,8 @@ import {
   mergeCoreConfig,
   sellableAmount as coreSellableAmount,
   coreAmount,
+  coreCostJPY,
+  tacticalBasis,
   summarizeCore,
   EMPTY_CORE_STATE,
   type CoreHoldingState,
@@ -1319,10 +1321,18 @@ async function runCycleForPair(pair: string): Promise<void> {
         console.log(`[${pair}] FIFO 計算エラー (${e instanceof Error ? e.message : "unknown"}) → ticker.price フォールバック`);
       }
 
+      // 取引所の約定履歴にはコア積立も混ざっている。コア台帳の数量と原価を
+      // 差し引いて、戦術枠だけのポジションとして復元する。
+      const basis = tacticalBasis({
+        exchangeAmount: realPosition.amount,
+        fifoAvgPrice: trueAvgPrice,
+        coreAmountBase: coreAmount(state.coreHolding, pair),
+        coreCostJPY: coreCostJPY(state.coreHolding, pair),
+      });
       const reconstructed: LivePositionEntry = {
         pair,
-        entryPrice: trueAvgPrice,
-        amount: realPosition.amount,
+        entryPrice: basis?.avgPrice ?? trueAvgPrice,
+        amount: basis?.amount ?? realPosition.amount,
         entryTimestamp: new Date().toISOString(),
         stopLossPercent: regimeTpSl.sl,
         takeProfitPercent: regimeTpSl.tp,
@@ -1335,18 +1345,33 @@ async function runCycleForPair(pair: string): Promise<void> {
 
     // livePos.amount と realPosition.amount のズレ検知 + 同期
     // 外部買い付けや手動取引で実残高が増えた場合、FIFO avg を取り直して同期
-    if (livePos && realPosition.amount > 0 && Math.abs(realPosition.amount - livePos.amount) / Math.max(realPosition.amount, livePos.amount) > 0.01) {
-      console.log(`[${pair}] livePos.amount ${livePos.amount} ≠ realPosition.amount ${realPosition.amount} → FIFO 再計算`);
+    // ズレ検知はコアを除いた戦術枠の数量どうしで比べる。実残高そのままと比べると、
+    // コアを 1 回積むたびに「ズレた」と判定して毎サイクル再計算が走る。
+    const tacticalTarget = Math.max(0, realPosition.amount - coreAmount(state.coreHolding, pair));
+    if (
+      livePos &&
+      tacticalTarget > 0 &&
+      Math.abs(tacticalTarget - livePos.amount) / Math.max(tacticalTarget, livePos.amount) > 0.01
+    ) {
+      console.log(`[${pair}] livePos.amount ${livePos.amount} ≠ 戦術枠 ${tacticalTarget} (実残高 ${realPosition.amount} - コア) → FIFO 再計算`);
       try {
         if (liveExchange.fetchExecutions) {
           const executions = await liveExchange.fetchExecutions(pair);
           const summary = computeLifetimePnL(executions);
           const pairData = summary.byPair.find(p => p.pair === pair);
           if (pairData && pairData.averageBuyPrice > 0 && pairData.remainingInventory > 0) {
-            livePos.entryPrice = pairData.averageBuyPrice;
-            livePos.amount = realPosition.amount;
-            await saveData("live-positions", Array.from(state.livePositions.values()));
-            console.log(`[${pair}] 同期完了: ${realPosition.amount} @ ¥${pairData.averageBuyPrice.toFixed(2)}`);
+            const basis = tacticalBasis({
+              exchangeAmount: realPosition.amount,
+              fifoAvgPrice: pairData.averageBuyPrice,
+              coreAmountBase: coreAmount(state.coreHolding, pair),
+              coreCostJPY: coreCostJPY(state.coreHolding, pair),
+            });
+            if (basis) {
+              livePos.entryPrice = basis.avgPrice;
+              livePos.amount = basis.amount;
+              await saveData("live-positions", Array.from(state.livePositions.values()));
+              console.log(`[${pair}] 同期完了: 戦術枠 ${basis.amount} @ ¥${basis.avgPrice.toFixed(2)} (全体 ${realPosition.amount} @ ¥${pairData.averageBuyPrice.toFixed(2)})`);
+            }
           }
         }
       } catch { /* keep current */ }
