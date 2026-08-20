@@ -216,6 +216,51 @@ describe("planCoreTakeProfit / applyCoreSell", () => {
     expect(plan).toBeNull();
   });
 
+  it("売りの下限は取引所の最小注文だけ (minTrancheJPY を掛けない)", () => {
+    // 2026-08-21 未明に踏んだ形。XRP のコアが ¥7,242 まで積まれて +22% に乗ったが、
+    // 25% 分は ¥1,810 で minTrancheJPY ¥3,000 に届かず利確が発火しなかった。
+    // XRP の取引所最小注文は 0.1 XRP ≒ ¥20 なので、本来は売れる。
+    const xrpState: CoreHoldingState = {
+      lots: [{ at: "2026-08-20T12:00:00.000Z", pair: "XRP/JPY", amountBase: 36.0, priceJPY: 165, costJPY: 5_940 }],
+      lastBuyAt: { "XRP/JPY": "2026-08-20T12:00:00.000Z" },
+    };
+    const { plan } = planCoreTakeProfit({
+      state: xrpState, cfg, prices: { "XRP/JPY": 202 },
+      minOrderJPY: { "XRP/JPY": 20 },
+    });
+    expect(plan?.pair).toBe("XRP/JPY");
+    expect(plan!.proceedsJPY).toBeGreaterThan(1_500);
+    expect(plan!.proceedsJPY).toBeLessThan(3_000); // ¥3,000 未満でも売れること
+  });
+
+  it("利確圏のペアには積み増さない (高値で買い足して条件から遠ざけない)", () => {
+    // 取得平均 ¥165 に対し ¥202 = +22%。目標に未達でも買わない。
+    const xrpState: CoreHoldingState = {
+      lots: [{ at: "2026-08-20T12:00:00.000Z", pair: "XRP/JPY", amountBase: 36.0, priceJPY: 165, costJPY: 5_940 }],
+      lastBuyAt: {},
+    };
+    const { plan } = planCoreBuy({
+      navJPY: 68_000, jpyFree: 10_000, cfg: { ...cfg, weights: { "XRP/JPY": 1 } },
+      state: xrpState, prices: { "XRP/JPY": 202 }, minOrderJPY: { "XRP/JPY": 20 },
+      nowMs: Date.parse("2026-08-21T02:00:00.000Z"),
+    });
+    expect(plan).toBeNull();
+  });
+
+  it("利確圏でなければ従来どおり積む", () => {
+    const xrpState: CoreHoldingState = {
+      lots: [{ at: "2026-08-20T12:00:00.000Z", pair: "XRP/JPY", amountBase: 36.0, priceJPY: 165, costJPY: 5_940 }],
+      lastBuyAt: {},
+    };
+    // 目標 ¥47,600 の 4 分割 = ¥11,900 が出るので、現金はそれ以上必要
+    const { plan } = planCoreBuy({
+      navJPY: 68_000, jpyFree: 20_000, cfg: { ...cfg, weights: { "XRP/JPY": 1 } },
+      state: xrpState, prices: { "XRP/JPY": 175 }, minOrderJPY: { "XRP/JPY": 20 },
+      nowMs: Date.parse("2026-08-21T02:00:00.000Z"),
+    });
+    expect(plan?.pair).toBe("XRP/JPY");
+  });
+
   it("約定を反映すると古いロットから減り、確定損益が積まれる", () => {
     const { state: after, realizedJPY } = applyCoreSell(tpState, "ETH/JPY", 0.02, 350_000);
     expect(coreAmount(after, "ETH/JPY")).toBeCloseTo(0.02, 8);

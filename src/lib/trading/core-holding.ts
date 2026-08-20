@@ -215,6 +215,18 @@ export function planCoreBuy(input: PlanCoreBuyInput): { plan: CoreBuyPlan | null
     // 5% の許容幅。価格変動のたびに端数を買い足さない。
     if (shortfallJPY <= targetJPY * 0.05) continue;
 
+    // 利確圏にいるペアには積み増さない。売る予定のものを高値で買い足すと
+    // 取得平均が上がって利確条件から遠ざかる。目標は NAV 連動で上がるので、
+    // 上昇局面ほど「高いところで買い足す」方向に引っ張られる。
+    if (cfg.takeProfitPct > 0) {
+      const heldAmount = coreAmount(state, pair);
+      const heldCost = coreCostJPY(state, pair);
+      if (heldAmount > 0 && heldCost > 0) {
+        const avgCost = heldCost / heldAmount;
+        if ((price - avgCost) / avgCost >= cfg.takeProfitPct) continue;
+      }
+    }
+
     // 利確した直後に同じ値段で買い戻さない。売値から reentryDiscountPct 下がるまで待つ。
     // これが無いと「+20% で売って次のサイクルで買い直す」を繰り返し、
     // 往復のスプレッドと手数料だけ払って数量が減っていく。
@@ -329,8 +341,11 @@ export function planCoreTakeProfit(input: {
 
     const sellAmount = amount * cfg.takeProfitFraction;
     const proceeds = sellAmount * price;
-    const minOrder = Math.max(minOrderJPY[pair] ?? 0, cfg.minTrancheJPY);
-    // 最小注文に届かないなら見送る。刻めない量を投げても約定しない。
+    // 下限は取引所の最小注文だけ。minTrancheJPY は「積むときに手数料負けしない額」で
+    // あって売りには関係ない。ここに ¥3,000 を掛けていたせいで、
+    // XRP が +22% まで乗っても 25% 分が ¥1,810 にしかならず利確が一度も発火せず、
+    // そのまま高値で積み増して +14% まで薄まった (2026-08-21 未明に実際に起きた)。
+    const minOrder = minOrderJPY[pair] ?? 0;
     if (proceeds < minOrder) continue;
 
     candidates.push({
