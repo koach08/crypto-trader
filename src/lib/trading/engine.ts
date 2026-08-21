@@ -9,6 +9,7 @@ import { getFearGreedIndex } from "../ai/fear-greed";
 import { RiskManager } from "./risk-manager";
 import { PaperTrader } from "./paper-trader";
 import { loadData, saveData } from "../data";
+import { slippageJPY, summarizeExecutionCosts, type ExecutionCost } from "./execution-cost";
 import { runQuantAnalysis, BASELINE_SIGNAL_WEIGHTS, setActiveSignalWeights } from "../quant/signals";
 import { calculateFinalDecision } from "../quant/scoring-engine";
 import { saveAudit, recordOutcome, getAudits } from "../quant/audit-log";
@@ -364,6 +365,8 @@ interface EngineState {
    * ここだけは目標比率まで積む。売却経路は必ずこの数量を残す。
    */
   coreHolding: CoreHoldingState;
+  /** 執行コストの記録 (発注直前の中値と実約定値の差)。直近 MAX_COST_RECORDS 件 */
+  executionCosts: ExecutionCost[];
   /** 画面から変更したコア設定 (env 既定に重ねる) */
   coreConfigOverride: CoreConfigOverride | null;
   /** 直近のコア積立判断 (画面に「なぜ積んでいないか」を出すため) */
@@ -391,6 +394,7 @@ const state: EngineState = {
   trendByPair: new Map(),
   lastPriceByPair: new Map(),
   coreHolding: { lots: [], lastBuyAt: {} },
+  executionCosts: [],
   coreConfigOverride: null,
   lastCoreSkip: null,
 };
@@ -461,17 +465,74 @@ async function triggerLossReflection(
  * BUY 実行ヘルパー: maker 指値を試し、timeout なら成行にフォールバック。
  * 既存の戦略コードを変えずに「実行レイヤーだけ手数料 0% 化」する。
  */
+const MAX_COST_RECORDS = 2000;
+
+/** 発注直前の中値。bid/ask が無ければ last で代用する。 */
+async function refMidPrice(
+  exchange: import("../exchanges/types").IExchange,
+  pair: string,
+): Promise<number> {
+  try {
+    const t = await exchange.getTicker(pair);
+    if (t?.bid && t?.ask && t.bid > 0 && t.ask > 0) return (t.bid + t.ask) / 2;
+    return t?.price ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * 執行コストを1件記録する。判断の良し悪しとは別に、
+ * 「中値に対していくら払ったか」をここだけで持つ。
+ */
+async function recordExecutionCost(
+  pair: string,
+  side: "buy" | "sell",
+  order: import("../types").OrderResult,
+  refMid: number,
+  viaMaker: boolean,
+): Promise<void> {
+  const fillPrice = order.price > 0 ? order.price : refMid;
+  const amountBase = order.amount ?? 0;
+  if (!(amountBase > 0) || !(fillPrice > 0) || !(refMid > 0)) return;
+  const rec: ExecutionCost = {
+    at: new Date().toISOString(),
+    pair,
+    side,
+    amountBase,
+    fillPrice,
+    refMid,
+    notionalJPY: amountBase * fillPrice,
+    slippageJPY: slippageJPY(side, fillPrice, refMid, amountBase),
+    viaMaker,
+  };
+  state.executionCosts.push(rec);
+  if (state.executionCosts.length > MAX_COST_RECORDS) {
+    state.executionCosts = state.executionCosts.slice(-MAX_COST_RECORDS);
+  }
+  console.log(
+    `[cost] ${pair} ${side} ${viaMaker ? "maker" : "taker"} 中値 ¥${refMid.toFixed(2)} → 約定 ¥${fillPrice.toFixed(2)} ` +
+      `不利分 ¥${rec.slippageJPY.toFixed(1)} (${((rec.slippageJPY / rec.notionalJPY) * 100).toFixed(3)}%)`
+  );
+  await saveData("execution-costs", state.executionCosts);
+}
+
 async function executeBuy(
   exchange: import("../exchanges/types").IExchange,
   pair: string,
   amountJPY: number,
 ): Promise<{ order: import("../types").OrderResult; viaMaker: boolean }> {
+  const refMid = await refMidPrice(exchange, pair);
   if (USE_MAKER_ONLY && exchange.limitBuyMakerOnly) {
     const makerOrder = await exchange.limitBuyMakerOnly(pair, amountJPY, MAKER_TIMEOUT_MS);
-    if (makerOrder) return { order: makerOrder, viaMaker: true };
+    if (makerOrder) {
+      await recordExecutionCost(pair, "buy", makerOrder, refMid, true);
+      return { order: makerOrder, viaMaker: true };
+    }
     console.log(`[${pair}] maker BUY timeout → 成行フォールバック`);
   }
   const order = await exchange.marketBuy(pair, amountJPY);
+  await recordExecutionCost(pair, "buy", order, refMid, false);
   return { order, viaMaker: false };
 }
 
@@ -485,12 +546,17 @@ async function executeSell(
   amountBase: number,
   forceMarket = false,
 ): Promise<{ order: import("../types").OrderResult; viaMaker: boolean }> {
+  const refMid = await refMidPrice(exchange, pair);
   if (!forceMarket && USE_MAKER_ONLY && exchange.limitSellMakerOnly) {
     const makerOrder = await exchange.limitSellMakerOnly(pair, amountBase, MAKER_TIMEOUT_MS);
-    if (makerOrder) return { order: makerOrder, viaMaker: true };
+    if (makerOrder) {
+      await recordExecutionCost(pair, "sell", makerOrder, refMid, true);
+      return { order: makerOrder, viaMaker: true };
+    }
     console.log(`[${pair}] maker SELL timeout → 成行フォールバック`);
   }
   const order = await exchange.marketSell(pair, amountBase);
+  await recordExecutionCost(pair, "sell", order, refMid, false);
   return { order, viaMaker: false };
 }
 
@@ -687,6 +753,8 @@ async function ensureDataLoaded(): Promise<void> {
       // コア保有 (売らない長期枠) を復元。ここが空だと全量が売却可能扱いになるので、
       // 再起動時に必ず読み直す。
       state.coreConfigOverride = await loadData<CoreConfigOverride | null>("core-config", null);
+      state.executionCosts = await loadData<ExecutionCost[]>("execution-costs", []);
+      if (!Array.isArray(state.executionCosts)) state.executionCosts = [];
       state.coreHolding = await loadData<CoreHoldingState>("core-holding", EMPTY_CORE_STATE);
       if (!state.coreHolding?.lots) state.coreHolding = { lots: [], lastBuyAt: {} };
       const coreLots = state.coreHolding.lots.length;
@@ -2167,6 +2235,12 @@ export async function updateCoreConfig(patch: CoreConfigOverride): Promise<CoreH
       `${Object.entries(cfg.weights).map(([p, w]) => `${p.split("/")[0]}:${w}`).join(" ")}`
   );
   return cfg;
+}
+
+/** 執行コストの集計。売買代金に対して中値からどれだけ払っているか。 */
+export async function getExecutionCostReport(): Promise<ReturnType<typeof summarizeExecutionCosts>> {
+  await ensureDataLoaded();
+  return summarizeExecutionCosts(state.executionCosts);
 }
 
 /** 次に積む予定の 1 件を、発注せずに返す (画面の事前確認用)。 */
