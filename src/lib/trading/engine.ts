@@ -3459,14 +3459,20 @@ export function getPositions() {
     // 画面のポジションが常に「評価額 ¥0・含み損益 0」に見えていた。
     const last = state.lastPriceByPair.get(p.pair);
     const currentPrice = last?.price ?? 0;
-    const valueJPY = currentPrice > 0 ? p.amount * currentPrice : 0;
-    const unrealizedPnL = currentPrice > 0 ? (currentPrice - p.entryPrice) * p.amount : 0;
+    // 【コア枠を引く】ここが引いていなかったため、画面が
+    // 「現金 + コア保有 + 戦術枠」を足すと同じコインを2回数え、
+    // 総資産が ¥190,799 (実際は ¥121,718) と表示されていた。
+    // リスク判定のエクスポージャーもこの値を使うので、ここが出所。
+    const core = coreAmount(state.coreHolding, p.pair);
+    const amount = Math.max(0, p.amount - core);
+    const valueJPY = currentPrice > 0 ? amount * currentPrice : 0;
+    const unrealizedPnL = currentPrice > 0 ? (currentPrice - p.entryPrice) * amount : 0;
     const unrealizedPnLPercent =
       currentPrice > 0 && p.entryPrice > 0 ? ((currentPrice - p.entryPrice) / p.entryPrice) * 100 : 0;
     return {
       pair: p.pair,
       exchange: "bitflyer",
-      amount: p.amount,
+      amount,
       avgEntryPrice: p.entryPrice,
       currentPrice,
       unrealizedPnL,
@@ -3487,17 +3493,11 @@ export function getDailyPnL() {
 export function getPortfolioRiskOverlay() {
   const dailyPnL = state.riskManager.getDailyPnL();
   const cumulative = getCumulativePnL();
-  // 【コア枠を除く】この安全装置が守るのは戦術枠の建玉。コア枠は3年持つ前提で
-  // 損切りもキルスイッチも効かない枠なので、同じ器に入れてはいけない。
-  // 入れていたせいで、目標85%まで積むほどエクスポージャーが上がり、
-  // スコアが9点まで落ちて新規停止に張り付いていた (設計どおりの状態が「危険」判定)。
-  const positions = getPositions().map((p) => {
-    const core = coreAmount(state.coreHolding, p.pair);
-    if (core <= 0) return p;
-    const tacticalAmount = Math.max(0, p.amount - core);
-    const ratio = p.amount > 0 ? tacticalAmount / p.amount : 0;
-    return { ...p, amount: tacticalAmount, valueJPY: p.valueJPY * ratio };
-  });
+  // コア枠は getPositions() の時点で控除済み。ここで引くと二重控除になる。
+  // この安全装置が守るのは戦術枠の建玉で、コア枠は対象外 (3年持つ前提で
+  // 損切りもキルスイッチも効かない)。同じ器に入れていたせいで、目標85%まで
+  // 積むほどエクスポージャーが上がり、スコア9点で新規停止に張り付いていた。
+  const positions = getPositions();
   // 資本は直近サイクルで実測した NAV。startCapitalJPY は入金を反映しないので、
   // ¥50,000 入れた後もエクスポージャーが 94.8% と実態より悪く出ていた。
   const capitalJPY = state.lastNavJPY > 0
