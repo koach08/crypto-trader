@@ -10,6 +10,7 @@ import { RiskManager } from "./risk-manager";
 import { PaperTrader } from "./paper-trader";
 import { loadData, saveData } from "../data";
 import { slippageJPY, summarizeExecutionCosts, type ExecutionCost } from "./execution-cost";
+import { attributePnL } from "./lane-pnl";
 import { runQuantAnalysis, BASELINE_SIGNAL_WEIGHTS, setActiveSignalWeights } from "../quant/signals";
 import { calculateFinalDecision } from "../quant/scoring-engine";
 import { saveAudit, recordOutcome, getAudits } from "../quant/audit-log";
@@ -491,6 +492,7 @@ async function recordExecutionCost(
   order: import("../types").OrderResult,
   refMid: number,
   viaMaker: boolean,
+  lane: "core" | "tactical",
 ): Promise<void> {
   const fillPrice = order.price > 0 ? order.price : refMid;
   const amountBase = order.amount ?? 0;
@@ -505,6 +507,7 @@ async function recordExecutionCost(
     notionalJPY: amountBase * fillPrice,
     slippageJPY: slippageJPY(side, fillPrice, refMid, amountBase),
     viaMaker,
+    lane,
   };
   state.executionCosts.push(rec);
   if (state.executionCosts.length > MAX_COST_RECORDS) {
@@ -521,18 +524,19 @@ async function executeBuy(
   exchange: import("../exchanges/types").IExchange,
   pair: string,
   amountJPY: number,
+  lane: "core" | "tactical" = "tactical",
 ): Promise<{ order: import("../types").OrderResult; viaMaker: boolean }> {
   const refMid = await refMidPrice(exchange, pair);
   if (USE_MAKER_ONLY && exchange.limitBuyMakerOnly) {
     const makerOrder = await exchange.limitBuyMakerOnly(pair, amountJPY, MAKER_TIMEOUT_MS);
     if (makerOrder) {
-      await recordExecutionCost(pair, "buy", makerOrder, refMid, true);
+      await recordExecutionCost(pair, "buy", makerOrder, refMid, true, lane);
       return { order: makerOrder, viaMaker: true };
     }
     console.log(`[${pair}] maker BUY timeout → 成行フォールバック`);
   }
   const order = await exchange.marketBuy(pair, amountJPY);
-  await recordExecutionCost(pair, "buy", order, refMid, false);
+  await recordExecutionCost(pair, "buy", order, refMid, false, lane);
   return { order, viaMaker: false };
 }
 
@@ -545,6 +549,7 @@ async function executeSell(
   pair: string,
   amountBase: number,
   forceMarket = false,
+  lane: "core" | "tactical" = "tactical",
 ): Promise<{ order: import("../types").OrderResult; viaMaker: boolean }> {
   const refMid = await refMidPrice(exchange, pair);
   if (!forceMarket && USE_MAKER_ONLY && exchange.limitSellMakerOnly) {
@@ -553,7 +558,7 @@ async function executeSell(
     try {
       const makerOrder = await exchange.limitSellMakerOnly(pair, amountBase, MAKER_TIMEOUT_MS);
       if (makerOrder) {
-        await recordExecutionCost(pair, "sell", makerOrder, refMid, true);
+        await recordExecutionCost(pair, "sell", makerOrder, refMid, true, lane);
         return { order: makerOrder, viaMaker: true };
       }
       console.log(`[${pair}] maker SELL timeout → 成行フォールバック`);
@@ -562,7 +567,7 @@ async function executeSell(
     }
   }
   const order = await exchange.marketSell(pair, amountBase);
-  await recordExecutionCost(pair, "sell", order, refMid, false);
+  await recordExecutionCost(pair, "sell", order, refMid, false, lane);
   return { order, viaMaker: false };
 }
 
@@ -2119,7 +2124,7 @@ async function maintainCoreHolding(): Promise<void> {
       const sellAmount = Math.min(tpPlan.amountBase, free);
       if (sellAmount > 0 && sellAmount * tpPlan.priceJPY >= Math.max(minOrderJPY[tpPlan.pair] ?? 0, cfg.minTrancheJPY)) {
         console.log(`[core] 利確実行: ${tpPlan.pair} ${sellAmount} @ ¥${Math.round(tpPlan.priceJPY).toLocaleString()} (${tpPlan.reason})`);
-        const { order } = await executeSell(exchange, tpPlan.pair, sellAmount);
+        const { order } = await executeSell(exchange, tpPlan.pair, sellAmount, false, "core");
         const sellPrice = order.price > 0 ? order.price : tpPlan.priceJPY;
         const soldAt = new Date().toISOString();
         const res = applyCoreSell(state.coreHolding, tpPlan.pair, order.amount || sellAmount, sellPrice);
@@ -2169,7 +2174,7 @@ async function maintainCoreHolding(): Promise<void> {
       `[core] 積立実行: ${plan.pair} ¥${plan.amountJPY.toLocaleString()} ` +
         `(目標 ¥${Math.round(plan.targetJPY).toLocaleString()} / 現在 ¥${Math.round(plan.currentJPY).toLocaleString()})`
     );
-    const { order } = await executeBuy(exchange, plan.pair, plan.amountJPY);
+    const { order } = await executeBuy(exchange, plan.pair, plan.amountJPY, "core");
     const fillPrice = order.price > 0 ? order.price : prices[plan.pair];
     const at = new Date().toISOString();
     // 約定数量は取引所の実残高で裏取りする。maker 指値の部分約定などで order.amount が
@@ -2247,6 +2252,17 @@ export async function updateCoreConfig(patch: CoreConfigOverride): Promise<CoreH
 export async function getExecutionCostReport(): Promise<ReturnType<typeof summarizeExecutionCosts>> {
   await ensureDataLoaded();
   return summarizeExecutionCosts(state.executionCosts);
+}
+
+/** 枠別 (コア / 戦術) の損益。どちらが稼いでどちらが溶かしているかを分ける。 */
+export async function getLanePnL() {
+  await ensureDataLoaded();
+  const trades = state.paperMode ? state.paperTrader.getTrades() : state.liveTrades;
+  return attributePnL({
+    trades,
+    costs: state.executionCosts,
+    coreRealizedJPY: state.coreHolding.realizedJPY ?? 0,
+  });
 }
 
 /** 次に積む予定の 1 件を、発注せずに返す (画面の事前確認用)。 */

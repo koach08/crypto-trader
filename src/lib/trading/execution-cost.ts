@@ -25,6 +25,8 @@ export interface ExecutionCost {
   slippageJPY: number;
   /** メイカー指値で約定したか (false = 成行フォールバック) */
   viaMaker: boolean;
+  /** どちらの枠の発注か。無い記録は戦術枠として扱う (計測を入れる前のもの) */
+  lane?: "core" | "tactical";
 }
 
 /** 中値に対する不利分。買いは高く買うほど、売りは安く売るほどコスト。 */
