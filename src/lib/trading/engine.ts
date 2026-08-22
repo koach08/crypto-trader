@@ -11,6 +11,7 @@ import { PaperTrader } from "./paper-trader";
 import { loadData, saveData } from "../data";
 import { slippageJPY, summarizeExecutionCosts, type ExecutionCost } from "./execution-cost";
 import { attributePnL } from "./lane-pnl";
+import { riskBudgetedSize } from "./risk-sizing";
 import { buildCryptoReturn, buildFundingReport, type CashFlow } from "./cash-flow";
 import { runQuantAnalysis, BASELINE_SIGNAL_WEIGHTS, setActiveSignalWeights } from "../quant/signals";
 import { calculateFinalDecision } from "../quant/scoring-engine";
@@ -115,6 +116,8 @@ const TREND_ENTRY_CONFIDENCE = 75;
 // バックテストの C+SL8 と同じ: 保険の損切り -8%、利確は事実上使わずトレンド割れで撤退
 const TREND_ENTRY_SL_PERCENT = Number(process.env.TREND_ENTRY_SL_PERCENT ?? "8");
 const TREND_ENTRY_TP_PERCENT = Number(process.env.TREND_ENTRY_TP_PERCENT ?? "30");
+// 1 回の取引で失ってよい額 (総資産に対する割合)。損切り幅ではなくこちらを固定する。
+const RISK_FRACTION_PER_TRADE = Number(process.env.RISK_FRACTION_PER_TRADE ?? "0.01");
 // 売買が発生しないサイクルで AI 照会を省く (課金抑制)。SKIP_AI_WHEN_IDLE=false で無効化
 const SKIP_AI_WHEN_IDLE = process.env.SKIP_AI_WHEN_IDLE !== "false";
 const LIVE_BASE_TRADE_JPY = Number(process.env.LIVE_BASE_TRADE_JPY || 15000); // 1回あたり目安サイズ（ユーザ設定可能）
@@ -371,6 +374,8 @@ interface EngineState {
   executionCosts: ExecutionCost[];
   /** 直近サイクルで計算した ATR。高速監視がトレーリング SL を更新するのに使う */
   lastATRByPair: Map<string, number>;
+  /** 直近サイクルで実測した総資産。リスク判定の資本基準に使う */
+  lastNavJPY: number;
   /** 画面から変更したコア設定 (env 既定に重ねる) */
   coreConfigOverride: CoreConfigOverride | null;
   /** 直近のコア積立判断 (画面に「なぜ積んでいないか」を出すため) */
@@ -400,6 +405,7 @@ const state: EngineState = {
   coreHolding: { lots: [], lastBuyAt: {} },
   executionCosts: [],
   lastATRByPair: new Map(),
+  lastNavJPY: 0,
   coreConfigOverride: null,
   lastCoreSkip: null,
 };
@@ -1623,6 +1629,28 @@ async function runCycleForPair(pair: string): Promise<void> {
         riskAdjustedTradeAmount = Math.max(riskAdjustedTradeAmount, LIVE_BASE_TRADE_JPY);
       }
 
+      // 【リスク量から逆算する】MA ルールで入る玉は損切り幅が広い (既定8%)。
+      // サイズを固定したまま幅だけ広げると、1 回の損が幅に比例して増える。
+      // 先に「1 回にいくら失ってよいか」を決め、そこからサイズを出す。
+      // 上の下限 (LIVE_BASE_TRADE_JPY) もここで上書きする。下限がリスク上限を
+      // 超えたら、下限のほうが間違っている。
+      if (trendEntryOverride && !state.paperMode) {
+        const sized = riskBudgetedSize({
+          navJPY: state.lastNavJPY > 0 ? state.lastNavJPY : jpyFree + currentPositionJPY,
+          riskFraction: RISK_FRACTION_PER_TRADE,
+          stopLossPercent: TREND_ENTRY_SL_PERCENT,
+          availableJPY: jpyFree,
+          maxJPY: dynamicMax,
+          minOrderJPY: liveExchange.getMinOrderJPY?.(pair, ticker.price) ?? 0,
+        });
+        if (sized.sizeJPY <= 0) {
+          console.log(`[${pair}] BUY見送り: ${sized.reason}`);
+          return;
+        }
+        console.log(`[${pair}] リスク基準サイズ: ¥${sized.sizeJPY.toLocaleString()} (損切り時 ¥${Math.round(sized.riskJPY).toLocaleString()}) ${sized.reason}`);
+        riskAdjustedTradeAmount = sized.sizeJPY;
+      }
+
       // PROFIT_MODE: 過去勝率がプラスなら fractional Kelly でサイズを押し上げる
       const PROFIT_MODE = process.env.PROFIT_MODE === '1' || process.env.PROFIT_MODE === 'true';
       if (PROFIT_MODE && decision.confidence >= 55) {
@@ -1687,8 +1715,12 @@ async function runCycleForPair(pair: string): Promise<void> {
             ? {
                 ...classified,
                 style: "HOLD" as const,
-                slPercent: decision.suggestedStopLossPercent ?? TREND_ENTRY_SL_PERCENT,
-                tpPercent: decision.suggestedTakeProfitPercent ?? TREND_ENTRY_TP_PERCENT,
+                // 【検証値をそのまま使う】以前は decision.suggested* を優先していたが、
+                // 判断側は常に SL 2% / TP 3% を返すため ?? が落ちることが無く、
+                // **バックテストで検証した SL8%/TP30% は一度も実行されていなかった**。
+                // コメントが禁じていることをコード自身がやっていた状態。
+                slPercent: TREND_ENTRY_SL_PERCENT,
+                tpPercent: TREND_ENTRY_TP_PERCENT,
                 partialTakeProfits: [],
                 reasoning: `MAルール建玉: SL/TP はバックテスト検証値を使用 (style 分類 ${classified.style} は不適用)`,
               }
@@ -2127,6 +2159,7 @@ async function maintainCoreHolding(): Promise<void> {
     const exchange = getExchange();
     await exchange.connect();
     const { navJPY, jpyFree, prices, balances } = await readPortfolioSnapshot(exchange, state.pairs);
+    if (navJPY > 0) state.lastNavJPY = navJPY;
 
     // 台帳を実残高に合わせる。本人が bitFlyer 側で直接売った場合、台帳だけが残ると
     // そのペアが二度と売れなくなる (sellableFree が 0 を返し続ける)。
@@ -3453,11 +3486,25 @@ export function getDailyPnL() {
 
 export function getPortfolioRiskOverlay() {
   const dailyPnL = state.riskManager.getDailyPnL();
-  const positions = getPositions();
   const cumulative = getCumulativePnL();
-  const capitalJPY = cumulative.startCapitalJPY > 0
-    ? cumulative.startCapitalJPY
-    : dailyPnL.startCapitalJPY;
+  // 【コア枠を除く】この安全装置が守るのは戦術枠の建玉。コア枠は3年持つ前提で
+  // 損切りもキルスイッチも効かない枠なので、同じ器に入れてはいけない。
+  // 入れていたせいで、目標85%まで積むほどエクスポージャーが上がり、
+  // スコアが9点まで落ちて新規停止に張り付いていた (設計どおりの状態が「危険」判定)。
+  const positions = getPositions().map((p) => {
+    const core = coreAmount(state.coreHolding, p.pair);
+    if (core <= 0) return p;
+    const tacticalAmount = Math.max(0, p.amount - core);
+    const ratio = p.amount > 0 ? tacticalAmount / p.amount : 0;
+    return { ...p, amount: tacticalAmount, valueJPY: p.valueJPY * ratio };
+  });
+  // 資本は直近サイクルで実測した NAV。startCapitalJPY は入金を反映しないので、
+  // ¥50,000 入れた後もエクスポージャーが 94.8% と実態より悪く出ていた。
+  const capitalJPY = state.lastNavJPY > 0
+    ? state.lastNavJPY
+    : cumulative.startCapitalJPY > 0
+      ? cumulative.startCapitalJPY
+      : dailyPnL.startCapitalJPY;
   return buildPortfolioRiskOverlay({
     positions,
     dailyPnL,
