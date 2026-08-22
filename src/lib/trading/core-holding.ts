@@ -551,15 +551,25 @@ export function tacticalBasis(input: {
   coreAmountBase: number;
   /** コア台帳の取得原価合計 */
   coreCostJPY: number;
+  /** 取引所の最小取引単位。これ未満の残りは戦術ポジションとして扱わない */
+  minAmountBase?: number;
 }): { amount: number; avgPrice: number } | null {
   const { exchangeAmount, fifoAvgPrice, coreAmountBase, coreCostJPY } = input;
   const amount = exchangeAmount - coreAmountBase;
   if (!(amount > 0) || !(fifoAvgPrice > 0)) return null;
 
+  // 売れない量はポジションではない。ここを通すと、コアがほぼ全量を占めるペアで
+  // 端数だけが「戦術ポジション」として残り、SL/TP がその端数に対して張られる。
+  // 緊急ロスカットと高速監視が毎分「売却可能数量未満」を出し続けていた原因でもある。
+  const minAmount = input.minAmountBase ?? 0;
+  if (minAmount > 0 && amount < minAmount) return null;
+
   const tacticalCost = exchangeAmount * fifoAvgPrice - coreCostJPY;
   const avgPrice = tacticalCost / amount;
-  // コアを高値で積んでいると差し引きが壊れることがある。その場合は
-  // 全体平均のほうがまだ実態に近いので、そちらを使う。
-  if (!Number.isFinite(avgPrice) || avgPrice <= 0) return { amount, avgPrice: fifoAvgPrice };
+  // 端数を分母にすると取得単価が発散する。実際 ETH で残り 0.00013 に対して
+  // ¥7,210,464 (実勢の約19倍) という取得単価が出て、SL/TP がその値を基準に
+  // 張られていた。実勢から大きく外れたら全体平均に落とす。
+  const sane = Number.isFinite(avgPrice) && avgPrice > fifoAvgPrice / 3 && avgPrice < fifoAvgPrice * 3;
+  if (!sane) return { amount, avgPrice: fifoAvgPrice };
   return { amount, avgPrice };
 }

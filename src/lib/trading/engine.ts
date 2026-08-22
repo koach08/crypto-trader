@@ -1407,6 +1407,9 @@ async function runCycleForPair(pair: string): Promise<void> {
         fifoAvgPrice: trueAvgPrice,
         coreAmountBase: coreAmount(state.coreHolding, pair),
         coreCostJPY: coreCostJPY(state.coreHolding, pair),
+        minAmountBase: liveExchange.getMinOrderJPY
+          ? (liveExchange.getMinOrderJPY(pair, ticker.price) / 1.1) / Math.max(ticker.price, 1e-9)
+          : 0,
       });
       const reconstructed: LivePositionEntry = {
         pair,
@@ -1444,6 +1447,9 @@ async function runCycleForPair(pair: string): Promise<void> {
               fifoAvgPrice: pairData.averageBuyPrice,
               coreAmountBase: coreAmount(state.coreHolding, pair),
               coreCostJPY: coreCostJPY(state.coreHolding, pair),
+              minAmountBase: liveExchange.getMinOrderJPY
+                ? (liveExchange.getMinOrderJPY(pair, ticker.price) / 1.1) / Math.max(ticker.price, 1e-9)
+                : 0,
             });
             if (basis) {
               livePos.entryPrice = basis.avgPrice;

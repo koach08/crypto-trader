@@ -478,6 +478,27 @@ describe("tacticalBasis", () => {
     expect(r).toBeNull();
   });
 
+  it("残りが最小取引単位未満ならポジションとして扱わない", () => {
+    // 本番で踏んだ形: ETH 実残高 0.05108182 に対しコアが 0.0509515。
+    // 残り 0.00013 は bitFlyer の最小 0.01 に遠く及ばず、売れない。
+    const r = tacticalBasis({
+      exchangeAmount: 0.05108182, fifoAvgPrice: 380_000,
+      coreAmountBase: 0.0509515, coreCostJPY: 18_500, minAmountBase: 0.01,
+    });
+    expect(r).toBeNull();
+  });
+
+  it("端数を分母にして取得単価が発散したら全体平均に落とす", () => {
+    // minAmountBase を渡さない経路でも、実勢の3倍を超える値は採らない。
+    // 実際 ETH で ¥7,210,464 (実勢の約19倍) が出て SL/TP の基準になっていた。
+    const r = tacticalBasis({
+      exchangeAmount: 0.05108182, fifoAvgPrice: 380_000,
+      coreAmountBase: 0.0509515, coreCostJPY: 18_500,
+    });
+    expect(r!.avgPrice).toBeLessThan(380_000 * 3);
+    expect(r!.avgPrice).toBeGreaterThan(380_000 / 3);
+  });
+
   it("差し引きが壊れるなら全体平均に落とす (負の取得単価を作らない)", () => {
     const r = tacticalBasis({
       exchangeAmount: 1, fifoAvgPrice: 100,
