@@ -376,6 +376,22 @@ interface EngineState {
   lastATRByPair: Map<string, number>;
   /** 直近サイクルで実測した総資産。リスク判定の資本基準に使う */
   lastNavJPY: number;
+  /**
+   * 取引所の約定履歴から出した実績。**確定損益はこちらを正とする**。
+   * アプリ側の liveTrades から出した pnl は、建玉の取得単価に複数のバグが
+   * あった (コア枠の混入 / 端数を分母にした発散) ため信用できない。
+   * 実際、同じ画面に「決済188回 WR34% / -¥5,256」と
+   * 「決済128回 WR38% / -¥11,583」が並んでいた。
+   */
+  exchangePnL: {
+    realizedJPY: number;
+    closedTrades: number;
+    wins: number;
+    losses: number;
+    buyVolumeJPY: number;
+    sellVolumeJPY: number;
+    at: string;
+  } | null;
   /** 画面から変更したコア設定 (env 既定に重ねる) */
   coreConfigOverride: CoreConfigOverride | null;
   /** 直近のコア積立判断 (画面に「なぜ積んでいないか」を出すため) */
@@ -406,6 +422,7 @@ const state: EngineState = {
   executionCosts: [],
   lastATRByPair: new Map(),
   lastNavJPY: 0,
+  exchangePnL: null,
   coreConfigOverride: null,
   lastCoreSkip: null,
 };
@@ -2161,6 +2178,9 @@ async function maintainCoreHolding(): Promise<void> {
     const { navJPY, jpyFree, prices, balances } = await readPortfolioSnapshot(exchange, state.pairs);
     if (navJPY > 0) state.lastNavJPY = navJPY;
 
+    // 取引所ベースの実績を取り直す (表示はこのキャッシュを読む)
+    await refreshExchangePnL().catch(() => {});
+
     // 台帳を実残高に合わせる。本人が bitFlyer 側で直接売った場合、台帳だけが残ると
     // そのペアが二度と売れなくなる (sellableFree が 0 を返し続ける)。
     let clamped = false;
@@ -3518,13 +3538,55 @@ export async function getEngineAllocations() {
   return state.lastAllocationDetails;
 }
 
+/**
+ * 取引所の約定履歴から実績を取り直してキャッシュする。
+ * fetchExecutions は数秒かかるので、画面のポーリング経路では呼ばない。
+ * サイクルの中で更新し、表示はキャッシュを読む。
+ */
+async function refreshExchangePnL(): Promise<void> {
+  const exchange = getExchange();
+  if (!exchange.fetchExecutions) return;
+  let realizedJPY = 0, closedTrades = 0, wins = 0, losses = 0, buyVolumeJPY = 0, sellVolumeJPY = 0;
+  let got = false;
+  for (const pair of state.pairs) {
+    try {
+      const summary = computeLifetimePnL(await exchange.fetchExecutions(pair));
+      const row = summary.byPair.find((b) => b.pair === pair);
+      if (!row) continue;
+      got = true;
+      realizedJPY += row.realizedPnL;
+      closedTrades += row.closedTrades;
+      wins += row.wins;
+      losses += row.losses;
+      buyVolumeJPY += row.buyVolume;
+      sellVolumeJPY += row.sellVolume;
+    } catch {
+      // 取れないペアは飛ばす。全滅ならキャッシュを更新しない
+    }
+  }
+  if (!got) return;
+  state.exchangePnL = {
+    realizedJPY, closedTrades, wins, losses, buyVolumeJPY, sellVolumeJPY,
+    at: new Date().toISOString(),
+  };
+  console.log(`[pnl] 取引所ベース更新: 確定 ¥${Math.round(realizedJPY).toLocaleString()} / ${closedTrades}決済 (${wins}W ${losses}L)`);
+}
+
 export function getCumulativePnL() {
   const trades = state.paperMode ? state.paperTrader.getTrades() : state.liveTrades;
   const sells = trades.filter(t => t.side === "sell" && t.pnl !== undefined);
-  const totalRealizedPnL = sells.reduce((sum, t) => sum + (t.pnl ?? 0), 0);
   const totalFees = trades.reduce((sum, t) => sum + (t.fee ?? 0), 0);
-  const wins = sells.filter(t => (t.pnl ?? 0) > 0).length;
-  const losses = sells.filter(t => (t.pnl ?? 0) < 0).length;
+  // 【確定損益は取引所の約定履歴を正とする】アプリ側の pnl は建玉の取得単価から
+  // 計算しているが、その取得単価に複数のバグがあった (コア枠の混入 /
+  // 端数を分母にして実勢の19倍になる)。同じ画面に「188決済 WR34% -¥5,256」と
+  // 「128決済 WR38% -¥11,583」が並ぶ状態を解消する。
+  // 取引所から取れていないときだけアプリ側にフォールバックする。
+  const fromExchange = state.paperMode ? null : state.exchangePnL;
+  const totalRealizedPnL = fromExchange
+    ? fromExchange.realizedJPY
+    : sells.reduce((sum, t) => sum + (t.pnl ?? 0), 0);
+  const wins = fromExchange ? fromExchange.wins : sells.filter(t => (t.pnl ?? 0) > 0).length;
+  const losses = fromExchange ? fromExchange.losses : sells.filter(t => (t.pnl ?? 0) < 0).length;
 
   let unrealizedPnL: number;
   let positionValueJPY: number;
@@ -3550,7 +3612,7 @@ export function getCumulativePnL() {
     totalFees,
     netPnL: totalRealizedPnL + unrealizedPnL - totalFees,
     totalTrades: trades.length,
-    closedTrades: sells.length,
+    closedTrades: fromExchange ? fromExchange.closedTrades : sells.length,
     wins,
     losses,
     winRate: sells.length > 0 ? (wins / sells.length) * 100 : 0,
