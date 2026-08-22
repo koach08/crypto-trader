@@ -368,6 +368,8 @@ interface EngineState {
   coreHolding: CoreHoldingState;
   /** 執行コストの記録 (発注直前の中値と実約定値の差)。直近 MAX_COST_RECORDS 件 */
   executionCosts: ExecutionCost[];
+  /** 直近サイクルで計算した ATR。高速監視がトレーリング SL を更新するのに使う */
+  lastATRByPair: Map<string, number>;
   /** 画面から変更したコア設定 (env 既定に重ねる) */
   coreConfigOverride: CoreConfigOverride | null;
   /** 直近のコア積立判断 (画面に「なぜ積んでいないか」を出すため) */
@@ -396,6 +398,7 @@ const state: EngineState = {
   lastPriceByPair: new Map(),
   coreHolding: { lots: [], lastBuyAt: {} },
   executionCosts: [],
+  lastATRByPair: new Map(),
   coreConfigOverride: null,
   lastCoreSkip: null,
 };
@@ -696,6 +699,29 @@ async function monitorPositionsFast(): Promise<void> {
       const ticker = await exchange.getTicker(pair);
       if (!ticker?.price || ticker.price <= 0) continue;
       state.lastPriceByPair.set(pair, { price: ticker.price, at: new Date().toISOString() });
+
+      // 【非対称性の解消】損切りは 1 分ごとに発火するのに、トレーリング SL の
+      // 引き上げは通常サイクル (既定 1 時間) でしか走っていなかった。
+      // 含み益が出ても次サイクルまで SL が動かないので、上振れ後に反落すると
+      // ブレイクイーブンにできたはずの玉が元の SL まで落ちる。
+      // 損失側だけ速い状態が、平均損失 > 平均利益を作る一因になっていた。
+      const cachedATR = state.lastATRByPair.get(pair) ?? 0;
+      if (cachedATR > 0 && typeof livePos.stopLossPercent === "number") {
+        const trail = computeTrailingStop({
+          entryPrice: livePos.entryPrice,
+          currentPrice: ticker.price,
+          atr: cachedATR,
+          currentStopLossPercent: livePos.stopLossPercent,
+          breakevenTriggerPercent: 1.0,
+          trailFactor: 1.0,
+        });
+        if ((trail.movedToBreakeven || trail.trailing) && trail.newStopLossPercent !== livePos.stopLossPercent) {
+          const oldSL = livePos.stopLossPercent;
+          livePos.stopLossPercent = trail.newStopLossPercent;
+          console.log(`[${pair}] 高速監視トレーリングSL: ${oldSL.toFixed(2)}% → ${trail.newStopLossPercent.toFixed(2)}% (${trail.reason})`);
+          await saveData("live-positions", Array.from(state.livePositions.values()));
+        }
+      }
 
       const changePercent = ((ticker.price - livePos.entryPrice) / livePos.entryPrice) * 100;
       let triggerType: "stop_loss" | "take_profit" | null = null;
@@ -1785,6 +1811,9 @@ async function runCycleForPair(pair: string): Promise<void> {
         14
       );
       const lastATR = atrVals.filter((v): v is number => v !== null).slice(-1)[0] ?? 0;
+      // 高速監視側でも同じ ATR を使ってトレーリングできるように残す。
+      // 1 分ごとに足を取り直すのは重いので、直近サイクルの値を流用する。
+      if (lastATR > 0) state.lastATRByPair.set(pair, lastATR);
       if (lastATR > 0 && typeof livePos.stopLossPercent === "number") {
         const trail = computeTrailingStop({
           entryPrice: livePos.entryPrice,
