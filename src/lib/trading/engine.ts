@@ -12,6 +12,7 @@ import { loadData, saveData } from "../data";
 import { slippageJPY, summarizeExecutionCosts, type ExecutionCost } from "./execution-cost";
 import { attributePnL } from "./lane-pnl";
 import { riskBudgetedSize } from "./risk-sizing";
+import { refreshArchive, flattenArchive } from "./execution-archive";
 import { buildCryptoReturn, buildFundingReport, type CashFlow } from "./cash-flow";
 import { runQuantAnalysis, BASELINE_SIGNAL_WEIGHTS, setActiveSignalWeights } from "../quant/signals";
 import { calculateFinalDecision } from "../quant/scoring-engine";
@@ -2357,22 +2358,11 @@ export async function getPerformanceReport() {
   const snap = await readPortfolioSnapshot(exchange, state.pairs, false, 20_000);
   const holdingsValueJPY = Math.max(0, snap.navJPY - snap.jpyFree);
 
-  let buyVolumeJPY = 0;
-  let sellVolumeJPY = 0;
-  let realizedJPY = 0;
-  for (const pair of state.pairs) {
-    try {
-      if (!exchange.fetchExecutions) break;
-      const summary = computeLifetimePnL(await exchange.fetchExecutions(pair));
-      const row = summary.byPair.find((b) => b.pair === pair);
-      if (!row) continue;
-      buyVolumeJPY += row.buyVolume;
-      sellVolumeJPY += row.sellVolume;
-      realizedJPY += row.realizedPnL;
-    } catch {
-      // 取れないペアは飛ばす (部分的な集計であることは cryptoReturn.buyVolumeJPY で分かる)
-    }
-  }
+  // 主指標の分母なので、保管庫の和集合から出す (取得できた分だけだと揺れる)
+  const cached = state.exchangePnL;
+  const buyVolumeJPY = cached?.buyVolumeJPY ?? 0;
+  const sellVolumeJPY = cached?.sellVolumeJPY ?? 0;
+  const realizedJPY = cached?.realizedJPY ?? 0;
 
   const navHistory = await loadData<NavSnapshot[]>("nav-history", []);
   const baseline = navHistory[0];
@@ -3546,25 +3536,23 @@ export async function getEngineAllocations() {
 async function refreshExchangePnL(): Promise<void> {
   const exchange = getExchange();
   if (!exchange.fetchExecutions) return;
+  // 取引所は古い約定を返しきらない。取れた分だけで集計すると過去の売買が
+  // 勝手に消えて数字が縮む (購入代金が ¥1,392,447 と ¥1,211,654 の2通り出ていた)。
+  // 保管庫に貯めた和集合から出す。
+  const archive = await refreshArchive(exchange, state.pairs);
+  const executions = flattenArchive(archive, state.pairs);
+  if (executions.length === 0) return;
+  const summary = computeLifetimePnL(executions);
   let realizedJPY = 0, closedTrades = 0, wins = 0, losses = 0, buyVolumeJPY = 0, sellVolumeJPY = 0;
-  let got = false;
-  for (const pair of state.pairs) {
-    try {
-      const summary = computeLifetimePnL(await exchange.fetchExecutions(pair));
-      const row = summary.byPair.find((b) => b.pair === pair);
-      if (!row) continue;
-      got = true;
-      realizedJPY += row.realizedPnL;
-      closedTrades += row.closedTrades;
-      wins += row.wins;
-      losses += row.losses;
-      buyVolumeJPY += row.buyVolume;
-      sellVolumeJPY += row.sellVolume;
-    } catch {
-      // 取れないペアは飛ばす。全滅ならキャッシュを更新しない
-    }
+  for (const row of summary.byPair) {
+    if (!state.pairs.includes(row.pair)) continue;
+    realizedJPY += row.realizedPnL;
+    closedTrades += row.closedTrades;
+    wins += row.wins;
+    losses += row.losses;
+    buyVolumeJPY += row.buyVolume;
+    sellVolumeJPY += row.sellVolume;
   }
-  if (!got) return;
   state.exchangePnL = {
     realizedJPY, closedTrades, wins, losses, buyVolumeJPY, sellVolumeJPY,
     at: new Date().toISOString(),
