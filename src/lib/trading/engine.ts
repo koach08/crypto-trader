@@ -11,6 +11,7 @@ import { PaperTrader } from "./paper-trader";
 import { loadData, saveData } from "../data";
 import { slippageJPY, summarizeExecutionCosts, type ExecutionCost } from "./execution-cost";
 import { attributePnL } from "./lane-pnl";
+import { buildCryptoReturn, buildFundingReport, type CashFlow } from "./cash-flow";
 import { runQuantAnalysis, BASELINE_SIGNAL_WEIGHTS, setActiveSignalWeights } from "../quant/signals";
 import { calculateFinalDecision } from "../quant/scoring-engine";
 import { saveAudit, recordOutcome, getAudits } from "../quant/audit-log";
@@ -2287,6 +2288,56 @@ export async function updateCoreConfig(patch: CoreConfigOverride): Promise<CoreH
 export async function getExecutionCostReport(): Promise<ReturnType<typeof summarizeExecutionCosts>> {
   await ensureDataLoaded();
   return summarizeExecutionCosts(state.executionCosts);
+}
+
+/**
+ * 成績レポート。**主指標は「買った暗号資産に対する損益」**。
+ * 総資産は入金でも増えるので、成績としては読めない (¥50,000 入れた直後に
+ * 24h +73.73% と出て、bot が稼いだように見えていた)。総資産は総資産で返す。
+ */
+export async function getPerformanceReport() {
+  await ensureDataLoaded();
+  const exchange = getExchange();
+  await exchange.connect();
+
+  const flows = await loadData<CashFlow[]>("cash-flows", []);
+  const snap = await readPortfolioSnapshot(exchange, state.pairs, false, 20_000);
+  const holdingsValueJPY = Math.max(0, snap.navJPY - snap.jpyFree);
+
+  let buyVolumeJPY = 0;
+  let sellVolumeJPY = 0;
+  let realizedJPY = 0;
+  for (const pair of state.pairs) {
+    try {
+      if (!exchange.fetchExecutions) break;
+      const summary = computeLifetimePnL(await exchange.fetchExecutions(pair));
+      const row = summary.byPair.find((b) => b.pair === pair);
+      if (!row) continue;
+      buyVolumeJPY += row.buyVolume;
+      sellVolumeJPY += row.sellVolume;
+      realizedJPY += row.realizedPnL;
+    } catch {
+      // 取れないペアは飛ばす (部分的な集計であることは cryptoReturn.buyVolumeJPY で分かる)
+    }
+  }
+
+  const navHistory = await loadData<NavSnapshot[]>("nav-history", []);
+  const baseline = navHistory[0];
+  return {
+    /** 主指標 */
+    cryptoReturn: buildCryptoReturn({ buyVolumeJPY, sellVolumeJPY, holdingsValueJPY, realizedJPY }),
+    /** 副指標: 入れた金の合計に対する現在の総資産 */
+    funding: buildFundingReport({
+      baselineJPY: baseline?.total ?? 0,
+      baselineAt: baseline?.timestamp ?? null,
+      currentNavJPY: snap.navJPY,
+      flows,
+    }),
+    /** 参考: 総資産そのもの */
+    navJPY: snap.navJPY,
+    jpyFreeJPY: snap.jpyFree,
+    holdingsValueJPY,
+  };
 }
 
 /** 枠別 (コア / 戦術) の損益。どちらが稼いでどちらが溶かしているかを分ける。 */
