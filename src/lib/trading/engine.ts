@@ -548,12 +548,18 @@ async function executeSell(
 ): Promise<{ order: import("../types").OrderResult; viaMaker: boolean }> {
   const refMid = await refMidPrice(exchange, pair);
   if (!forceMarket && USE_MAKER_ONLY && exchange.limitSellMakerOnly) {
-    const makerOrder = await exchange.limitSellMakerOnly(pair, amountBase, MAKER_TIMEOUT_MS);
-    if (makerOrder) {
-      await recordExecutionCost(pair, "sell", makerOrder, refMid, true);
-      return { order: makerOrder, viaMaker: true };
+    // メイカー指値で失敗しても売り自体を落とさない。ここで throw が抜けると
+    // SL / 利確が発注されないまま終わる。
+    try {
+      const makerOrder = await exchange.limitSellMakerOnly(pair, amountBase, MAKER_TIMEOUT_MS);
+      if (makerOrder) {
+        await recordExecutionCost(pair, "sell", makerOrder, refMid, true);
+        return { order: makerOrder, viaMaker: true };
+      }
+      console.log(`[${pair}] maker SELL timeout → 成行フォールバック`);
+    } catch (e) {
+      console.log(`[${pair}] maker SELL 失敗 (${e instanceof Error ? e.message : "unknown"}) → 成行フォールバック`);
     }
-    console.log(`[${pair}] maker SELL timeout → 成行フォールバック`);
   }
   const order = await exchange.marketSell(pair, amountBase);
   await recordExecutionCost(pair, "sell", order, refMid, false);

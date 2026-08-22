@@ -2,6 +2,16 @@ import ccxt, { type Exchange as CcxtExchange } from "ccxt";
 import type { IExchange, ExecutionRecord } from "./types";
 import type { TickerData, OHLCVBar, Balance, OrderResult, ExchangeConfig } from "../types";
 
+/**
+ * 成行売りの数量リトライ係数。**まず全量**で出し、"Insufficient funds" で
+ * 弾かれたときだけ少しずつ削る。1 回目から削ると、売るたびに端数が口座に残り、
+ * それが最小注文を下回るダストとして積み上がる。
+ */
+export const SELL_RETRY_FACTORS = [1, 0.9999, 0.9995, 0.999, 0.995, 0.99, 0.98, 0.95];
+
+/** メイカー指値売りの安全マージン (リトライ経路が無いので最小限だけ削る) */
+export const MAKER_SELL_SAFETY = 0.9999;
+
 const MIN_BASE_AMOUNT: Record<string, number> = {
   BTC: 0.001, ETH: 0.01, XRP: 0.1, XLM: 0.1, MONA: 0.1,
   SOL: 0.01, // BitFlyer 現物 SOL 0.01 単位
@@ -319,11 +329,15 @@ export class BitFlyerExchange implements IExchange {
 
   async marketSell(pair: string, amountBase: number): Promise<OrderResult> {
     // BitFlyer は free 残高をピタリ送ると内部精度ズレで "Insufficient funds" を返すことがある。
-    // 段階的に buffer を増やしてリトライ: 0.5% → 1% → 2% → 5%
+    // そのためのリトライだが、**1 回目から 0.5% 削っていたのが誤り**だった。
+    // リトライ経路がある以上、まず全量で試すべきで、削るのは弾かれてからでいい。
+    // 実害: 売るたびに 0.5% が口座に残り、それが最小注文を下回るダストになって
+    // 「売却可能数量未満」を毎サイクル出し続けていた (2026-08-21 の往復では
+    // 値段は上がったのに数量が 0.33% 減って -¥41 になった)。
     const base = pair.split("/")[0];
     const minAmount = MIN_BASE_AMOUNT[base] ?? 0.001;
 
-    const buffers = [0.995, 0.99, 0.98, 0.95];
+    const buffers = SELL_RETRY_FACTORS;
     let lastError: unknown = null;
     for (const buffer of buffers) {
       const safeAmount = amountBase * buffer;
@@ -429,7 +443,9 @@ export class BitFlyerExchange implements IExchange {
   async limitSellMakerOnly(pair: string, amountBase: number, timeoutMs = 30000): Promise<OrderResult | null> {
     const base = pair.split("/")[0];
     const minAmount = MIN_BASE_AMOUNT[base] ?? 0.001;
-    const safeAmount = Math.max(amountBase * 0.995, minAmount);
+    // ここはリトライ経路が無く 1 回だけなので、精度ズレ対策の最小限だけ残す。
+    // 0.995 (0.5%) は削りすぎで、売るたびにダストを作っていた。
+    const safeAmount = Math.max(amountBase * MAKER_SELL_SAFETY, minAmount);
     const amount = this.roundAmount(pair, safeAmount);
     if (amount <= 0) {
       throw new Error(`${pair}: 指値売却量が最小単位未満 (要求 ${amountBase})`);
