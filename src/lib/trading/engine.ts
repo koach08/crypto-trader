@@ -3114,19 +3114,33 @@ async function reconcileLivePositionsFromExchange(): Promise<void> {
     if (!exchange.fetchExecutions) return;
     await exchange.connect();
 
-    for (const pair of state.pairs) {
+    // 対象ペアに加えて、既に追跡しているペアも見る。state.pairs から外した
+    // ペア (XLM など) の残骸がここを通らず、ずっと戦術ポジションとして
+    // 残って毎分の監視に引っかかっていた。
+    const pairsToCheck = Array.from(new Set([...state.pairs, ...state.livePositions.keys()]));
+    for (const pair of pairsToCheck) {
       const realPos = await exchange.getPosition(pair);
-      if (realPos.amount <= 0.0000001) continue;
+      if (realPos.amount <= 0.0000001) {
+        if (state.livePositions.has(pair)) {
+          state.livePositions.delete(pair);
+          console.log(`[reconcile] ${pair} 残高なし → livePositions から除外`);
+        }
+        continue;
+      }
 
-      // dust skip: 評価額 ¥500 未満は売却不能 + 判断ノイズなので追跡対象外
+      // dust skip: 評価額 ¥500 未満は売却不能 + 判断ノイズなので追跡対象外。
+      // 【コアを引いた戦術枠で判定する】実残高で見ると、コア枠がほとんどを
+      // 占めるペア (ETH 実残高 0.051 のうちコア 0.0509) で残り ¥38 の
+      // ダストが ¥500 の閾値を通ってしまい、掃除されなかった。
       try {
         const ticker = await exchange.getTicker(pair);
-        const valueJPY = realPos.amount * ticker.price;
+        const tacticalAmount = Math.max(0, realPos.amount - coreAmount(state.coreHolding, pair));
+        const valueJPY = tacticalAmount * ticker.price;
         if (valueJPY < 500) {
           // 既存追跡があれば削除
           if (state.livePositions.has(pair)) {
             state.livePositions.delete(pair);
-            console.log(`[reconcile] ${pair} dust (¥${Math.round(valueJPY)}) → livePositions から除外`);
+            console.log(`[reconcile] ${pair} 戦術枠 dust (¥${Math.round(valueJPY)}) → livePositions から除外`);
           }
           continue;
         }
