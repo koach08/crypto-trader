@@ -8,6 +8,7 @@
  * BitFlyer の getexecutions から取り直して真の累計を出す。
  */
 
+import { feeToJPY } from "./fee";
 import type { ExecutionRecord } from "../exchanges/types";
 
 export interface LifetimePnLByPair {
@@ -84,8 +85,11 @@ export function computeLifetimePnL(executions: ExecutionRecord[]): LifetimePnLSu
     }
 
     const stats = perPair[e.pair];
-    stats.totalFees += e.fee;
-    totalFees += e.fee;
+    // 手数料は基軸通貨建てで来る (bitFlyer)。円に直さずに足すと、
+    // 売買代金 ¥2,750,000 に対して総手数料 ¥0.19 のような数字になる。
+    const feeJPY = feeToJPY({ fee: e.fee, feeCurrency: e.feeCurrency, pair: e.pair, priceJPY: e.price });
+    stats.totalFees += feeJPY;
+    totalFees += feeJPY;
     if (stats.firstTradeTimestamp === null || e.timestamp < stats.firstTradeTimestamp) {
       stats.firstTradeTimestamp = e.timestamp;
     }
@@ -119,8 +123,9 @@ export function computeLifetimePnL(executions: ExecutionRecord[]): LifetimePnLSu
       }
       const matchedSize = e.amount - remaining;
       if (matchedSize > 0) {
-        // 売却収入 - 取得コスト - 手数料
-        const pnl = matchedSize * e.price - matchedCost - e.fee;
+        // 売却収入 - 取得コスト - 手数料 (円に直したもの)
+        const sellFeeJPY = feeToJPY({ fee: e.fee, feeCurrency: e.feeCurrency, pair: e.pair, priceJPY: e.price });
+        const pnl = matchedSize * e.price - matchedCost - sellFeeJPY;
         totalRealizedPnL += pnl;
         stats.realizedPnL += pnl;
         stats.closedTrades += 1;

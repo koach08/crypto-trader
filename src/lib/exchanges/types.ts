@@ -7,7 +7,10 @@ export interface ExecutionRecord {
   side: "buy" | "sell";
   amount: number;
   price: number;
+  /** 取引所が返す手数料。**円とは限らない** (bitFlyer は基軸通貨建てで返す) */
   fee: number;
+  /** fee の通貨。無い場合は基軸通貨とみなす */
+  feeCurrency?: string;
 }
 
 export interface IExchange {

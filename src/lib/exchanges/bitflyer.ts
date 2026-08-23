@@ -534,6 +534,7 @@ export class BitFlyerExchange implements IExchange {
           amount: t.amount ?? 0,
           price: t.price ?? 0,
           fee: t.fee?.cost ?? 0,
+          feeCurrency: t.fee?.currency ? String(t.fee.currency) : undefined,
         });
       }
 
