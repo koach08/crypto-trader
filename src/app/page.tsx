@@ -309,6 +309,9 @@ export default function Dashboard() {
   // 価格履歴・ニュース・PnL履歴は低頻度で取得
   const fetchSlowData = useCallback(async () => {
     try {
+      // 初回に取るのは既定表示のペアだけ。残りはタブを開いたときに取りに行く
+      // (下の useEffect)。ここに BTC が入っていなかったので、BTC タブを開くと
+      // 「データ取得中...」のまま何も出なかった。API 側は正常に 48 本返している。
       const pairs = ["ETH/JPY", "XRP/JPY"];
       const results = await Promise.all([
         ...pairs.map(p =>
@@ -449,6 +452,22 @@ export default function Dashboard() {
   }
 
   // 価格チャート用データ
+  // 選ばれたペアの履歴が無ければその場で取る。全ペアを毎回取ると
+  // OHLCV は外部APIを叩くので画面が重くなる。
+  useEffect(() => {
+    if (priceHistory[activePair]?.length) return;
+    let aborted = false;
+    fetch(`/api/exchange/ohlcv?pair=${encodeURIComponent(activePair)}&timeframe=1h&limit=48`)
+      .then(r => (r.ok ? r.json() : []))
+      .then((bars: OHLCVBar[]) => {
+        if (!aborted && Array.isArray(bars) && bars.length > 0) {
+          setPriceHistory(prev => ({ ...prev, [activePair]: bars }));
+        }
+      })
+      .catch(() => {});
+    return () => { aborted = true; };
+  }, [activePair, priceHistory]);
+
   const chartBars = (priceHistory[activePair] || []).map(b => ({
     time: new Date(b.timestamp).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Tokyo" }),
     price: b.close,
