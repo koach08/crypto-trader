@@ -9,7 +9,7 @@ import { getFearGreedIndex } from "../ai/fear-greed";
 import { RiskManager } from "./risk-manager";
 import { PaperTrader } from "./paper-trader";
 import { loadData, saveData } from "../data";
-import { slippageJPY, summarizeExecutionCosts, type ExecutionCost } from "./execution-cost";
+import { slippageJPY, summarizeExecutionCosts, allInCostJPY, type ExecutionCost } from "./execution-cost";
 import { attributePnL } from "./lane-pnl";
 import { riskBudgetedSize } from "./risk-sizing";
 import { refreshArchive, flattenArchive } from "./execution-archive";
@@ -496,6 +496,16 @@ async function triggerLossReflection(
  */
 const MAX_COST_RECORDS = 2000;
 
+/** 円の free 残高。全部込みコストの実測に使う。取れなければ NaN。 */
+async function jpyFreeNow(exchange: import("../exchanges/types").IExchange): Promise<number> {
+  try {
+    const bal = await exchange.getBalance();
+    return bal.find((b) => b.currency === "JPY")?.free ?? NaN;
+  } catch {
+    return NaN;
+  }
+}
+
 /** 発注直前の中値。bid/ask が無ければ last で代用する。 */
 async function refMidPrice(
   exchange: import("../exchanges/types").IExchange,
@@ -521,6 +531,8 @@ async function recordExecutionCost(
   refMid: number,
   viaMaker: boolean,
   lane: "core" | "tactical",
+  jpyBefore?: number,
+  jpyAfter?: number,
 ): Promise<void> {
   const fillPrice = order.price > 0 ? order.price : refMid;
   const amountBase = order.amount ?? 0;
@@ -536,6 +548,10 @@ async function recordExecutionCost(
     slippageJPY: slippageJPY(side, fillPrice, refMid, amountBase),
     viaMaker,
     lane,
+    allInCostJPY:
+      jpyBefore !== undefined && jpyAfter !== undefined
+        ? allInCostJPY({ side, jpyBefore, jpyAfter, amountBase, fillPrice })
+        : undefined,
   };
   state.executionCosts.push(rec);
   if (state.executionCosts.length > MAX_COST_RECORDS) {
@@ -543,7 +559,10 @@ async function recordExecutionCost(
   }
   console.log(
     `[cost] ${pair} ${side} ${viaMaker ? "maker" : "taker"} 中値 ¥${refMid.toFixed(2)} → 約定 ¥${fillPrice.toFixed(2)} ` +
-      `不利分 ¥${rec.slippageJPY.toFixed(1)} (${((rec.slippageJPY / rec.notionalJPY) * 100).toFixed(3)}%)`
+      `不利分 ¥${rec.slippageJPY.toFixed(1)} (${((rec.slippageJPY / rec.notionalJPY) * 100).toFixed(3)}%)` +
+      (rec.allInCostJPY !== undefined
+        ? ` / 実測コスト ¥${rec.allInCostJPY.toFixed(1)} (${((rec.allInCostJPY / rec.notionalJPY) * 100).toFixed(3)}%)`
+        : " / 実測コスト 取得できず")
   );
   await saveData("execution-costs", state.executionCosts);
 }
@@ -555,16 +574,17 @@ async function executeBuy(
   lane: "core" | "tactical" = "tactical",
 ): Promise<{ order: import("../types").OrderResult; viaMaker: boolean }> {
   const refMid = await refMidPrice(exchange, pair);
+  const jpyBefore = await jpyFreeNow(exchange);
   if (USE_MAKER_ONLY && exchange.limitBuyMakerOnly) {
     const makerOrder = await exchange.limitBuyMakerOnly(pair, amountJPY, MAKER_TIMEOUT_MS);
     if (makerOrder) {
-      await recordExecutionCost(pair, "buy", makerOrder, refMid, true, lane);
+      await recordExecutionCost(pair, "buy", makerOrder, refMid, true, lane, jpyBefore, await jpyFreeNow(exchange));
       return { order: makerOrder, viaMaker: true };
     }
     console.log(`[${pair}] maker BUY timeout → 成行フォールバック`);
   }
   const order = await exchange.marketBuy(pair, amountJPY);
-  await recordExecutionCost(pair, "buy", order, refMid, false, lane);
+  await recordExecutionCost(pair, "buy", order, refMid, false, lane, jpyBefore, await jpyFreeNow(exchange));
   return { order, viaMaker: false };
 }
 
@@ -580,13 +600,14 @@ async function executeSell(
   lane: "core" | "tactical" = "tactical",
 ): Promise<{ order: import("../types").OrderResult; viaMaker: boolean }> {
   const refMid = await refMidPrice(exchange, pair);
+  const jpyBefore = await jpyFreeNow(exchange);
   if (!forceMarket && USE_MAKER_ONLY && exchange.limitSellMakerOnly) {
     // メイカー指値で失敗しても売り自体を落とさない。ここで throw が抜けると
     // SL / 利確が発注されないまま終わる。
     try {
       const makerOrder = await exchange.limitSellMakerOnly(pair, amountBase, MAKER_TIMEOUT_MS);
       if (makerOrder) {
-        await recordExecutionCost(pair, "sell", makerOrder, refMid, true, lane);
+        await recordExecutionCost(pair, "sell", makerOrder, refMid, true, lane, jpyBefore, await jpyFreeNow(exchange));
         return { order: makerOrder, viaMaker: true };
       }
       console.log(`[${pair}] maker SELL timeout → 成行フォールバック`);
@@ -595,7 +616,7 @@ async function executeSell(
     }
   }
   const order = await exchange.marketSell(pair, amountBase);
-  await recordExecutionCost(pair, "sell", order, refMid, false, lane);
+  await recordExecutionCost(pair, "sell", order, refMid, false, lane, jpyBefore, await jpyFreeNow(exchange));
   return { order, viaMaker: false };
 }
 

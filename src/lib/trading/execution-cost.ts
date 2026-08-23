@@ -27,6 +27,14 @@ export interface ExecutionCost {
   viaMaker: boolean;
   /** どちらの枠の発注か。無い記録は戦術枠として扱う (計測を入れる前のもの) */
   lane?: "core" | "tactical";
+  /**
+   * 円残高の実測差分から出した「全部込みのコスト」。
+   * 取引所が返す約定データの手数料欄が当てにならない (公表料率は
+   * 0.01-0.15% なのに、返ってくる値を合計すると売買代金 ¥2,750,143 に対して
+   * ¥0 になる) ため、**円が実際にいくら減ったか**で測る。
+   * 手数料も気配差もまとめて入る。取れなかったときは undefined。
+   */
+  allInCostJPY?: number;
 }
 
 /** 中値に対する不利分。買いは高く買うほど、売りは安く売るほどコスト。 */
@@ -95,4 +103,34 @@ export function summarizeExecutionCosts(costs: ExecutionCost[]): CostSummary {
     costPercent: notionalJPY > 0 ? (slip / notionalJPY) * 100 : 0,
     since: costs.length > 0 ? costs[0].at : null,
   };
+}
+
+/**
+ * 円残高の実測差分から全部込みのコストを出す。
+ *
+ * 買い: 出ていくはずの円 = 約定数量 × 約定単価。実際に減った円がそれより多ければ差が手数料。
+ * 売り: 入るはずの円 = 約定数量 × 約定単価。実際に増えた円がそれより少なければ差が手数料。
+ *
+ * 取引所の手数料欄を信用しないための計測なので、こちらを正とする。
+ */
+export function allInCostJPY(input: {
+  side: "buy" | "sell";
+  jpyBefore: number;
+  jpyAfter: number;
+  amountBase: number;
+  fillPrice: number;
+}): number | undefined {
+  const { side, jpyBefore, jpyAfter, amountBase, fillPrice } = input;
+  if (!(amountBase > 0) || !(fillPrice > 0)) return undefined;
+  if (!Number.isFinite(jpyBefore) || !Number.isFinite(jpyAfter)) return undefined;
+
+  const expected = amountBase * fillPrice;
+  const actual = side === "buy" ? jpyBefore - jpyAfter : jpyAfter - jpyBefore;
+  if (!Number.isFinite(actual)) return undefined;
+
+  // 買いは「多く出ていった分」、売りは「少なく入ってきた分」がコスト
+  const cost = side === "buy" ? actual - expected : expected - actual;
+  // 明らかに桁が違うものは、別の入出金が挟まったとみなして捨てる
+  if (Math.abs(cost) > expected * 0.1) return undefined;
+  return cost;
 }

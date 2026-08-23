@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { slippageJPY, summarizeExecutionCosts, type ExecutionCost } from "./execution-cost";
+import { slippageJPY, summarizeExecutionCosts, allInCostJPY, type ExecutionCost } from "./execution-cost";
 
 describe("slippageJPY", () => {
   it("買いは中値より高く買った分がコスト", () => {
@@ -44,5 +44,33 @@ describe("summarizeExecutionCosts", () => {
     expect(s.fills).toBe(0);
     expect(s.costPercent).toBe(0);
     expect(s.since).toBeNull();
+  });
+});
+
+describe("allInCostJPY", () => {
+  it("買いは余分に出ていった円がコスト", () => {
+    // ¥15,000 分の建玉に ¥18 の手数料がかかったケース
+    const c = allInCostJPY({ side: "buy", jpyBefore: 50_000, jpyAfter: 34_982, amountBase: 1, fillPrice: 15_000 });
+    expect(c).toBeCloseTo(18, 6);
+  });
+
+  it("売りは入ってこなかった円がコスト", () => {
+    const c = allInCostJPY({ side: "sell", jpyBefore: 10_000, jpyAfter: 24_982, amountBase: 1, fillPrice: 15_000 });
+    expect(c).toBeCloseTo(18, 6);
+  });
+
+  it("手数料ゼロなら 0 が出る (推定値を混ぜない)", () => {
+    const c = allInCostJPY({ side: "buy", jpyBefore: 50_000, jpyAfter: 35_000, amountBase: 1, fillPrice: 15_000 });
+    expect(c).toBeCloseTo(0, 8);
+  });
+
+  it("桁が違う差は捨てる (別の入出金が挟まった場合)", () => {
+    // 途中で ¥50,000 入金されたようなケース
+    const c = allInCostJPY({ side: "buy", jpyBefore: 50_000, jpyAfter: 85_000, amountBase: 1, fillPrice: 15_000 });
+    expect(c).toBeUndefined();
+  });
+
+  it("値が欠けていれば undefined", () => {
+    expect(allInCostJPY({ side: "buy", jpyBefore: 1, jpyAfter: 1, amountBase: 0, fillPrice: 1 })).toBeUndefined();
   });
 });
