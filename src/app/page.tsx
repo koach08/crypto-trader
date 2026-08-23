@@ -428,6 +428,29 @@ export default function Dashboard() {
     return () => { clearInterval(fast); clearInterval(slow); clearInterval(navInt); clearInterval(diagInt); clearInterval(learnInt); clearInterval(timingInt); clearInterval(strategyInt); clearInterval(lifeInt); };
   }, [fetchData, fetchSlowData, fetchLifetime, fetchNav, fetchDiagnostics, fetchLearning, fetchTiming, fetchAdaptiveStrategy]);
 
+  // 価格チャート用データ。選ばれたペアの履歴が無ければその場で取る。
+  // 全ペアを毎回取ると OHLCV は外部APIを叩くので画面が重くなる。
+  //
+  // 【必ず早期リターンより前に置く】以前はこの下の `if (loading) return` の
+  // 後ろにあった。初回は loading=true で早期リターンするためこの useEffect が
+  // 呼ばれず、loading=false になった2回目でフックが1つ増える。React が
+  // フック数の不一致 (error #310) で例外を投げ、**ページ全体が描画されなく
+  // なっていた**。「価格推移がデータ取得中のまま」の正体はチャートではなく
+  // ページのクラッシュ。
+  useEffect(() => {
+    if (priceHistory[activePair]?.length) return;
+    let aborted = false;
+    fetch(`/api/exchange/ohlcv?pair=${encodeURIComponent(activePair)}&timeframe=1h&limit=48`)
+      .then(r => (r.ok ? r.json() : []))
+      .then((bars: OHLCVBar[]) => {
+        if (!aborted && Array.isArray(bars) && bars.length > 0) {
+          setPriceHistory(prev => ({ ...prev, [activePair]: bars }));
+        }
+      })
+      .catch(() => {});
+    return () => { aborted = true; };
+  }, [activePair, priceHistory]);
+
   if (loading) {
     return <div className="text-center py-20 text-zinc-500">読み込み中...</div>;
   }
@@ -450,23 +473,6 @@ export default function Dashboard() {
       }
     }
   }
-
-  // 価格チャート用データ
-  // 選ばれたペアの履歴が無ければその場で取る。全ペアを毎回取ると
-  // OHLCV は外部APIを叩くので画面が重くなる。
-  useEffect(() => {
-    if (priceHistory[activePair]?.length) return;
-    let aborted = false;
-    fetch(`/api/exchange/ohlcv?pair=${encodeURIComponent(activePair)}&timeframe=1h&limit=48`)
-      .then(r => (r.ok ? r.json() : []))
-      .then((bars: OHLCVBar[]) => {
-        if (!aborted && Array.isArray(bars) && bars.length > 0) {
-          setPriceHistory(prev => ({ ...prev, [activePair]: bars }));
-        }
-      })
-      .catch(() => {});
-    return () => { aborted = true; };
-  }, [activePair, priceHistory]);
 
   const chartBars = (priceHistory[activePair] || []).map(b => ({
     time: new Date(b.timestamp).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Tokyo" }),
