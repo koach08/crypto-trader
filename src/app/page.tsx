@@ -528,22 +528,30 @@ export default function Dashboard() {
         const cash = data.jpyBalance.total;
         const core = data.coreHolding?.totalValueJPY ?? 0;
         const tactical = (data.positions ?? []).reduce((s, p) => s + (p.valueJPY ?? 0), 0);
-        const nav = cash + core + tactical;
-        if (nav <= 0) return null;
-        const pct = (v: number) => (v / nav) * 100;
+        // コア台帳にも戦術ポジションにも属さない暗号資産 (旧ペアの残り・ダスト・
+        // 手動で買った分)。これを足さないと資産構成の合計が NAV と合わない。
+        // 実際 ¥123,172 と ¥125,225 で ¥2,053 ずれていた。
+        const cryptoTotal = nav?.current
+          ? Object.values(nav.current.positions ?? {}).reduce((s, p) => s + (p.valueJPY ?? 0), 0)
+          : core + tactical;
+        const other = Math.max(0, cryptoTotal - core - tactical);
+        const navTotal = cash + core + tactical + other;
+        if (navTotal <= 0) return null;
+        const pct = (v: number) => (v / navTotal) * 100;
         return (
           <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
             <div className="flex items-baseline justify-between gap-2 flex-wrap mb-3">
               <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold">資産構成</div>
               <div className="text-sm">
                 <span className="text-zinc-500">総資産 </span>
-                <span className="font-mono">¥{Math.round(nav).toLocaleString()}</span>
+                <span className="font-mono">¥{Math.round(navTotal).toLocaleString()}</span>
               </div>
             </div>
             <div className="flex h-3 rounded-full overflow-hidden bg-zinc-950">
               <div className="bg-zinc-600" style={{ width: `${pct(cash)}%` }} title="現金" />
               <div className="bg-sky-600" style={{ width: `${pct(core)}%` }} title="コア保有" />
               <div className="bg-emerald-600" style={{ width: `${pct(tactical)}%` }} title="戦術枠" />
+              <div className="bg-zinc-700" style={{ width: `${pct(other)}%` }} title="その他 (旧ペア・ダスト)" />
             </div>
             <div className="mt-2 flex gap-4 text-xs flex-wrap">
               <span className="flex items-center gap-1.5">
@@ -564,6 +572,14 @@ export default function Dashboard() {
                 <span className="font-mono text-zinc-300">¥{Math.round(tactical).toLocaleString()}</span>
                 <span className="text-zinc-600">{pct(tactical).toFixed(0)}%</span>
               </span>
+              {other > 1 && (
+                <span className="flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-full bg-zinc-700" />
+                  <span className="text-zinc-400">その他</span>
+                  <span className="font-mono text-zinc-300">¥{Math.round(other).toLocaleString()}</span>
+                  <span className="text-zinc-600">{pct(other).toFixed(0)}%</span>
+                </span>
+              )}
             </div>
             {pct(cash) >= 90 && (
               <div className="mt-2 text-xs text-amber-300/90">

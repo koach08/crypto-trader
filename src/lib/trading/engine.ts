@@ -3614,6 +3614,7 @@ export function getCumulativePnL() {
   // 「128決済 WR38% -¥11,583」が並ぶ状態を解消する。
   // 取引所から取れていないときだけアプリ側にフォールバックする。
   const fromExchange = state.paperMode ? null : state.exchangePnL;
+  const closedTrades = fromExchange ? fromExchange.closedTrades : sells.length;
   const totalRealizedPnL = fromExchange
     ? fromExchange.realizedJPY
     : sells.reduce((sum, t) => sum + (t.pnl ?? 0), 0);
@@ -3644,10 +3645,13 @@ export function getCumulativePnL() {
     totalFees,
     netPnL: totalRealizedPnL + unrealizedPnL - totalFees,
     totalTrades: trades.length,
-    closedTrades: fromExchange ? fromExchange.closedTrades : sells.length,
+    closedTrades,
     wins,
     losses,
-    winRate: sells.length > 0 ? (wins / sells.length) * 100 : 0,
+    // 【分子と分母を同じ出所にする】wins は取引所ベース (63) なのに分母だけ
+    // アプリ側の sells.length (128) を使っていたため、63/128 = 49.2% と出て
+    // いた。同じ画面の別パネルは 63/188 = 34% で、勝率が2つ存在していた。
+    winRate: closedTrades > 0 ? (wins / closedTrades) * 100 : 0,
     positionValueJPY,
     firstTradeDate: trades.length > 0 ? trades[0].timestamp : null,
     lastTradeDate: trades.length > 0 ? trades[trades.length - 1].timestamp : null,
