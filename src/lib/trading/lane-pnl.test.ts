@@ -66,3 +66,36 @@ describe("attributePnL", () => {
     expect(r.core.netRealizedJPY).toBe(863);
   });
 });
+
+describe("attributePnL: 口座全体との整合", () => {
+  it("全体が渡されたら戦術枠は引き算で出す (上部の数字と必ず一致する)", () => {
+    // 本番で食い違っていた形。上部は取引所ベースで 188決済 -¥5,256、
+    // 枠別はアプリ側で 128決済 -¥13,608 になっていた。
+    const r = attributePnL({
+      trades: [
+        mkTrade("core-tp-1", "sell", 3_002),
+        mkTrade("live-1", "sell", 12_000, -400),
+      ],
+      costs: [],
+      coreRealizedJPY: 863,
+      exchangeTotal: { realizedJPY: -5_256, closedTrades: 188, wins: 92, losses: 96 },
+    });
+    expect(r.core.realizedJPY).toBe(863);
+    expect(r.core.closes).toBe(1);
+    // 戦術 = 全体 - コア
+    expect(r.tactical.realizedJPY).toBe(-6_119);
+    expect(r.tactical.closes).toBe(187);
+    // 足すと全体に戻る
+    expect(r.core.realizedJPY + r.tactical.realizedJPY).toBe(-5_256);
+    expect(r.core.closes + r.tactical.closes).toBe(188);
+  });
+
+  it("全体が無ければ従来どおりアプリ側の記録で出す", () => {
+    const r = attributePnL({
+      trades: [mkTrade("live-1", "sell", 12_000, -400)],
+      costs: [],
+    });
+    expect(r.tactical.realizedJPY).toBe(-400);
+    expect(r.tactical.closes).toBe(1);
+  });
+});

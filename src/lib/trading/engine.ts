@@ -2412,6 +2412,15 @@ export async function getLanePnL() {
     trades,
     costs: state.executionCosts,
     coreRealizedJPY: state.coreHolding.realizedJPY ?? 0,
+    // 口座全体は取引所ベース。画面上部の確定損益と枠別が食い違わないようにする。
+    exchangeTotal: state.paperMode || !state.exchangePnL
+      ? undefined
+      : {
+          realizedJPY: state.exchangePnL.realizedJPY,
+          closedTrades: state.exchangePnL.closedTrades,
+          wins: state.exchangePnL.wins,
+          losses: state.exchangePnL.losses,
+        },
   });
 }
 

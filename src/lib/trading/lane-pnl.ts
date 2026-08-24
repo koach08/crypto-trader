@@ -51,6 +51,17 @@ export function attributePnL(input: {
   costs: ExecutionCost[];
   /** コア枠の確定損益 (コア台帳が持っている正の値)。trades 側の pnl より信頼する */
   coreRealizedJPY?: number;
+  /**
+   * 口座全体の確定損益と決済数 (取引所の約定履歴ベース)。
+   * 渡されたらこちらを正とし、戦術枠は「全体 - コア枠」で出す。
+   *
+   * 【なぜ】画面上部の確定損益は取引所ベースに統一したのに、枠別だけ
+   * アプリ側の記録 (liveTrades の pnl) を読んでいて、同じ画面に
+   * 「188決済 -¥5,256」と「128決済 -¥13,608」が並んでいた。
+   * アプリ側の pnl は建玉の取得単価から計算していて、その取得単価には
+   * 複数のバグがあった (コア枠の混入 / 端数を分母にした発散) ので信用できない。
+   */
+  exchangeTotal?: { realizedJPY: number; closedTrades: number; wins: number; losses: number };
 }): { core: LaneStats; tactical: LaneStats } {
   const out = { core: empty("core"), tactical: empty("tactical") };
 
@@ -74,6 +85,21 @@ export function attributePnL(input: {
   // 持たせていない (取得原価はコア台帳側にあるため)。
   if (typeof input.coreRealizedJPY === "number") {
     out.core.realizedJPY = input.coreRealizedJPY;
+  }
+
+  // 口座全体が分かるなら、戦術枠は引き算で出す。アプリ側の pnl を足し上げるより
+  // 正確で、上部の数字とも必ず一致する。
+  if (input.exchangeTotal) {
+    const coreCloses = input.trades.filter((t) => laneOf(t.id) === "core" && t.side === "sell").length;
+    out.core.closes = coreCloses;
+    // コアの決済は利確のみ。損切りしない枠なので、実現がプラスなら勝ち扱い。
+    out.core.wins = out.core.realizedJPY > 0 ? coreCloses : 0;
+    out.core.losses = out.core.realizedJPY < 0 ? coreCloses : 0;
+
+    out.tactical.realizedJPY = input.exchangeTotal.realizedJPY - out.core.realizedJPY;
+    out.tactical.closes = Math.max(0, input.exchangeTotal.closedTrades - coreCloses);
+    out.tactical.wins = Math.max(0, input.exchangeTotal.wins - out.core.wins);
+    out.tactical.losses = Math.max(0, input.exchangeTotal.losses - out.core.losses);
   }
 
   for (const s of [out.core, out.tactical]) {
