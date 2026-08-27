@@ -13,7 +13,7 @@ import { slippageJPY, summarizeExecutionCosts, allInCostJPY, type ExecutionCost 
 import { attributePnL } from "./lane-pnl";
 import { riskBudgetedSize } from "./risk-sizing";
 import { refreshArchive, flattenArchive } from "./execution-archive";
-import { computeDrawdown, computeTradeQuality, INSTITUTIONAL_BENCHMARK, type DrawdownPoint } from "./performance-metrics";
+import { computeDrawdown, computeTradeQuality, evaluateEdgeBudget, INSTITUTIONAL_BENCHMARK, type DrawdownPoint } from "./performance-metrics";
 import { buildCryptoReturn, buildFundingReport, type CashFlow } from "./cash-flow";
 import { runQuantAnalysis, BASELINE_SIGNAL_WEIGHTS, setActiveSignalWeights } from "../quant/signals";
 import { calculateFinalDecision } from "../quant/scoring-engine";
@@ -120,6 +120,10 @@ const TREND_ENTRY_SL_PERCENT = Number(process.env.TREND_ENTRY_SL_PERCENT ?? "8")
 const TREND_ENTRY_TP_PERCENT = Number(process.env.TREND_ENTRY_TP_PERCENT ?? "30");
 // 1 回の取引で失ってよい額 (総資産に対する割合)。損切り幅ではなくこちらを固定する。
 const RISK_FRACTION_PER_TRADE = Number(process.env.RISK_FRACTION_PER_TRADE ?? "0.01");
+// 実績連動の判定に使う直近の決済件数。全期間平均だと、設定を変えた後の成績が
+// 変える前の大量のサンプルに埋もれる。
+const EDGE_WINDOW_TRADES = Number(process.env.EDGE_WINDOW_TRADES ?? "30");
+const EDGE_MIN_SAMPLES = Number(process.env.EDGE_MIN_SAMPLES ?? "20");
 // 売買が発生しないサイクルで AI 照会を省く (課金抑制)。SKIP_AI_WHEN_IDLE=false で無効化
 const SKIP_AI_WHEN_IDLE = process.env.SKIP_AI_WHEN_IDLE !== "false";
 const LIVE_BASE_TRADE_JPY = Number(process.env.LIVE_BASE_TRADE_JPY || 15000); // 1回あたり目安サイズ（ユーザ設定可能）
@@ -394,6 +398,8 @@ interface EngineState {
     sellVolumeJPY: number;
     grossProfitJPY: number;
     grossLossJPY: number;
+    /** 直近 EDGE_WINDOW_TRADES 件の決済損益 (実績連動の資金配分に使う) */
+    recentCloses: number[];
     at: string;
   } | null;
   /** 画面から変更したコア設定 (env 既定に重ねる) */
@@ -1677,9 +1683,10 @@ async function runCycleForPair(pair: string): Promise<void> {
       // 上の下限 (LIVE_BASE_TRADE_JPY) もここで上書きする。下限がリスク上限を
       // 超えたら、下限のほうが間違っている。
       if (trendEntryOverride && !state.paperMode) {
+        const edge = currentEdgeBudget();
         const sized = riskBudgetedSize({
           navJPY: state.lastNavJPY > 0 ? state.lastNavJPY : jpyFree + currentPositionJPY,
-          riskFraction: RISK_FRACTION_PER_TRADE,
+          riskFraction: edge.budget.riskFraction,
           stopLossPercent: TREND_ENTRY_SL_PERCENT,
           availableJPY: jpyFree,
           maxJPY: dynamicMax,
@@ -1690,6 +1697,7 @@ async function runCycleForPair(pair: string): Promise<void> {
           return;
         }
         console.log(`[${pair}] リスク基準サイズ: ¥${sized.sizeJPY.toLocaleString()} (損切り時 ¥${Math.round(sized.riskJPY).toLocaleString()}) ${sized.reason}`);
+        console.log(`[${pair}] 実績連動: ${edge.budget.phase} x${edge.budget.multiplier} — ${edge.budget.reason}`);
         riskAdjustedTradeAmount = sized.sizeJPY;
       }
 
@@ -2407,6 +2415,27 @@ export async function getPerformanceReport() {
   };
 }
 
+/** 直近の決済から戦術枠の張る額を決める。悪ければ縮め、良ければ戻す。 */
+function currentEdgeBudget() {
+  const recent = state.exchangePnL?.recentCloses ?? [];
+  const wins = recent.filter((p) => p > 0);
+  const losses = recent.filter((p) => p < 0);
+  const quality = computeTradeQuality({
+    wins: wins.length,
+    losses: losses.length,
+    grossProfitJPY: wins.reduce((s, p) => s + p, 0),
+    grossLossJPY: losses.reduce((s, p) => s - p, 0),
+  });
+  return {
+    quality,
+    budget: evaluateEdgeBudget({
+      quality,
+      minSamples: EDGE_MIN_SAMPLES,
+      baseRiskFraction: RISK_FRACTION_PER_TRADE,
+    }),
+  };
+}
+
 /**
  * 運用成績の指標。損益だけでは「相場が上げた」と「仕組みが機能した」の
  * 区別がつかないので、ドローダウン・プロフィットファクター・期待値・損益比を出す。
@@ -2430,6 +2459,8 @@ export async function getPerformanceMetrics() {
       grossProfitJPY: ex?.grossProfitJPY ?? 0,
       grossLossJPY: ex?.grossLossJPY ?? 0,
     }),
+    /** 直近の成績と、それに応じた戦術枠の張る額 */
+    edge: currentEdgeBudget(),
     benchmark: INSTITUTIONAL_BENCHMARK,
     samplePoints: series.length,
   };
@@ -3634,6 +3665,7 @@ async function refreshExchangePnL(): Promise<void> {
   state.exchangePnL = {
     realizedJPY, closedTrades, wins, losses, buyVolumeJPY, sellVolumeJPY,
     grossProfitJPY, grossLossJPY,
+    recentCloses: (summary.closes ?? []).slice(-EDGE_WINDOW_TRADES).map((c) => c.pnlJPY),
     at: new Date().toISOString(),
   };
   console.log(`[pnl] 取引所ベース更新: 確定 ¥${Math.round(realizedJPY).toLocaleString()} / ${closedTrades}決済 (${wins}W ${losses}L)`);

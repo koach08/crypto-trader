@@ -30,7 +30,16 @@ export interface LifetimePnLByPair {
   lastTradeTimestamp: number | null;
 }
 
+/** 決済 1 件ぶんの記録。直近 N 件だけで成績を測るために使う。 */
+export interface ClosedTradeRecord {
+  at: number;
+  pair: string;
+  pnlJPY: number;
+}
+
 export interface LifetimePnLSummary {
+  /** 決済の明細 (時刻順)。全期間の平均だけだと、設定を変えた後の成績が埋もれる */
+  closes: ClosedTradeRecord[];
   totalRealizedPnL: number;
   totalFees: number;
   netRealizedPnL: number;
@@ -56,6 +65,7 @@ export function computeLifetimePnL(executions: ExecutionRecord[]): LifetimePnLSu
   const inventory: Record<string, InventoryLot[]> = {};
   const perPair: Record<string, LifetimePnLByPair> = {};
 
+  const closes: ClosedTradeRecord[] = [];
   let totalRealizedPnL = 0;
   let totalFees = 0;
   let closedTrades = 0;
@@ -136,6 +146,7 @@ export function computeLifetimePnL(executions: ExecutionRecord[]): LifetimePnLSu
         stats.realizedPnL += pnl;
         stats.closedTrades += 1;
         closedTrades += 1;
+        closes.push({ at: e.timestamp, pair: e.pair, pnlJPY: pnl });
         if (pnl > 0) {
           stats.wins += 1;
           stats.grossProfit += pnl;
@@ -168,6 +179,7 @@ export function computeLifetimePnL(executions: ExecutionRecord[]): LifetimePnLSu
     winRate: closedTrades > 0 ? (wins / closedTrades) * 100 : 0,
     totalBuyVolumeJPY,
     totalSellVolumeJPY,
+    closes: closes.sort((a, b) => a.at - b.at),
     byPair: Object.values(perPair).sort((a, b) => Math.abs(b.realizedPnL) - Math.abs(a.realizedPnL)),
     firstTradeTimestamp: firstTs,
     lastTradeTimestamp: lastTs,

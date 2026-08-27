@@ -127,3 +127,73 @@ export const INSTITUTIONAL_BENCHMARK = {
   profitFactor: 1.8,
   sharpe: 1.5,
 } as const;
+
+/**
+ * 戦術枠にいくら張らせるかを、実績から決める。
+ *
+ * 【なぜ要るか】これまで戦術枠は「余った現金を全部使ってよい」構造だった。
+ * 実測では 1 回あたりの期待値が -¥114 で、187 決済で -¥6,119 を作っている。
+ * 期待値がマイナスの仕組みに満額を張らせる理由が無い。
+ *
+ * 【止めずに縮める理由】完全に止めると新しい成績が一件も溜まらず、
+ * 「直したものが効いたか」を永久に判定できなくなる。実際、リスク判定が
+ * コア枠を危険視して戦術枠を全停止させたとき、それが起きた。
+ * だから止めるのではなく張る額を落とす。悪ければ小さく、良くなれば戻す。
+ *
+ * 【全期間ではなく直近で測る理由】設定を変えた後の成績が、変える前の
+ * 大量のサンプルに埋もれてしまうため。
+ */
+export interface EdgeBudgetResult {
+  /** 1 回のリスク割合 (総資産に対して) */
+  riskFraction: number;
+  /** 満額に対する倍率 */
+  multiplier: number;
+  /** 判定に使ったサンプル数 */
+  samples: number;
+  phase: "観察中" | "エッジ未確認" | "エッジ確認";
+  reason: string;
+}
+
+export function evaluateEdgeBudget(input: {
+  quality: TradeQuality;
+  /** これ未満のサンプルでは良し悪しを判定しない */
+  minSamples: number;
+  /** エッジが確認できたときの 1 回のリスク割合 */
+  baseRiskFraction: number;
+}): EdgeBudgetResult {
+  const { quality, minSamples, baseRiskFraction } = input;
+
+  if (quality.trades < minSamples) {
+    // 判定材料が足りない。半分の大きさで様子を見ながらサンプルを溜める。
+    return {
+      riskFraction: baseRiskFraction * 0.5,
+      multiplier: 0.5,
+      samples: quality.trades,
+      phase: "観察中",
+      reason: `直近 ${quality.trades} 件では判定できない (${minSamples} 件必要)。半分の大きさで様子を見る`,
+    };
+  }
+
+  if (!quality.hasEdge || quality.expectancyJPY <= 0) {
+    return {
+      riskFraction: baseRiskFraction * 0.25,
+      multiplier: 0.25,
+      samples: quality.trades,
+      phase: "エッジ未確認",
+      reason:
+        `直近 ${quality.trades} 件で期待値 ¥${Math.round(quality.expectancyJPY).toLocaleString()}/回、` +
+        `損益比 ${quality.payoffRatio.toFixed(2)} (必要 ${quality.requiredPayoffRatio.toFixed(2)})。` +
+        `張る額を 1/4 に落とす`,
+    };
+  }
+
+  return {
+    riskFraction: baseRiskFraction,
+    multiplier: 1,
+    samples: quality.trades,
+    phase: "エッジ確認",
+    reason:
+      `直近 ${quality.trades} 件で期待値 ¥${Math.round(quality.expectancyJPY).toLocaleString()}/回、` +
+      `損益比 ${quality.payoffRatio.toFixed(2)} が必要水準 ${quality.requiredPayoffRatio.toFixed(2)} を上回る`,
+  };
+}

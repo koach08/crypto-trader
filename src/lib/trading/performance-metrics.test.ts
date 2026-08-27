@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { computeDrawdown, computeTradeQuality, INSTITUTIONAL_BENCHMARK } from "./performance-metrics";
+import { computeDrawdown, computeTradeQuality, evaluateEdgeBudget, INSTITUTIONAL_BENCHMARK } from "./performance-metrics";
 
 const pt = (at: string, equityJPY: number) => ({ at, equityJPY });
 
@@ -73,5 +73,33 @@ describe("computeTradeQuality", () => {
     expect(r.trades).toBe(0);
     expect(r.expectancyJPY).toBe(0);
     expect(r.hasEdge).toBe(false);
+  });
+});
+
+describe("evaluateEdgeBudget", () => {
+  const base = { minSamples: 20, baseRiskFraction: 0.01 };
+
+  it("サンプル不足なら半分の大きさで様子を見る (止めない)", () => {
+    const q = computeTradeQuality({ wins: 3, losses: 2, grossProfitJPY: 900, grossLossJPY: 400 });
+    const r = evaluateEdgeBudget({ ...base, quality: q });
+    expect(r.phase).toBe("観察中");
+    expect(r.multiplier).toBe(0.5);
+  });
+
+  it("エッジが無ければ 1/4 に落とす (ゼロにはしない)", () => {
+    // 実測: 勝率38.2% / 損益比0.79 / 必要1.62
+    const q = computeTradeQuality({ wins: 50, losses: 81, grossProfitJPY: 283 * 50, grossLossJPY: 359 * 81 });
+    const r = evaluateEdgeBudget({ ...base, quality: q });
+    expect(r.phase).toBe("エッジ未確認");
+    expect(r.multiplier).toBe(0.25);
+    // ゼロにすると新しい成績が溜まらず、直した効果を永久に判定できなくなる
+    expect(r.riskFraction).toBeGreaterThan(0);
+  });
+
+  it("エッジが確認できたら満額に戻す", () => {
+    const q = computeTradeQuality({ wins: 30, losses: 70, grossProfitJPY: 30 * 1_000, grossLossJPY: 70 * 300 });
+    const r = evaluateEdgeBudget({ ...base, quality: q });
+    expect(r.phase).toBe("エッジ確認");
+    expect(r.riskFraction).toBe(0.01);
   });
 });
