@@ -14,6 +14,10 @@ import type { ExecutionRecord } from "../exchanges/types";
 export interface LifetimePnLByPair {
   pair: string;
   realizedPnL: number;
+  /** 勝ちトレードの利益合計 (プロフィットファクターの分子) */
+  grossProfit: number;
+  /** 負けトレードの損失合計 (正の数。プロフィットファクターの分母) */
+  grossLoss: number;
   buyVolume: number;
   sellVolume: number;
   closedTrades: number;
@@ -71,6 +75,8 @@ export function computeLifetimePnL(executions: ExecutionRecord[]): LifetimePnLSu
       perPair[e.pair] = {
         pair: e.pair,
         realizedPnL: 0,
+        grossProfit: 0,
+        grossLoss: 0,
         buyVolume: 0,
         sellVolume: 0,
         closedTrades: 0,
@@ -132,9 +138,11 @@ export function computeLifetimePnL(executions: ExecutionRecord[]): LifetimePnLSu
         closedTrades += 1;
         if (pnl > 0) {
           stats.wins += 1;
+          stats.grossProfit += pnl;
           wins += 1;
         } else if (pnl < 0) {
           stats.losses += 1;
+          stats.grossLoss += -pnl;
           losses += 1;
         }
       }

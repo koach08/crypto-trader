@@ -13,6 +13,7 @@ import { slippageJPY, summarizeExecutionCosts, allInCostJPY, type ExecutionCost 
 import { attributePnL } from "./lane-pnl";
 import { riskBudgetedSize } from "./risk-sizing";
 import { refreshArchive, flattenArchive } from "./execution-archive";
+import { computeDrawdown, computeTradeQuality, INSTITUTIONAL_BENCHMARK, type DrawdownPoint } from "./performance-metrics";
 import { buildCryptoReturn, buildFundingReport, type CashFlow } from "./cash-flow";
 import { runQuantAnalysis, BASELINE_SIGNAL_WEIGHTS, setActiveSignalWeights } from "../quant/signals";
 import { calculateFinalDecision } from "../quant/scoring-engine";
@@ -391,6 +392,8 @@ interface EngineState {
     losses: number;
     buyVolumeJPY: number;
     sellVolumeJPY: number;
+    grossProfitJPY: number;
+    grossLossJPY: number;
     at: string;
   } | null;
   /** 画面から変更したコア設定 (env 既定に重ねる) */
@@ -2404,6 +2407,34 @@ export async function getPerformanceReport() {
   };
 }
 
+/**
+ * 運用成績の指標。損益だけでは「相場が上げた」と「仕組みが機能した」の
+ * 区別がつかないので、ドローダウン・プロフィットファクター・期待値・損益比を出す。
+ * 機関投資家の目安も併記する (数字だけでは良し悪しが分からない)。
+ */
+export async function getPerformanceMetrics() {
+  await ensureDataLoaded();
+  const navHistory = await loadData<NavSnapshot[]>("nav-history", []);
+  // 総資産は入金でも増えるので、そのままだとドローダウンが薄まる。
+  // 暗号資産の評価額だけを見る (現金の出入りに影響されない)。
+  const series: DrawdownPoint[] = navHistory
+    .filter((n) => typeof n.cryptoValueJPY === "number" && n.cryptoValueJPY > 0)
+    .map((n) => ({ at: n.timestamp, equityJPY: n.cryptoValueJPY }));
+
+  const ex = state.exchangePnL;
+  return {
+    drawdown: computeDrawdown(series),
+    tradeQuality: computeTradeQuality({
+      wins: ex?.wins ?? 0,
+      losses: ex?.losses ?? 0,
+      grossProfitJPY: ex?.grossProfitJPY ?? 0,
+      grossLossJPY: ex?.grossLossJPY ?? 0,
+    }),
+    benchmark: INSTITUTIONAL_BENCHMARK,
+    samplePoints: series.length,
+  };
+}
+
 /** 枠別 (コア / 戦術) の損益。どちらが稼いでどちらが溶かしているかを分ける。 */
 export async function getLanePnL() {
   await ensureDataLoaded();
@@ -3588,6 +3619,7 @@ async function refreshExchangePnL(): Promise<void> {
   if (executions.length === 0) return;
   const summary = computeLifetimePnL(executions);
   let realizedJPY = 0, closedTrades = 0, wins = 0, losses = 0, buyVolumeJPY = 0, sellVolumeJPY = 0;
+  let grossProfitJPY = 0, grossLossJPY = 0;
   for (const row of summary.byPair) {
     if (!state.pairs.includes(row.pair)) continue;
     realizedJPY += row.realizedPnL;
@@ -3596,9 +3628,12 @@ async function refreshExchangePnL(): Promise<void> {
     losses += row.losses;
     buyVolumeJPY += row.buyVolume;
     sellVolumeJPY += row.sellVolume;
+    grossProfitJPY += row.grossProfit ?? 0;
+    grossLossJPY += row.grossLoss ?? 0;
   }
   state.exchangePnL = {
     realizedJPY, closedTrades, wins, losses, buyVolumeJPY, sellVolumeJPY,
+    grossProfitJPY, grossLossJPY,
     at: new Date().toISOString(),
   };
   console.log(`[pnl] 取引所ベース更新: 確定 ¥${Math.round(realizedJPY).toLocaleString()} / ${closedTrades}決済 (${wins}W ${losses}L)`);
