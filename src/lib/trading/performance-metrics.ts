@@ -29,6 +29,36 @@ export interface DrawdownResult {
   daysUnderwater: number;
 }
 
+/**
+ * 入出金を差し引いた資産曲線を作る。
+ *
+ * 【なぜ総資産そのままではだめか】入金すると総資産が跳ね上がり、下落率が薄まる。
+ * 【なぜ暗号資産の評価額だけでもだめか】現金に寄せた時期が「ほぼ全損」に見える。
+ * 実際、口座がほぼ全額 JPY だった記録が 79 点あり、それを評価額だけで測ったら
+ * 最大ドローダウンが **-99.9%** と出た。現金にいるのは損ではない。
+ *
+ * 見たいのは「入れた金に対して、資産がピークからどれだけ落ちたか」なので、
+ * 総資産からその時点までの入金累計を引く。
+ */
+export function buildEquityCurve(
+  navHistory: Array<{ timestamp: string; total: number }>,
+  flows: Array<{ at: string; amountJPY: number }>
+): DrawdownPoint[] {
+  const sortedFlows = [...flows].sort((a, b) => a.at.localeCompare(b.at));
+  const sorted = [...navHistory].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+  const out: DrawdownPoint[] = [];
+  let idx = 0;
+  let cumulative = 0;
+  for (const n of sorted) {
+    while (idx < sortedFlows.length && sortedFlows[idx].at <= n.timestamp) {
+      cumulative += sortedFlows[idx].amountJPY;
+      idx++;
+    }
+    out.push({ at: n.timestamp, equityJPY: n.total - cumulative });
+  }
+  return out;
+}
+
 export function computeDrawdown(series: DrawdownPoint[]): DrawdownResult {
   const empty: DrawdownResult = {
     maxDrawdownPercent: 0, maxDrawdownJPY: 0, peakAt: null, troughAt: null,

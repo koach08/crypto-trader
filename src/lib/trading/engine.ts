@@ -13,7 +13,7 @@ import { slippageJPY, summarizeExecutionCosts, allInCostJPY, type ExecutionCost 
 import { attributePnL } from "./lane-pnl";
 import { riskBudgetedSize } from "./risk-sizing";
 import { refreshArchive, flattenArchive } from "./execution-archive";
-import { computeDrawdown, computeTradeQuality, evaluateEdgeBudget, INSTITUTIONAL_BENCHMARK, type DrawdownPoint } from "./performance-metrics";
+import { buildEquityCurve, computeDrawdown, computeTradeQuality, evaluateEdgeBudget, INSTITUTIONAL_BENCHMARK } from "./performance-metrics";
 import { buildCryptoReturn, buildFundingReport, type CashFlow } from "./cash-flow";
 import { runQuantAnalysis, BASELINE_SIGNAL_WEIGHTS, setActiveSignalWeights } from "../quant/signals";
 import { calculateFinalDecision } from "../quant/scoring-engine";
@@ -2444,11 +2444,14 @@ function currentEdgeBudget() {
 export async function getPerformanceMetrics() {
   await ensureDataLoaded();
   const navHistory = await loadData<NavSnapshot[]>("nav-history", []);
-  // 総資産は入金でも増えるので、そのままだとドローダウンが薄まる。
-  // 暗号資産の評価額だけを見る (現金の出入りに影響されない)。
-  const series: DrawdownPoint[] = navHistory
-    .filter((n) => typeof n.cryptoValueJPY === "number" && n.cryptoValueJPY > 0)
-    .map((n) => ({ at: n.timestamp, equityJPY: n.cryptoValueJPY }));
+  // 入出金を差し引いた資産曲線で測る。
+  // 総資産そのままだと入金で下落率が薄まり、暗号資産の評価額だけだと
+  // 現金に寄せた時期が「ほぼ全損」に見える (実際 -99.9% と出ていた)。
+  const flows = await loadData<CashFlow[]>("cash-flows", []);
+  const series = buildEquityCurve(
+    navHistory.filter((n) => typeof n.total === "number" && n.total > 0),
+    flows
+  );
 
   const ex = state.exchangePnL;
   return {

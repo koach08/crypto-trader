@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { computeDrawdown, computeTradeQuality, evaluateEdgeBudget, INSTITUTIONAL_BENCHMARK } from "./performance-metrics";
+import { buildEquityCurve, computeDrawdown, computeTradeQuality, evaluateEdgeBudget, INSTITUTIONAL_BENCHMARK } from "./performance-metrics";
 
 const pt = (at: string, equityJPY: number) => ({ at, equityJPY });
 
@@ -101,5 +101,39 @@ describe("evaluateEdgeBudget", () => {
     const r = evaluateEdgeBudget({ ...base, quality: q });
     expect(r.phase).toBe("エッジ確認");
     expect(r.riskFraction).toBe(0.01);
+  });
+});
+
+describe("buildEquityCurve", () => {
+  it("入金を差し引く (入金で下落率が薄まらないように)", () => {
+    const curve = buildEquityCurve(
+      [
+        { timestamp: "2026-08-01T00:00:00.000Z", total: 100_000 },
+        { timestamp: "2026-08-23T00:00:00.000Z", total: 140_000 },
+      ],
+      [{ at: "2026-08-22T00:00:00.000Z", amountJPY: 50_000 }]
+    );
+    expect(curve[0].equityJPY).toBe(100_000);
+    // 入金後は総資産 ¥140,000 でも実質は ¥90,000 (¥10,000 の負け)
+    expect(curve[1].equityJPY).toBe(90_000);
+    expect(computeDrawdown(curve).maxDrawdownPercent).toBeCloseTo(-10, 6);
+  });
+
+  it("現金に寄せた時期を暴落として扱わない", () => {
+    // 総資産で測る限り、暗号資産を売って現金にしただけでは資産は減らない。
+    // 暗号資産の評価額だけで測ると -99.9% になっていた。
+    const curve = buildEquityCurve(
+      [
+        { timestamp: "2026-05-30T00:00:00.000Z", total: 80_687 },
+        { timestamp: "2026-06-01T00:00:00.000Z", total: 80_603 },
+      ],
+      []
+    );
+    expect(computeDrawdown(curve).maxDrawdownPercent).toBeGreaterThan(-1);
+  });
+
+  it("入出金が無ければ総資産そのまま", () => {
+    const curve = buildEquityCurve([{ timestamp: "2026-08-01T00:00:00.000Z", total: 1_000 }], []);
+    expect(curve[0].equityJPY).toBe(1_000);
   });
 });
