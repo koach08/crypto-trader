@@ -65,7 +65,8 @@ describe("computeTradeQuality", () => {
 
   it("負けが無ければ profitFactor は無限大にする (0 割りしない)", () => {
     const r = computeTradeQuality({ wins: 3, losses: 0, grossProfitJPY: 900, grossLossJPY: 0 });
-    expect(r.profitFactor).toBe(Infinity);
+    // Infinity は JSON で null になり画面から数字が消えるので有限値を返す
+    expect(r.profitFactor).toBe(999);
   });
 
   it("取引が無ければ 0", () => {
@@ -135,5 +136,31 @@ describe("buildEquityCurve", () => {
   it("入出金が無ければ総資産そのまま", () => {
     const curve = buildEquityCurve([{ timestamp: "2026-08-01T00:00:00.000Z", total: 1_000 }], []);
     expect(curve[0].equityJPY).toBe(1_000);
+  });
+});
+
+describe("buildEquityCurve: 記録時刻がずれていても段差に合わせる", () => {
+  it("入金の記録時刻が実際の着金より遅くても人工的なピークを作らない", () => {
+    // 実際の着金は 03:30、記録は 03:48。記録時刻をそのまま使うと
+    // 03:30-03:47 の点が「入金済みなのに差し引かれない」ピークになる。
+    const nav = [
+      { timestamp: "2026-08-22T03:00:00.000Z", total: 73_000 },
+      { timestamp: "2026-08-22T03:30:00.000Z", total: 123_000 },
+      { timestamp: "2026-08-22T03:48:00.000Z", total: 123_100 },
+      { timestamp: "2026-08-22T04:00:00.000Z", total: 122_500 },
+    ];
+    const curve = buildEquityCurve(nav, [{ at: "2026-08-22T03:48:00.000Z", amountJPY: 50_000 }]);
+    expect(curve.map((c) => Math.round(c.equityJPY))).toEqual([73_000, 73_000, 73_100, 72_500]);
+    // 段差を正しく捉えていれば、ドローダウンは数%に収まる
+    expect(computeDrawdown(curve).maxDrawdownPercent).toBeGreaterThan(-2);
+  });
+
+  it("段差が見つからなければ記録時刻で妥協する", () => {
+    const nav = [
+      { timestamp: "2026-08-01T00:00:00.000Z", total: 100_000 },
+      { timestamp: "2026-08-02T00:00:00.000Z", total: 100_000 },
+    ];
+    const curve = buildEquityCurve(nav, [{ at: "2026-08-02T00:00:00.000Z", amountJPY: 50_000 }]);
+    expect(Math.round(curve[1].equityJPY)).toBe(50_000);
   });
 });

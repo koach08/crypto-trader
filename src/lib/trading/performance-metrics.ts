@@ -42,19 +42,48 @@ export interface DrawdownResult {
  */
 export function buildEquityCurve(
   navHistory: Array<{ timestamp: string; total: number }>,
-  flows: Array<{ at: string; amountJPY: number }>
+  flows: Array<{ at: string; amountJPY: number }>,
+  /** 記録時刻の前後どこまで実際の段差を探すか */
+  searchWindowMs = 24 * 60 * 60 * 1000
 ): DrawdownPoint[] {
-  const sortedFlows = [...flows].sort((a, b) => a.at.localeCompare(b.at));
   const sorted = [...navHistory].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
-  const out: DrawdownPoint[] = [];
-  let idx = 0;
-  let cumulative = 0;
-  for (const n of sorted) {
-    while (idx < sortedFlows.length && sortedFlows[idx].at <= n.timestamp) {
-      cumulative += sortedFlows[idx].amountJPY;
-      idx++;
+  if (sorted.length === 0) return [];
+
+  // 【記録時刻をそのまま使わない】手で入れた時刻が実際の着金より数十分ずれると、
+  // その差の区間だけ「入金済みなのに差し引かれていない」点が残り、人工的な
+  // ピークができる。実際 ¥50,000 の入金で最大ドローダウンが -43.1% と出た
+  // (正しくは -23.7%)。総資産の段差を探して、そこに合わせる。
+  const adjustAt = new Map<number, number>(); // index → 差し引く額
+  for (const f of flows) {
+    const target = Date.parse(f.at);
+    let bestIdx = -1;
+    let bestDiff = Infinity;
+    for (let i = 1; i < sorted.length; i++) {
+      const t = Date.parse(sorted[i].timestamp);
+      if (Number.isFinite(target) && Math.abs(t - target) > searchWindowMs) continue;
+      const step = sorted[i].total - sorted[i - 1].total;
+      // 記録額の 8 割以上動いた段差を候補にする (手数料や値動きの誤差を許容)
+      if (Math.sign(step) !== Math.sign(f.amountJPY)) continue;
+      if (Math.abs(step) < Math.abs(f.amountJPY) * 0.8) continue;
+      const diff = Math.abs(Math.abs(step) - Math.abs(f.amountJPY));
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        bestIdx = i;
+      }
     }
-    out.push({ at: n.timestamp, equityJPY: n.total - cumulative });
+    // 段差が見つからなければ記録時刻の位置で妥協する
+    if (bestIdx < 0) {
+      bestIdx = sorted.findIndex((n) => n.timestamp >= f.at);
+      if (bestIdx < 0) bestIdx = sorted.length;
+    }
+    adjustAt.set(bestIdx, (adjustAt.get(bestIdx) ?? 0) + f.amountJPY);
+  }
+
+  const out: DrawdownPoint[] = [];
+  let cumulative = 0;
+  for (let i = 0; i < sorted.length; i++) {
+    cumulative += adjustAt.get(i) ?? 0;
+    out.push({ at: sorted[i].timestamp, equityJPY: sorted[i].total - cumulative });
   }
   return out;
 }
@@ -137,13 +166,16 @@ export function computeTradeQuality(input: {
   const avgLoss = losses > 0 ? grossLossJPY / losses : 0;
   const payoff = avgLoss > 0 ? avgWin / avgLoss : 0;
   // 勝率 p で期待値 0 になる損益比は (1-p)/p
-  const required = winRate > 0 ? (1 - winRate) / winRate : Infinity;
+  // Infinity は JSON にすると null になり、画面で数字が消える。
+  // 勝ちが 1 件も無い状態は「どんな損益比でも足りない」なので大きな有限値にする。
+  const required = winRate > 0 ? (1 - winRate) / winRate : 999;
   return {
     trades,
     wins,
     losses,
     winRatePercent: winRate * 100,
-    profitFactor: grossLossJPY > 0 ? grossProfitJPY / grossLossJPY : (grossProfitJPY > 0 ? Infinity : 0),
+    // 同上。負けが無い場合は 999 (実質無限大) を返す
+    profitFactor: grossLossJPY > 0 ? grossProfitJPY / grossLossJPY : (grossProfitJPY > 0 ? 999 : 0),
     payoffRatio: payoff,
     expectancyJPY: trades > 0 ? (grossProfitJPY - grossLossJPY) / trades : 0,
     requiredPayoffRatio: required,
