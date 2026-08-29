@@ -117,7 +117,12 @@ const ENTRY_MODE = process.env.ENTRY_MODE === "quant" ? "quant" : "trend";
 const TREND_ENTRY_CONFIDENCE = 75;
 // バックテストの C+SL8 と同じ: 保険の損切り -8%、利確は事実上使わずトレンド割れで撤退
 const TREND_ENTRY_SL_PERCENT = Number(process.env.TREND_ENTRY_SL_PERCENT ?? "8");
-const TREND_ENTRY_TP_PERCENT = Number(process.env.TREND_ENTRY_TP_PERCENT ?? "30");
+// 【利確は事実上使わない】検証で +46.2% を出した設定は takeProfitPercent: 9999、
+// つまり利確なし。トレンドが崩れたら撤退する設計なので、利確幅は本来要らない。
+// 30% を入れていたせいで伸びる玉を途中で切っており、2年のバックテストで
+// TP無効 +66.5% に対し TP30% は +61.3% と 5 ポイント劣後していた。
+// 「検証した設定」と「実行される設定」がまた別物になっていた。
+const TREND_ENTRY_TP_PERCENT = Number(process.env.TREND_ENTRY_TP_PERCENT ?? "9999");
 // 1 回の取引で失ってよい額 (総資産に対する割合)。損切り幅ではなくこちらを固定する。
 const RISK_FRACTION_PER_TRADE = Number(process.env.RISK_FRACTION_PER_TRADE ?? "0.01");
 // 実績連動の判定に使う直近の決済件数。全期間平均だと、設定を変えた後の成績が
