@@ -129,6 +129,18 @@ const RISK_FRACTION_PER_TRADE = Number(process.env.RISK_FRACTION_PER_TRADE ?? "0
 // 変える前の大量のサンプルに埋もれる。
 const EDGE_WINDOW_TRADES = Number(process.env.EDGE_WINDOW_TRADES ?? "30");
 const EDGE_MIN_SAMPLES = Number(process.env.EDGE_MIN_SAMPLES ?? "20");
+/**
+ * 戦略設定を変えた時刻。**これより前の約定は実績連動の判定に使わない**。
+ *
+ * 直近 N 件で測るだけでは足りなかった。SL2%/TP3% 時代の 30 件が
+ * 「勝率60% / 損益比2.49 / 期待値+¥228」と出ており、実績連動が
+ * 「エッジ確認 → 満額」と判定していた。設定はもう別物なのに、
+ * 消えた設定の好成績を根拠に満額を張ることになる。
+ *
+ * ⚠️ SL/TP・エントリー条件・サイズの決め方を変えたら、この日付も更新すること。
+ *    更新しないと、変更前の成績で変更後の資金量が決まる。
+ */
+const STRATEGY_EPOCH_MS = Date.parse(process.env.STRATEGY_EPOCH ?? "2026-08-29T14:00:00.000Z");
 // 売買が発生しないサイクルで AI 照会を省く (課金抑制)。SKIP_AI_WHEN_IDLE=false で無効化
 const SKIP_AI_WHEN_IDLE = process.env.SKIP_AI_WHEN_IDLE !== "false";
 const LIVE_BASE_TRADE_JPY = Number(process.env.LIVE_BASE_TRADE_JPY || 15000); // 1回あたり目安サイズ（ユーザ設定可能）
@@ -3673,7 +3685,10 @@ async function refreshExchangePnL(): Promise<void> {
   state.exchangePnL = {
     realizedJPY, closedTrades, wins, losses, buyVolumeJPY, sellVolumeJPY,
     grossProfitJPY, grossLossJPY,
-    recentCloses: (summary.closes ?? []).slice(-EDGE_WINDOW_TRADES).map((c) => c.pnlJPY),
+    recentCloses: (summary.closes ?? [])
+      .filter((c) => !Number.isFinite(STRATEGY_EPOCH_MS) || c.at >= STRATEGY_EPOCH_MS)
+      .slice(-EDGE_WINDOW_TRADES)
+      .map((c) => c.pnlJPY),
     at: new Date().toISOString(),
   };
   console.log(`[pnl] 取引所ベース更新: 確定 ¥${Math.round(realizedJPY).toLocaleString()} / ${closedTrades}決済 (${wins}W ${losses}L)`);
