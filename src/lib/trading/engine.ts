@@ -709,8 +709,9 @@ async function closeLivePositionAtExit(
     const { order } = await executeSell(exchange, pair, sellAmountBase, triggerType === "stop_loss");
     // BitFlyer (ccxt) は order.average を 0 で返すことがある。参照価格で代替。
     const fillPrice = order.price > 0 ? order.price : referencePrice;
-    const pnl = (fillPrice - livePos.entryPrice) * order.amount;
-    const pnlPercent = ((fillPrice - livePos.entryPrice) / livePos.entryPrice) * 100;
+    // 建値が 0 のまま計算すると、売却額の全額が利益として記録される。
+    const pnl = livePos.entryPrice > 0 ? (fillPrice - livePos.entryPrice) * order.amount : 0;
+    const pnlPercent = livePos.entryPrice > 0 ? ((fillPrice - livePos.entryPrice) / livePos.entryPrice) * 100 : 0;
 
     const trade: TradeRecord = {
       id: `live-${Date.now()}`,
@@ -786,6 +787,13 @@ async function monitorPositionsFast(): Promise<void> {
   for (const [pair, livePos] of Array.from(state.livePositions.entries())) {
     if (exitLocks.has(pair)) continue;
     if (typeof livePos.stopLossPercent !== "number" || typeof livePos.takeProfitPercent !== "number") continue;
+    // 建値が無い玉を通すと変化率が Infinity になり、毎サイクル利確が成立する。
+    // 売れない端数だと「売却可能数量未満」を出し続ける (実際に BTC の
+    // 0.00015803 = ¥1,917 が建値 ¥0 で残っていた)。判定に載せない。
+    if (!(livePos.entryPrice > 0)) {
+      console.warn(`[${pair}] 建値が無い玉 (${livePos.amount}) は監視対象外。/api/bot/cleanup-dust で掃除する`);
+      continue;
+    }
     try {
       const ticker = await exchange.getTicker(pair);
       if (!ticker?.price || ticker.price <= 0) continue;
@@ -2012,6 +2020,10 @@ async function runCycleForPair(pair: string): Promise<void> {
         }
       }
 
+      if (!(livePos.entryPrice > 0)) {
+        console.warn(`[${pair}] 建値が無い玉 (${livePos.amount}) は SL/TP 判定を行わない`);
+        return;
+      }
       const changePercent = ((ticker.price - livePos.entryPrice) / livePos.entryPrice) * 100;
       let triggerType: "stop_loss" | "take_profit" | null = null;
 
@@ -2026,8 +2038,8 @@ async function runCycleForPair(pair: string): Promise<void> {
           try {
             const { order: ptpOrder } = await executeSell(liveExchange, pair, sellAmount);
             const fillPrice = ptpOrder.price > 0 ? ptpOrder.price : ticker.price;
-            const partialPnl = (fillPrice - livePos.entryPrice) * ptpOrder.amount;
-            const partialPnlPct = ((fillPrice - livePos.entryPrice) / livePos.entryPrice) * 100;
+            const partialPnl = livePos.entryPrice > 0 ? (fillPrice - livePos.entryPrice) * ptpOrder.amount : 0;
+            const partialPnlPct = livePos.entryPrice > 0 ? ((fillPrice - livePos.entryPrice) / livePos.entryPrice) * 100 : 0;
             const ptpTrade: TradeRecord = {
               id: `ptp-${Date.now()}`,
               timestamp: new Date().toISOString(),
@@ -2172,7 +2184,7 @@ async function closeAllLivePositions(reason: string): Promise<void> {
       const ticker = await exchange.getTicker(pair);
       const order = await exchange.marketSell(pair, sellQty);
       const fillPrice = order.price > 0 ? order.price : ticker.price;
-      const pnl = (fillPrice - livePos.entryPrice) * order.amount;
+      const pnl = livePos.entryPrice > 0 ? (fillPrice - livePos.entryPrice) * order.amount : 0;
       const pnlPercent = livePos.entryPrice > 0 ? ((fillPrice - livePos.entryPrice) / livePos.entryPrice) * 100 : 0;
       const trade: TradeRecord = {
         id: `killswitch-${Date.now()}-${pair.replace("/", "")}`,
@@ -3442,8 +3454,9 @@ async function emergencyLossCut(pair: string, currentPrice: number): Promise<boo
     );
     const order = await exchange.marketSell(pair, cutQty);
     const fillPrice = order.price > 0 ? order.price : currentPrice;
-    const pnl = (fillPrice - livePos.entryPrice) * order.amount;
-    const pnlPercent = ((fillPrice - livePos.entryPrice) / livePos.entryPrice) * 100;
+    // 建値が 0 のまま計算すると、売却額の全額が利益として記録される。
+    const pnl = livePos.entryPrice > 0 ? (fillPrice - livePos.entryPrice) * order.amount : 0;
+    const pnlPercent = livePos.entryPrice > 0 ? ((fillPrice - livePos.entryPrice) / livePos.entryPrice) * 100 : 0;
 
     const trade: TradeRecord = {
       id: `emergency-${Date.now()}`,
