@@ -43,21 +43,19 @@ export async function POST(req: NextRequest) {
     const kept: PositionRecord[] = [];
 
     for (const p of positions) {
-      let valueJPY = 0;
+      // ticker は 1 ペアにつき 1 回だけ取る。2 回叩くと 2 回目が失敗したときに
+      // 最小注文が 0 に落ち、判定が固定閾値 ¥500 に戻ってしまう。
+      let price = 0;
       try {
-        const t = await exchange.getTicker(p.pair);
-        valueJPY = p.amount * t.price;
-      } catch (e) {
-        // ticker 取得失敗 = ペアが廃止された可能性。amount * entryPrice で推定
-        valueJPY = p.amount * (p.entryPrice ?? 0);
+        price = (await exchange.getTicker(p.pair)).price;
+      } catch {
+        // ticker 取得失敗 = ペアが廃止された可能性。建値で代用する。
+        price = p.entryPrice ?? 0;
       }
+      const valueJPY = p.amount * price;
 
       // 売れるかどうかが本当の基準。最小注文に届かない玉は持っていても動かせない。
-      let minOrderJPY = 0;
-      try {
-        const t = await exchange.getTicker(p.pair);
-        minOrderJPY = exchange.getMinOrderJPY?.(p.pair, t.price) ?? 0;
-      } catch { /* ticker が取れないなら固定閾値だけで判定する */ }
+      const minOrderJPY = price > 0 ? (exchange.getMinOrderJPY?.(p.pair, price) ?? 0) : 0;
 
       const threshold = Math.max(DUST_THRESHOLD_JPY, minOrderJPY);
       const noEntryPrice = !(p.entryPrice > 0);
@@ -84,6 +82,7 @@ export async function POST(req: NextRequest) {
       ok: true,
       dryRun,
       threshold: DUST_THRESHOLD_JPY,
+      note: "実際の判定は max(この値, 取引所の最小注文)。売れない玉を dust とする",
       totalPositions: positions.length,
       dustCount: dustList.length,
       keptCount: kept.length,
