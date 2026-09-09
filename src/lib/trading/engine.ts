@@ -8,7 +8,7 @@ import { buildConsensus } from "../ai/consensus";
 import { getFearGreedIndex } from "../ai/fear-greed";
 import { RiskManager } from "./risk-manager";
 import { PaperTrader } from "./paper-trader";
-import { loadData, saveData } from "../data";
+import { loadData, loadDataStrict, saveData } from "../data";
 import { slippageJPY, summarizeExecutionCosts, allInCostJPY, type ExecutionCost } from "./execution-cost";
 import { attributePnL } from "./lane-pnl";
 import { riskBudgetedSize } from "./risk-sizing";
@@ -393,6 +393,11 @@ interface EngineState {
    * ここだけは目標比率まで積む。売却経路は必ずこの数量を残す。
    */
   coreHolding: CoreHoldingState;
+  /**
+   * コア保有台帳を実際に読めたか。読めていないうちは空と区別がつかないので、
+   * 積立も売却も止める (空と誤認すると買い直し + 保護解除の両方が起きる)。
+   */
+  coreLedgerLoaded: boolean;
   /** 執行コストの記録 (発注直前の中値と実約定値の差)。直近 MAX_COST_RECORDS 件 */
   executionCosts: ExecutionCost[];
   /** 直近サイクルで計算した ATR。高速監視がトレーリング SL を更新するのに使う */
@@ -451,6 +456,7 @@ const state: EngineState = {
   lastNavJPY: 0,
   exchangePnL: null,
   coreConfigOverride: null,
+  coreLedgerLoaded: false,
   lastCoreSkip: null,
 };
 
@@ -466,6 +472,9 @@ function currentCoreConfig(): CoreHoldConfig {
  * (過去に「判断ロジックだけ直して発注経路が素通り」を踏んでいる)
  */
 function sellableFree(pair: string, exchangeFree: number): number {
+  // 台帳が読めていないなら、どれがコア枠か分からない。0 を返して売らせない。
+  // (空の台帳をそのまま使うと、控除が消えて長期枠ごと売れてしまう)
+  if (!state.coreLedgerLoaded) return 0;
   return coreSellableAmount(state.coreHolding, pair, exchangeFree);
 }
 
@@ -757,6 +766,16 @@ async function monitorPositionsFast(): Promise<void> {
   if (!state.running || state.paperMode) return;
   if (state.livePositions.size === 0) return;
 
+  // 台帳が読めていないと sellableFree が 0 を返し、損切りが撃てなくなる。
+  // 止まったままにせず、毎回読み直しを試みる (読めれば即座に元に戻る)。
+  if (!state.coreLedgerLoaded) {
+    await loadCoreLedger();
+    if (!state.coreLedgerLoaded) {
+      console.warn("[core] 台帳が読めないため損切り/利確を見送る (どれが長期枠か判別できない)");
+      return;
+    }
+  }
+
   const exchange = getExchange();
   try {
     await exchange.connect();
@@ -864,15 +883,38 @@ async function ensureDataLoaded(): Promise<void> {
       state.coreConfigOverride = await loadData<CoreConfigOverride | null>("core-config", null);
       state.executionCosts = await loadData<ExecutionCost[]>("execution-costs", []);
       if (!Array.isArray(state.executionCosts)) state.executionCosts = [];
-      state.coreHolding = await loadData<CoreHoldingState>("core-holding", EMPTY_CORE_STATE);
-      if (!state.coreHolding?.lots) state.coreHolding = { lots: [], lastBuyAt: {} };
-      const coreLots = state.coreHolding.lots.length;
-      if (coreLots > 0) {
-        console.log(`[core] コア保有 ${coreLots} ロット復元`);
-      }
+      await loadCoreLedger();
     })();
   }
   return _initPromise;
+}
+
+/**
+ * コア保有台帳を読む。読めなければ「空」ではなく「不明」として扱う。
+ *
+ * 空で続けると実弾で2つ起きる:
+ *   1. 積立が「まだ 0 しか持っていない」と見て、目標まで**買い直す**
+ *   2. sellableFree の控除が消え、戦術枠が長期枠ごと**売れるようになる**
+ * どちらも取り返しがつかないので、読めるまで両方止める。
+ */
+async function loadCoreLedger(): Promise<boolean> {
+  try {
+    const loaded = await loadDataStrict<CoreHoldingState>("core-holding", EMPTY_CORE_STATE);
+    state.coreHolding = loaded?.lots ? loaded : { lots: [], lastBuyAt: {} };
+    state.coreLedgerLoaded = true;
+    if (state.coreHolding.lots.length > 0) {
+      console.log(`[core] コア保有 ${state.coreHolding.lots.length} ロット復元`);
+    }
+    return true;
+  } catch (e) {
+    state.coreHolding = { lots: [], lastBuyAt: {} };
+    state.coreLedgerLoaded = false;
+    console.error(
+      "[core] 台帳を読めなかった。積立と売却を止める (空と誤認すると買い直し + 保護解除が起きる):",
+      e instanceof Error ? e.message : e
+    );
+    return false;
+  }
 }
 
 async function persistCooldowns(): Promise<void> {
@@ -2221,6 +2263,13 @@ async function readPortfolioSnapshot(
 async function maintainCoreHolding(): Promise<void> {
   const cfg = currentCoreConfig();
   if (!cfg.enabled || state.paperMode) return;
+
+  // 台帳が読めていないと「まだ 0 しか持っていない」に見え、既に積んだ分の上に
+  // もう一度買い直してしまう。毎サイクル読み直しを試みて、読めるまで何もしない。
+  if (!state.coreLedgerLoaded && !(await loadCoreLedger())) {
+    console.warn("[core] 台帳が読めないため積立を見送る");
+    return;
+  }
 
   try {
     const exchange = getExchange();

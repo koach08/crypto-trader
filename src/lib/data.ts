@@ -44,6 +44,27 @@ export async function loadData<T>(key: string, fallback: T): Promise<T> {
   }
 }
 
+/**
+ * 「まだ無い」と「読めなかった」を区別して読む。
+ *
+ * loadData は全ての失敗で fallback を返すので、ボリュームが読めない事故と
+ * 一度も保存していない状態が同じに見える。コア保有台帳のように、
+ * **空と誤認すると実弾が動く**ものはこちらを使う。
+ * ファイルが無いときだけ empty を返し、それ以外は投げる。
+ */
+export async function loadDataStrict<T>(key: string, empty: T): Promise<T> {
+  await ensureDir();
+  const filePath = path.join(DATA_DIR, `${key}.json`);
+  let raw: string;
+  try {
+    raw = await readFile(filePath, "utf-8");
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException)?.code === "ENOENT") return empty;
+    throw e;
+  }
+  return JSON.parse(raw) as T;
+}
+
 export async function saveData<T>(key: string, data: T): Promise<void> {
   await ensureDir();
   const safe = key.replace(/[^a-zA-Z0-9_-]/g, "_");
