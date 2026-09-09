@@ -163,4 +163,27 @@ describe("buildEquityCurve: 記録時刻がずれていても段差に合わせ�
     const curve = buildEquityCurve(nav, [{ at: "2026-08-02T00:00:00.000Z", amountJPY: 50_000 }]);
     expect(Math.round(curve[1].equityJPY)).toBe(50_000);
   });
+
+  it("設定を変えてサンプルが減っても、全期間で負けていれば 1/4 より緩まない", () => {
+    // 実際に起きていたこと: STRATEGY_EPOCH を動かすと直近が 5 件になり、
+    // 「判定できない = 0.5倍」に戻る。全期間 193 件が負けているのに、
+    // エッジ未確認 (0.25倍) より大きく張れてしまっていた。
+    const recent = computeTradeQuality({ wins: 4, losses: 1, grossProfitJPY: 400, grossLossJPY: 68 });
+    const lifetime = computeTradeQuality({ wins: 67, losses: 126, grossProfitJPY: 11400, grossLossJPY: 16325 });
+    expect(lifetime.hasEdge).toBe(false);
+
+    const r = evaluateEdgeBudget({ quality: recent, lifetime, minSamples: 20, baseRiskFraction: 0.01 });
+    expect(r.phase).toBe("観察中");
+    expect(r.multiplier).toBe(0.25);
+    expect(r.riskFraction).toBeCloseTo(0.0025);
+  });
+
+  it("全期間でも勝っているなら、観察中は従来どおり半分で様子を見る", () => {
+    const recent = computeTradeQuality({ wins: 4, losses: 1, grossProfitJPY: 400, grossLossJPY: 68 });
+    const lifetime = computeTradeQuality({ wins: 120, losses: 73, grossProfitJPY: 30000, grossLossJPY: 9000 });
+    expect(lifetime.hasEdge).toBe(true);
+
+    const r = evaluateEdgeBudget({ quality: recent, lifetime, minSamples: 20, baseRiskFraction: 0.01 });
+    expect(r.multiplier).toBe(0.5);
+  });
 });

@@ -2443,10 +2443,21 @@ function currentEdgeBudget() {
     grossProfitJPY: wins.reduce((s, p) => s + p, 0),
     grossLossJPY: losses.reduce((s, p) => s - p, 0),
   });
+  // 全期間の成績も渡す。直近だけだと、設定を変えた瞬間にサンプルが 0 に戻って
+  // 「判定できない = 半分」に緩む (エッジ未確認の 1/4 より大きい)。
+  const lifetime = state.exchangePnL
+    ? computeTradeQuality({
+        wins: state.exchangePnL.wins,
+        losses: state.exchangePnL.losses,
+        grossProfitJPY: state.exchangePnL.grossProfitJPY,
+        grossLossJPY: state.exchangePnL.grossLossJPY,
+      })
+    : undefined;
   return {
     quality,
     budget: evaluateEdgeBudget({
       quality,
+      lifetime,
       minSamples: EDGE_MIN_SAMPLES,
       baseRiskFraction: RISK_FRACTION_PER_TRADE,
     }),

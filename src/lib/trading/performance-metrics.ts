@@ -204,6 +204,11 @@ export const INSTITUTIONAL_BENCHMARK = {
  *
  * 【全期間ではなく直近で測る理由】設定を変えた後の成績が、変える前の
  * 大量のサンプルに埋もれてしまうため。
+ *
+ * 【全期間も渡す理由】直近だけで見ると、設定を変えた瞬間にサンプルが 0 に戻り、
+ * 「判定できない = 半分の大きさ」に**緩む**。エッジ未確認の 1/4 より大きい。
+ * つまり設定をいじるたびに、負け続けている仕組みが張る額を戻せてしまう。
+ * 全期間で負けているうちは、観察中でも 1/4 を上限にする。
  */
 export interface EdgeBudgetResult {
   /** 1 回のリスク割合 (総資産に対して) */
@@ -218,15 +223,31 @@ export interface EdgeBudgetResult {
 
 export function evaluateEdgeBudget(input: {
   quality: TradeQuality;
+  /** 全期間の成績。観察中に「緩む」のを止めるための上限として使う */
+  lifetime?: TradeQuality;
   /** これ未満のサンプルでは良し悪しを判定しない */
   minSamples: number;
   /** エッジが確認できたときの 1 回のリスク割合 */
   baseRiskFraction: number;
 }): EdgeBudgetResult {
-  const { quality, minSamples, baseRiskFraction } = input;
+  const { quality, lifetime, minSamples, baseRiskFraction } = input;
 
   if (quality.trades < minSamples) {
     // 判定材料が足りない。半分の大きさで様子を見ながらサンプルを溜める。
+    // ただし全期間で負けているなら、観察中でも 1/4 より緩めない。
+    const lifetimeLoses =
+      lifetime != null && lifetime.trades > 0 && (!lifetime.hasEdge || lifetime.expectancyJPY <= 0);
+    if (lifetimeLoses) {
+      return {
+        riskFraction: baseRiskFraction * 0.25,
+        multiplier: 0.25,
+        samples: quality.trades,
+        phase: "観察中",
+        reason:
+          `直近 ${quality.trades} 件では判定できない (${minSamples} 件必要)。` +
+          `全期間 ${lifetime!.trades} 件は期待値 ¥${Math.round(lifetime!.expectancyJPY).toLocaleString()}/回で負けているため 1/4 のまま様子を見る`,
+      };
+    }
     return {
       riskFraction: baseRiskFraction * 0.5,
       multiplier: 0.5,
