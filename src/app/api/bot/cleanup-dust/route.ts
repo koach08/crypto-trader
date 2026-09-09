@@ -41,6 +41,7 @@ export async function POST(req: NextRequest) {
     const positions = await loadData<PositionRecord[]>("live-positions", []);
     const dustList: { pair: string; amount: number; valueJPY: number; reason: string }[] = [];
     const kept: PositionRecord[] = [];
+    const inspected: Record<string, unknown>[] = [];
 
     for (const p of positions) {
       // ticker は 1 ペアにつき 1 回だけ取る。2 回叩くと 2 回目が失敗したときに
@@ -72,6 +73,19 @@ export async function POST(req: NextRequest) {
       } else {
         kept.push(p);
       }
+
+      // dryRun では判定に使った数字を全件返す。返さないと「なぜ dust にならないか」
+      // を外から推測するしかなくなる (実際それで何度も外した)。
+      inspected.push({
+        pair: p.pair,
+        storedAmount: p.amount,
+        price: Math.round(price),
+        valueJPY: Math.round(valueJPY),
+        minOrderJPY: Math.round(minOrderJPY),
+        threshold: Math.round(threshold),
+        entryPrice: Math.round(p.entryPrice ?? 0),
+        isDust: valueJPY < threshold || noEntryPrice,
+      });
     }
 
     if (!dryRun && dustList.length > 0) {
@@ -87,6 +101,7 @@ export async function POST(req: NextRequest) {
       dustCount: dustList.length,
       keptCount: kept.length,
       dust: dustList,
+      inspected,
       message: dryRun
         ? `${dustList.length} 件の dust 検出 (dryRun=true で未削除)。実行するには {"dryRun":false} で再 POST`
         : `${dustList.length} 件の dust を削除しました (残 ${kept.length} 件)`,
