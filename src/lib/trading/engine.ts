@@ -1618,10 +1618,21 @@ async function runCycleForPair(pair: string): Promise<void> {
                 : 0,
             });
             if (basis) {
-              livePos.entryPrice = basis.avgPrice;
+              // ここで直したいのは **数量** のズレ (コア枠が実残高の一部を持っていく)。
+              // 建値は自分の買い注文から分かっているので、逆算値で塗り潰さない。
+              // 逆算は残りが小さいほど誤差が増幅するので、記録済みの建値と大きく
+              // 食い違うときは記録側を信じる (¥396,090 の玉が ¥500,828 にされ、
+              // -3.1% の値動きが -23.4% の損切りとして記録されたことがある)。
+              const known = livePos.entryPrice;
+              const drift = known > 0 ? Math.abs(basis.avgPrice - known) / known : 0;
+              if (known > 0 && drift > 0.1) {
+                console.warn(`[${pair}] 建値の逆算 ¥${basis.avgPrice.toFixed(0)} が記録値 ¥${known.toFixed(0)} と ${(drift * 100).toFixed(1)}% 食い違う → 記録値を維持 (数量だけ同期)`);
+              } else {
+                livePos.entryPrice = basis.avgPrice;
+              }
               livePos.amount = basis.amount;
               await saveData("live-positions", Array.from(state.livePositions.values()));
-              console.log(`[${pair}] 同期完了: 戦術枠 ${basis.amount} @ ¥${basis.avgPrice.toFixed(2)} (全体 ${realPosition.amount} @ ¥${pairData.averageBuyPrice.toFixed(2)})`);
+              console.log(`[${pair}] 同期完了: 戦術枠 ${basis.amount} @ ¥${livePos.entryPrice.toFixed(2)} (全体 ${realPosition.amount} @ ¥${pairData.averageBuyPrice.toFixed(2)})`);
             }
           }
         }

@@ -507,4 +507,36 @@ describe("tacticalBasis", () => {
     expect(r!.amount).toBeCloseTo(0.5, 8);
     expect(r!.avgPrice).toBeGreaterThan(0);
   });
+
+  it("コアが大半を占めると逆算値が実勢から外れる。実勢に落とす (本番で -3.1% が -23.4% になった)", () => {
+    // 2026-09-09 の ETH。実残高 0.08644173 / コア 0.07469711 (86%) で、
+    // 残り 0.01174462 に全体平均とコア平均の差が 6.4 倍で乗り、
+    // 実際 ¥396,090 で買った玉が ¥500,828 で建てたことにされた。
+    const r = tacticalBasis({
+      exchangeAmount: 0.08644173,
+      fifoAvgPrice: 390145,
+      coreAmountBase: 0.07469711,
+      coreCostJPY: 27842.59,
+      minAmountBase: 0.01,
+    });
+    expect(r).not.toBeNull();
+    expect(r!.amount).toBeCloseTo(0.01174462, 8);
+    // 旧ガード (1/3〜3倍) では ¥500,828 がそのまま通っていた
+    expect(r!.avgPrice).toBeLessThan(390145 * 1.26);
+    expect(r!.avgPrice).toBe(390145);
+  });
+
+  it("残りが十分あって逆算値が実勢に近いときは、逆算値をそのまま使う", () => {
+    // コア 0.02 / 残り 0.03 なら増幅は 0.67 倍にしかならない
+    const r = tacticalBasis({
+      exchangeAmount: 0.05,
+      fifoAvgPrice: 400000,
+      coreAmountBase: 0.02,
+      coreCostJPY: 0.02 * 390000,
+      minAmountBase: 0.01,
+    });
+    expect(r).not.toBeNull();
+    // (0.05*400000 - 7800) / 0.03 = 406,666.7
+    expect(r!.avgPrice).toBeCloseTo(406666.67, 1);
+  });
 });

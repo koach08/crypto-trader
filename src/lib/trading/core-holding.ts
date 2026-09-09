@@ -566,10 +566,25 @@ export function tacticalBasis(input: {
 
   const tacticalCost = exchangeAmount * fifoAvgPrice - coreCostJPY;
   const avgPrice = tacticalCost / amount;
-  // 端数を分母にすると取得単価が発散する。実際 ETH で残り 0.00013 に対して
-  // ¥7,210,464 (実勢の約19倍) という取得単価が出て、SL/TP がその値を基準に
-  // 張られていた。実勢から大きく外れたら全体平均に落とす。
-  const sane = Number.isFinite(avgPrice) && avgPrice > fifoAvgPrice / 3 && avgPrice < fifoAvgPrice * 3;
+
+  // 【なぜ狭く見るか】この逆算の誤差は残りの小ささで増幅される。式で書くと
+  //
+  //   逆算値 − 全体平均 = (コア数量 / 残り数量) × (全体平均 − コア平均)
+  //
+  // つまりコアが大半を占めるほど、コア平均と全体平均のわずかな差が
+  // そのまま何倍にもなって残りに乗る。実際 ETH で
+  // コア 0.0747 / 残り 0.0117 (6.4倍) × 全体平均との差 ¥17,404 = ¥110,690 ずれ、
+  // 実際の買値 ¥396,090 の玉が **¥500,828 で建てたこと**にされた。
+  // その結果 -3.1% の値動きが **-23.4% の損切り**として記録され、
+  // 連敗クールダウンと学習系がその偽の大負けを教材にしていた。
+  //
+  // 旧ガードは「全体平均の 1/3 〜 3倍」で、上の 1.28 倍は素通りしていた。
+  // 逆算値が使えるのは実勢から大きく離れないときだけ。離れたら全体平均に落とす。
+  const MAX_DEVIATION = 0.25;
+  const sane =
+    Number.isFinite(avgPrice) &&
+    avgPrice > 0 &&
+    Math.abs(avgPrice - fifoAvgPrice) <= fifoAvgPrice * MAX_DEVIATION;
   if (!sane) return { amount, avgPrice: fifoAvgPrice };
   return { amount, avgPrice };
 }
