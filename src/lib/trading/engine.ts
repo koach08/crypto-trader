@@ -884,9 +884,35 @@ async function ensureDataLoaded(): Promise<void> {
       state.executionCosts = await loadData<ExecutionCost[]>("execution-costs", []);
       if (!Array.isArray(state.executionCosts)) state.executionCosts = [];
       await loadCoreLedger();
+      await restoreLastPrices();
     })();
   }
   return _initPromise;
+}
+
+/**
+ * 直近価格をディスクに残す / 読み直す。
+ *
+ * このキャッシュはメモリだけに持っていたので、デプロイや再起動のたびに空になる。
+ * 起動直後の画面は「価格が無い = 評価額 ¥0・充足 0%」と表示し、NAV も現金だけに
+ * なる (目標額が 0.85 × 現金で出る)。保有は無事なのに全部失ったように見える。
+ *
+ * 発注判断は 10 分より古い価格を使わず必ず ticker を取り直すので、
+ * 保存した古い価格で注文が出ることはない。表示と NAV の穴埋めだけに使う。
+ */
+async function persistLastPrices(): Promise<void> {
+  try {
+    await saveData("last-prices", Array.from(state.lastPriceByPair.entries()));
+  } catch { /* 表示用なので失敗しても続ける */ }
+}
+
+async function restoreLastPrices(): Promise<void> {
+  const saved = await loadData<Array<[string, { price: number; at: string }]>>("last-prices", []);
+  if (!Array.isArray(saved)) return;
+  for (const [pair, v] of saved) {
+    if (v?.price > 0 && !state.lastPriceByPair.has(pair)) state.lastPriceByPair.set(pair, v);
+  }
+  if (saved.length > 0) console.log(`[price] 直近価格 ${saved.length} ペアを復元`);
 }
 
 /**
@@ -2276,6 +2302,8 @@ async function maintainCoreHolding(): Promise<void> {
     await exchange.connect();
     const { navJPY, jpyFree, prices, balances } = await readPortfolioSnapshot(exchange, state.pairs);
     if (navJPY > 0) state.lastNavJPY = navJPY;
+    // 再起動しても画面が「評価額 ¥0」にならないように、取り直した価格を残す。
+    await persistLastPrices();
 
     // 取引所ベースの実績を取り直す (表示はこのキャッシュを読む)
     await refreshExchangePnL().catch(() => {});
