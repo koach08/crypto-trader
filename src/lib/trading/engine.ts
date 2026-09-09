@@ -2660,6 +2660,10 @@ export async function getCoreHoldingReport(): Promise<{
 }
 
 async function runCycle(): Promise<void> {
+  // 台帳と直近価格を読み終えてから回す。読み終わる前に売却経路が走ると、
+  // コア枠の控除が効いているか分からないまま判断することになる
+  // (今は安全側に倒して売らないが、黙って売れなくなるのも困る)。
+  await ensureDataLoaded();
   state.cycleCount++;
   state.lastCycleTimestamp = new Date().toISOString();
   console.log(`\n=== サイクル #${state.cycleCount} (${state.lastCycleTimestamp}) ===`);
