@@ -217,7 +217,7 @@ export interface EdgeBudgetResult {
   multiplier: number;
   /** 判定に使ったサンプル数 */
   samples: number;
-  phase: "観察中" | "エッジ未確認" | "エッジ確認";
+  phase: "観察中" | "エッジ未確認" | "エッジ確認" | "引退";
   reason: string;
 }
 

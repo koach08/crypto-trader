@@ -113,6 +113,27 @@ const LIVE_MIN_TRADE_JPY = 3_000;            // 最小取引額 ¥3,000 (旧 ¥1
 const TREND_GATE_ENABLED = process.env.TREND_GATE !== "false";
 // エントリー判断の出所。"trend" = 日足 MA ルール (既定)、"quant" = 旧クオンツ判断
 const ENTRY_MODE = process.env.ENTRY_MODE === "quant" ? "quant" : "trend";
+
+/**
+ * 戦術枠 (短期売買) を動かすか。既定は **引退**。
+ *
+ * 【なぜ止めるか】2026-09-09 の判定。
+ *   - ライブ 194 決済で期待値 -¥25/回、損益比 1.30 (必要 1.85)。エッジ無し
+ *   - コスト込み・重ならない 4 区間のバックテストで、MA ゲートはどのパラメータでも
+ *     買い持ちに負ける (本番 50/200 で +62.8% vs 買い持ち +250.9%)
+ *   - 利益は全部コア枠の含み益で、売買はそれを削っていた (戦術 -¥5,807 / コア +¥885)
+ *   - 実績連動のブレーキを 0.25 倍に締めたら建玉 ¥3,797 になり、bitFlyer の最小注文
+ *     (ETH ¥4,223 / BTC ¥13,335) に届かず発注できなくなった。解除には決済 20 件が
+ *     要るが、発注できないので永久に溜まらない。「縮めて様子を見る」はこの口座規模で
+ *     成立しない
+ *
+ * 止めるのは新規の買い (本線 / グリッド / 配分維持) と、その判断のための AI 照会。
+ * 既存の戦術ポジションの損切り・利確は動かしたままにする (逃げ道は塞がない)。
+ * コア枠 (積んで持つ・利確・再エントリー) はこのスイッチと無関係に動く。
+ *
+ * TACTICAL_LANE=on で再開できる。再開するなら STRATEGY_EPOCH も動かすこと。
+ */
+const TACTICAL_LANE_ENABLED = process.env.TACTICAL_LANE === "on";
 // MA ルールの判断は確信度で強弱を測らないので、実行閾値を通る固定値を使う
 const TREND_ENTRY_CONFIDENCE = 75;
 // バックテストの C+SL8 と同じ: 保険の損切り -8%、利確は事実上使わずトレンド割れで撤退
@@ -1089,7 +1110,10 @@ async function runCycleForPair(pair: string): Promise<void> {
   const maPreview = ENTRY_MODE === "trend"
     ? decideByTrend(dailyTrend, tacticalAmount * ticker.price >= 500)
     : null;
-  const skipAI = maPreview !== null && maPreview.action === "HOLD" && SKIP_AI_WHEN_IDLE;
+  // 戦術枠が引退していれば、入る判断そのものが無いので AI は呼ばない。
+  const skipAI =
+    !TACTICAL_LANE_ENABLED ||
+    (maPreview !== null && maPreview.action === "HOLD" && SKIP_AI_WHEN_IDLE);
 
   const useFull = signal.score >= -1 && signal.score <= 1; // borderline
   let decision: AIDecision;
@@ -1099,7 +1123,9 @@ async function runCycleForPair(pair: string): Promise<void> {
       status: "success",
       action: "HOLD",
       confidence: 50,
-      summary: "MA ルール運用中かつ売買不要のサイクルのため AI 照会を省略 (課金抑制)",
+      summary: TACTICAL_LANE_ENABLED
+        ? "MA ルール運用中かつ売買不要のサイクルのため AI 照会を省略 (課金抑制)"
+        : "戦術枠は引退済み (コア枠のみ運用) のため AI 照会を省略",
       duration: 0,
     };
     decision = buildConsensus([stub], pair, "bitflyer", signal.score, fearGreed.value, state.paperMode);
@@ -1654,6 +1680,10 @@ async function runCycleForPair(pair: string): Promise<void> {
     // hold-only モード時は BUY 完全停止 (TP/SL は通常動作)
     if (isHoldOnly && decision.action === "BUY") {
       console.log(`[${pair}] hold-only モード: 新規 BUY 停止 (${pairOverride?.reasoning ?? ""})`);
+      return;
+    }
+    if (!TACTICAL_LANE_ENABLED && decision.action === "BUY") {
+      console.log(`[${pair}] 戦術枠は引退済み: 新規 BUY を出さない (コア枠のみ運用)`);
       return;
     }
     // MA ルールの確信度 (75) は勝率推定ではなく固定値なので、閾値比較の対象にしない。
@@ -2351,6 +2381,48 @@ async function maintainCoreHolding(): Promise<void> {
       minOrderJPY[pair] = exchange.getMinOrderJPY?.(pair, price) ?? 0;
     }
 
+    // 【引退した枠の端数をコアへ】戦術枠を止めた後に、最小注文に届かず売れない玉が
+    // 戦術ポジションとして残ると、所属不明のまま高速監視が毎分それを見に行き、
+    // 通常サイクルは毎回 FIFO 再計算で取引所 API を叩く (実際 BTC 0.00015803 = ¥1,915 で
+    // それが起きていた)。売れないなら持つしかなく、持つ枠はコアなのでそこに移す。
+    // 記録上の移動で、注文は出さない。取得原価は戦術側の建値をそのまま引き継ぐ。
+    if (!TACTICAL_LANE_ENABLED) {
+      let moved = false;
+      for (const [pair, pos] of Array.from(state.livePositions.entries())) {
+        const price = prices[pair];
+        if (!(price > 0)) continue;
+        // 戦術枠の実量は「取引所の実残高 − コア台帳」。livePos.amount は実残高が
+        // そのまま入っていることがある (同期が端数で止まるため) ので、それを使わない。
+        const base = pair.split("/")[0];
+        const held = balances.find((b) => b.currency === base)?.total ?? 0;
+        const tacticalAmount = Math.max(0, held - coreAmount(state.coreHolding, pair));
+        const valueJPY = tacticalAmount * price;
+        if (tacticalAmount <= 0) {
+          // 戦術枠は実質ゼロ。記録だけ残っているので消す。
+          state.livePositions.delete(pair);
+          moved = true;
+          console.log(`[core] 戦術ポジション記録を削除: ${pair} (実残高 ${held} は全てコア台帳に一致)`);
+          continue;
+        }
+        if (valueJPY >= (minOrderJPY[pair] ?? 0)) continue; // 売れる玉は戦術側に残す (損切り経路を塞がない)
+        const entry = pos.entryPrice > 0 ? pos.entryPrice : price;
+        state.coreHolding = applyCoreFill(state.coreHolding, {
+          pair,
+          amountBase: tacticalAmount,
+          priceJPY: entry,
+          costJPY: tacticalAmount * entry,
+          at: new Date().toISOString(),
+        });
+        state.livePositions.delete(pair);
+        moved = true;
+        console.log(`[core] 引退した戦術枠の端数をコアへ移動: ${pair} ${tacticalAmount} @ ¥${Math.round(entry).toLocaleString()} (¥${Math.round(valueJPY).toLocaleString()} < 最小注文 ¥${Math.round(minOrderJPY[pair] ?? 0).toLocaleString()})`);
+      }
+      if (moved) {
+        await saveData("core-holding", state.coreHolding);
+        await saveData("live-positions", Array.from(state.livePositions.values()));
+      }
+    }
+
     // 先に利確を見る。上がった分を現金に戻してから、その現金で足りない枠を積む。
     // 1 サイクルにつき売りか買いのどちらか 1 件だけ。
     const tp = planCoreTakeProfit({ state: state.coreHolding, cfg, prices, minOrderJPY });
@@ -2590,8 +2662,19 @@ export async function getPerformanceMetrics() {
       grossProfitJPY: ex?.grossProfitJPY ?? 0,
       grossLossJPY: ex?.grossLossJPY ?? 0,
     }),
-    /** 直近の成績と、それに応じた戦術枠の張る額 */
-    edge: currentEdgeBudget(),
+    /** 直近の成績と、それに応じた戦術枠の張る額。引退中はその旨を返す */
+    edge: TACTICAL_LANE_ENABLED
+      ? currentEdgeBudget()
+      : {
+          ...currentEdgeBudget(),
+          budget: {
+            riskFraction: 0,
+            multiplier: 0,
+            samples: state.exchangePnL?.recentCloses.length ?? 0,
+            phase: "引退" as const,
+            reason: "戦術枠は引退済み (コア枠のみ運用)。新規の買いは出さない",
+          },
+        },
     benchmark: INSTITUTIONAL_BENCHMARK,
     samplePoints: series.length,
   };
@@ -3024,7 +3107,7 @@ async function runCycle(): Promise<void> {
   }
 
   // === Grid trader (短期上下取り): GRID_ENABLED=1 で有効. 6 cycle ごとに評価 ===
-  if (process.env.GRID_ENABLED === "1" && state.cycleCount % 6 === 0 && !state.paperMode) {
+  if (TACTICAL_LANE_ENABLED && process.env.GRID_ENABLED === "1" && state.cycleCount % 6 === 0 && !state.paperMode) {
     try {
       const exchange = getExchange();
       const balance = await exchange.getBalance();
@@ -3113,7 +3196,9 @@ async function runCycle(): Promise<void> {
   // 動的 target cash% (F&G / drawdown / ATR / trend に応じて 10-50%) を計算し、
   // 現金比率が target + buffer 超なら最良ペアに小額 BUY 実行。BUY のみ、SELL なし。
   // 落ちるナイフ防止: kill switch / daily loss / 過剰買いに上限あり。
-  if (state.cycleCount % 6 === 0 && !state.paperMode) {
+  // 戦術枠が引退していれば動かさない。「現金で寝かせない」はコア枠が担う。
+  // (過去にこの経路が AI 判断を素通りして下降トレンドに現金を入れ続けたことがある)
+  if (TACTICAL_LANE_ENABLED && state.cycleCount % 6 === 0 && !state.paperMode) {
     try {
       const exchange = getExchange();
       const balance = await exchange.getBalance();
@@ -3643,6 +3728,12 @@ export function getBotStatus(): BotStatus {
     circuitBreakerState: state.riskManager.getState(),
     activePairs: state.pairs,
     cycleCount: state.cycleCount,
+    tacticalLane: {
+      enabled: TACTICAL_LANE_ENABLED,
+      reason: TACTICAL_LANE_ENABLED
+        ? "TACTICAL_LANE=on で稼働中"
+        : "引退 (2026-09-09 判定: 194 決済でエッジ無し・バックテストで買い持ちに負ける)。コア枠のみ運用",
+    },
   };
 }
 

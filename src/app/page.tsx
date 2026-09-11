@@ -520,6 +520,15 @@ export default function Dashboard() {
         {status?.circuitBreakerState === "TRIGGERED" && (
           <span className="px-2 py-0.5 rounded text-xs bg-red-900/50 text-red-400 font-medium">CB発動</span>
         )}
+        {/* 戦術枠が引退している間は、短期売買が止まっているのが設計どおりだと分かるようにする */}
+        {status?.tacticalLane && !status.tacticalLane.enabled && (
+          <span
+            className="px-2 py-0.5 rounded text-xs bg-zinc-800 text-zinc-400 font-medium"
+            title={status.tacticalLane.reason}
+          >
+            コア枠のみ運用
+          </span>
+        )}
         <span className="text-xs text-zinc-600 ml-auto">Cycle #{status?.cycleCount ?? 0}</span>
       </div>
 
@@ -568,7 +577,7 @@ export default function Dashboard() {
               </span>
               <span className="flex items-center gap-1.5">
                 <span className="w-2 h-2 rounded-full bg-emerald-600" />
-                <span className="text-zinc-400">戦術枠</span>
+                <span className="text-zinc-400">戦術枠{status?.tacticalLane && !status.tacticalLane.enabled ? " (引退)" : ""}</span>
                 <span className="font-mono text-zinc-300">¥{Math.round(tactical).toLocaleString()}</span>
                 <span className="text-zinc-600">{pct(tactical).toFixed(0)}%</span>
               </span>

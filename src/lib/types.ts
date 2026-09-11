@@ -185,6 +185,8 @@ export interface BotStatus {
   circuitBreakerState: CircuitBreakerState;
   activePairs: string[];
   cycleCount: number;
+  /** 戦術枠 (短期売買) が動いているか。既定は引退 (コア枠のみ運用) */
+  tacticalLane: { enabled: boolean; reason: string };
 }
 
 // === Wallet Types ===
