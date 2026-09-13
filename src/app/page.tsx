@@ -262,6 +262,11 @@ export default function Dashboard() {
   const [news, setNews] = useState<NewsItem[]>([]);
   const [pnlHistory, setPnlHistory] = useState<PnLSnapshot[]>([]);
   const [lifetime, setLifetime] = useState<LifetimeResponse | null>(null);
+  // 「放置に勝っているか」。入金判断の基準として決めた比較 (円のまま / 均等買い持ち)
+  const [benchmark, setBenchmark] = useState<{
+    cashOnlyJPY: number; holdJPY: number | null; appJPY: number;
+    vsCashJPY: number; vsHoldJPY: number | null; missing: string[];
+  } | null>(null);
   const [lifetimeLoading, setLifetimeLoading] = useState(false);
   const [nav, setNav] = useState<NavResponse | null>(null);
   const [diagnostics, setDiagnostics] = useState<DiagnosticsResponse | null>(null);
@@ -348,6 +353,15 @@ export default function Dashboard() {
     }
   }, []);
 
+  const fetchBenchmark = useCallback(async () => {
+    try {
+      const res = await fetch("/api/bot/benchmark");
+      if (res.ok) setBenchmark(await res.json());
+    } catch (e) {
+      console.error("benchmark fetch失敗:", e);
+    }
+  }, []);
+
   const fetchNav = useCallback(async () => {
     try {
       const res = await fetch("/api/bot/nav");
@@ -413,6 +427,7 @@ export default function Dashboard() {
     fetchSlowData();
     fetchLifetime();
     fetchNav();
+    fetchBenchmark();
     fetchDiagnostics();
     fetchLearning();
     fetchTiming();
@@ -425,8 +440,9 @@ export default function Dashboard() {
     const timingInt = setInterval(fetchTiming, 60 * 60_000); // 1時間ごと
     const strategyInt = setInterval(fetchAdaptiveStrategy, 5 * 60_000); // 5分ごと
     const lifeInt = setInterval(() => fetchLifetime(), 30 * 60 * 1000); // 30分ごと
-    return () => { clearInterval(fast); clearInterval(slow); clearInterval(navInt); clearInterval(diagInt); clearInterval(learnInt); clearInterval(timingInt); clearInterval(strategyInt); clearInterval(lifeInt); };
-  }, [fetchData, fetchSlowData, fetchLifetime, fetchNav, fetchDiagnostics, fetchLearning, fetchTiming, fetchAdaptiveStrategy]);
+    const benchInt = setInterval(fetchBenchmark, 5 * 60_000); // 5分ごと
+    return () => { clearInterval(fast); clearInterval(slow); clearInterval(navInt); clearInterval(diagInt); clearInterval(learnInt); clearInterval(timingInt); clearInterval(strategyInt); clearInterval(lifeInt); clearInterval(benchInt); };
+  }, [fetchData, fetchSlowData, fetchLifetime, fetchNav, fetchBenchmark, fetchDiagnostics, fetchLearning, fetchTiming, fetchAdaptiveStrategy]);
 
   // 価格チャート用データ。選ばれたペアの履歴が無ければその場で取る。
   // 全ペアを毎回取ると OHLCV は外部APIを叩くので画面が重くなる。
@@ -795,6 +811,37 @@ export default function Dashboard() {
               <div>手数料 ¥{Math.round(lifetime.summary.totalFees).toLocaleString()}</div>
             </div>
           </div>
+
+          {/* 放置との比較 — 入金判断の基準。「増えた/減った」ではなく「何もしないより良いか」 */}
+          {benchmark && (() => {
+            const fmt = (v: number) => `${v >= 0 ? "+" : ""}¥${Math.round(v).toLocaleString()}`;
+            const cls = (v: number | null) => v == null ? "text-zinc-500" : v >= 0 ? "text-green-400" : "text-red-400";
+            const bothWin = benchmark.vsCashJPY > 0 && (benchmark.vsHoldJPY ?? -1) > 0;
+            return (
+              <div className="mt-4 pt-4 border-t border-zinc-800">
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="text-[10px] text-zinc-400 uppercase tracking-wider font-bold">放置と比べると</span>
+                  <span className={`text-[10px] px-1.5 py-0.5 rounded ${bothWin ? "bg-green-900/50 text-green-400" : "bg-zinc-800 text-zinc-400"}`}>
+                    {bothWin ? "両方に勝っている" : "放置に負けている"}
+                  </span>
+                </div>
+                <div className="grid grid-cols-[auto_1fr_auto] gap-x-3 gap-y-1 text-xs font-mono">
+                  <span className="text-zinc-400">このアプリ</span>
+                  <span className="text-zinc-100 text-right">¥{Math.round(benchmark.appJPY).toLocaleString()}</span>
+                  <span className="text-zinc-600">—</span>
+                  <span className="text-zinc-400">円のまま置く</span>
+                  <span className="text-zinc-300 text-right">¥{Math.round(benchmark.cashOnlyJPY).toLocaleString()}</span>
+                  <span className={cls(benchmark.vsCashJPY)}>{fmt(benchmark.vsCashJPY)}</span>
+                  <span className="text-zinc-400">入れた日に均等に買って持つ</span>
+                  <span className="text-zinc-300 text-right">{benchmark.holdJPY == null ? "価格不明" : `¥${Math.round(benchmark.holdJPY).toLocaleString()}`}</span>
+                  <span className={cls(benchmark.vsHoldJPY)}>{benchmark.vsHoldJPY == null ? "—" : fmt(benchmark.vsHoldJPY)}</span>
+                </div>
+                <div className="text-[10px] text-zinc-600 mt-1.5">
+                  入出金の日付ごとに、その日の価格で 3 ペアを均等に買ったことにして比べています。増やすかどうかは両方に勝ってから。
+                </div>
+              </div>
+            );
+          })()}
 
           {/* 総資産推移 — このアプリが意味あるかどうかの最重要指標 */}
           {nav?.current && (() => {

@@ -12,6 +12,7 @@ import { loadData, loadDataStrict, saveData } from "../data";
 import { slippageJPY, summarizeExecutionCosts, allInCostJPY, type ExecutionCost } from "./execution-cost";
 import { attributePnL } from "./lane-pnl";
 import { riskBudgetedSize } from "./risk-sizing";
+import { buildDoNothingBenchmark, nearestPrice } from "./benchmark";
 import { refreshArchive, flattenArchive } from "./execution-archive";
 import { buildEquityCurve, computeDrawdown, computeTradeQuality, evaluateEdgeBudget, INSTITUTIONAL_BENCHMARK } from "./performance-metrics";
 import { buildCryptoReturn, buildFundingReport, type CashFlow } from "./cash-flow";
@@ -2602,6 +2603,46 @@ export async function getPerformanceReport() {
     jpyFreeJPY: snap.jpyFree,
     holdingsValueJPY,
   };
+}
+
+/**
+ * 「放置に勝っているか」。入金判断の基準として本人と決めた比較。
+ *
+ * 入出金 (最初の残高 + cash-flows) の日付ごとに、その時刻に最も近い NAV スナップショットの
+ * 価格で 3 ペアを均等に買ったことにして、いまの価格で評価する。
+ * 価格が取れない入出金があれば、均等買い持ちは null にして誤魔化さない。
+ */
+export async function getDoNothingBenchmark() {
+  await ensureDataLoaded();
+  const exchange = getExchange();
+  await exchange.connect();
+  const snap = await readPortfolioSnapshot(exchange, state.pairs, false, 20_000);
+  const navHistory = await loadData<NavSnapshot[]>("nav-history", []);
+  const flows = await loadData<CashFlow[]>("cash-flows", []);
+  const baseline = navHistory[0];
+
+  const series: Record<string, Array<{ ts: number; price: number }>> = {};
+  for (const p of state.pairs) series[p] = [];
+  for (const n of navHistory) {
+    const ts = Date.parse(n.timestamp);
+    for (const p of state.pairs) {
+      const px = n.positions?.[p]?.price;
+      if (px && px > 0) series[p].push({ ts, price: px });
+    }
+  }
+
+  const allFlows = [
+    ...(baseline ? [{ at: baseline.timestamp, amountJPY: baseline.total }] : []),
+    ...flows.map((f) => ({ at: f.at, amountJPY: f.amountJPY })),
+  ].sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+
+  return buildDoNothingBenchmark({
+    flows: allFlows,
+    pairs: state.pairs,
+    priceAt: (pair, atMs) => nearestPrice(series[pair] ?? [], atMs),
+    currentPrices: snap.prices,
+    currentNavJPY: snap.navJPY,
+  });
 }
 
 /** 直近の決済から戦術枠の張る額を決める。悪ければ縮め、良ければ戻す。 */
