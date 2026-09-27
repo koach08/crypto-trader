@@ -3,7 +3,7 @@
 import { useState, useEffect, useCallback } from "react";
 import {
   LineChart, Line, AreaChart, Area, BarChart, Bar,
-  XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
+  XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, ReferenceLine,
 } from "recharts";
 import type { BotStatus, Position, DailyPnL, AIDecision, TickerData, TradeRecord, PortfolioRiskOverlay } from "@/lib/types";
 import { BITFLYER_PAIRS } from "@/lib/types";
@@ -266,6 +266,12 @@ export default function Dashboard() {
   const [benchmark, setBenchmark] = useState<{
     cashOnlyJPY: number; holdJPY: number | null; appJPY: number;
     vsCashJPY: number; vsHoldJPY: number | null; missing: string[];
+    ladder?: {
+      steps: Array<{ label: string; valueJPY: number | null }>;
+      effects: Array<{ label: string; deltaJPY: number | null; note: string }>;
+      totalGapJPY: number | null;
+    };
+    series?: Array<{ at: string; appJPY: number; cashOnlyJPY: number; holdJPY: number | null }>;
   } | null>(null);
   const [lifetimeLoading, setLifetimeLoading] = useState(false);
   const [nav, setNav] = useState<NavResponse | null>(null);
@@ -816,13 +822,21 @@ export default function Dashboard() {
           {benchmark && (() => {
             const fmt = (v: number) => `${v >= 0 ? "+" : ""}¥${Math.round(v).toLocaleString()}`;
             const cls = (v: number | null) => v == null ? "text-zinc-500" : v >= 0 ? "text-green-400" : "text-red-400";
-            const bothWin = benchmark.vsCashJPY > 0 && (benchmark.vsHoldJPY ?? -1) > 0;
+            const winCash = benchmark.vsCashJPY > 0;
+            const winHold = (benchmark.vsHoldJPY ?? -1) > 0;
+            const bothWin = winCash && winHold;
+            const verdict = bothWin ? "両方に勝っている" : winCash ? "円には勝ち・買い持ちに負け" : winHold ? "買い持ちには勝ち・円に負け" : "両方に負けている";
+            const gapSeries = (benchmark.series ?? []).map((pt) => ({
+              t: new Date(pt.at).toLocaleDateString("ja-JP", { month: "numeric", day: "numeric", timeZone: "Asia/Tokyo" }),
+              vsHold: pt.holdJPY == null ? null : Math.round(pt.appJPY - pt.holdJPY),
+              vsCash: Math.round(pt.appJPY - pt.cashOnlyJPY),
+            }));
             return (
               <div className="mt-4 pt-4 border-t border-zinc-800">
                 <div className="flex items-center gap-2 mb-2">
                   <span className="text-[10px] text-zinc-400 uppercase tracking-wider font-bold">放置と比べると</span>
                   <span className={`text-[10px] px-1.5 py-0.5 rounded ${bothWin ? "bg-green-900/50 text-green-400" : "bg-zinc-800 text-zinc-400"}`}>
-                    {bothWin ? "両方に勝っている" : "放置に負けている"}
+                    {verdict}
                   </span>
                 </div>
                 <div className="grid grid-cols-[auto_1fr_auto] gap-x-3 gap-y-1 text-xs font-mono">
@@ -839,6 +853,50 @@ export default function Dashboard() {
                 <div className="text-[10px] text-zinc-600 mt-1.5">
                   入出金の日付ごとに、その日の価格で 3 ペアを均等に買ったことにして比べています。増やすかどうかは両方に勝ってから。
                 </div>
+
+                {/* 買い持ちとの差を要因に分ける。足すと全体の差に一致する */}
+                {benchmark.ladder && benchmark.ladder.totalGapJPY != null && (
+                  <div className="mt-3">
+                    <div className="text-[10px] text-zinc-400 uppercase tracking-wider font-bold mb-1.5">
+                      均等買い持ちとの差 {fmt(benchmark.ladder.totalGapJPY)} の内訳
+                    </div>
+                    <div className="space-y-1">
+                      {benchmark.ladder.effects.map((e) => (
+                        <div key={e.label} className="grid grid-cols-[1fr_auto] gap-x-3 text-xs" title={e.note}>
+                          <span className="text-zinc-400">{e.label}<span className="text-zinc-600 text-[10px] ml-1.5 hidden sm:inline">{e.note}</span></span>
+                          <span className={`font-mono ${cls(e.deltaJPY)}`}>{e.deltaJPY == null ? "—" : fmt(e.deltaJPY)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* 差の推移: 縮んでいるのか広がっているのか */}
+                {gapSeries.length >= 3 && (
+                  <div className="mt-3">
+                    <div className="text-[10px] text-zinc-400 uppercase tracking-wider font-bold mb-1">放置との差の推移 (0 より上なら勝ち)</div>
+                    <div className="h-32">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <LineChart data={gapSeries} margin={{ top: 4, right: 4, left: 4, bottom: 0 }}>
+                          <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
+                          <XAxis dataKey="t" tick={{ fontSize: 9, fill: "#71717a" }} interval="preserveStartEnd" minTickGap={24} />
+                          <YAxis tick={{ fontSize: 9, fill: "#71717a" }} width={48} tickFormatter={(v: number) => `${v >= 0 ? "+" : ""}${Math.round(v / 1000)}k`} />
+                          <ReferenceLine y={0} stroke="#52525b" />
+                          <Tooltip
+                            contentStyle={{ background: "#18181b", border: "1px solid #3f3f46", fontSize: 11 }}
+                            formatter={(v, name) => [typeof v === "number" ? fmt(v) : "—", name === "vsHold" ? "均等買い持ちとの差" : "円のままとの差"]}
+                          />
+                          <Line type="monotone" dataKey="vsHold" stroke="#f59e0b" dot={false} strokeWidth={1.5} connectNulls />
+                          <Line type="monotone" dataKey="vsCash" stroke="#60a5fa" dot={false} strokeWidth={1.5} />
+                        </LineChart>
+                      </ResponsiveContainer>
+                    </div>
+                    <div className="flex gap-3 text-[10px] text-zinc-500 mt-0.5">
+                      <span><span className="inline-block w-2 h-0.5 bg-amber-500 align-middle mr-1" />均等買い持ちとの差</span>
+                      <span><span className="inline-block w-2 h-0.5 bg-blue-400 align-middle mr-1" />円のままとの差</span>
+                    </div>
+                  </div>
+                )}
               </div>
             );
           })()}

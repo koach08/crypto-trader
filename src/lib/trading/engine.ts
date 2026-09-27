@@ -12,7 +12,7 @@ import { loadData, loadDataStrict, saveData } from "../data";
 import { slippageJPY, summarizeExecutionCosts, allInCostJPY, type ExecutionCost } from "./execution-cost";
 import { attributePnL } from "./lane-pnl";
 import { riskBudgetedSize } from "./risk-sizing";
-import { buildDoNothingBenchmark, nearestPrice } from "./benchmark";
+import { buildBenchmarkLadder, buildBenchmarkSeries, buildDoNothingBenchmark, nearestPrice } from "./benchmark";
 import { refreshArchive, flattenArchive } from "./execution-archive";
 import { buildEquityCurve, computeDrawdown, computeTradeQuality, evaluateEdgeBudget, INSTITUTIONAL_BENCHMARK } from "./performance-metrics";
 import { buildCryptoReturn, buildFundingReport, type CashFlow } from "./cash-flow";
@@ -2636,13 +2636,46 @@ export async function getDoNothingBenchmark() {
     ...flows.map((f) => ({ at: f.at, amountJPY: f.amountJPY })),
   ].sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
 
-  return buildDoNothingBenchmark({
-    flows: allFlows,
-    pairs: state.pairs,
-    priceAt: (pair, atMs) => nearestPrice(series[pair] ?? [], atMs),
-    currentPrices: snap.prices,
-    currentNavJPY: snap.navJPY,
-  });
+  const priceAt = (pair: string, atMs: number) => nearestPrice(series[pair] ?? [], atMs);
+  const cfg = currentCoreConfig();
+  const pairWeights: Record<string, number> = {};
+  for (const p of state.pairs) pairWeights[p] = cfg.weights[p] ?? 0;
+
+  return {
+    ...buildDoNothingBenchmark({
+      flows: allFlows,
+      pairs: state.pairs,
+      priceAt,
+      currentPrices: snap.prices,
+      currentNavJPY: snap.navJPY,
+    }),
+    /** 均等買い持ちとの差を要因に分けたもの */
+    ladder: buildBenchmarkLadder({
+      flows: allFlows,
+      pairs: state.pairs,
+      priceAt,
+      currentPrices: snap.prices,
+      currentNavJPY: snap.navJPY,
+      weights: pairWeights,
+      investedFraction: cfg.targetPct,
+    }),
+    /** 1 日 1 点の推移 (差が縮んでいるか広がっているか) */
+    series: buildBenchmarkSeries({
+      snapshots: navHistory
+        .filter((n) => typeof n.total === "number" && n.total > 0)
+        .map((n) => {
+          const prices: Record<string, number> = {};
+          for (const p of state.pairs) {
+            const px = n.positions?.[p]?.price;
+            if (px && px > 0) prices[p] = px;
+          }
+          return { at: n.timestamp, navJPY: n.total, prices };
+        }),
+      flows: allFlows,
+      pairs: state.pairs,
+      priceAt,
+    }),
+  };
 }
 
 /** 直近の決済から戦術枠の張る額を決める。悪ければ縮め、良ければ戻す。 */
