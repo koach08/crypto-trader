@@ -75,7 +75,12 @@ async function http<T>(path: string, opts: RequestInit = {}): Promise<T> {
   const res = await fetch(`${BASE_URL}${path}`, {
     ...opts,
     signal: opts.signal ?? AbortSignal.timeout(15000),
-    headers: { "Content-Type": "application/json", ...(opts.headers ?? {}) },
+    headers: {
+      "Content-Type": "application/json",
+      // investment-app は 2026-09-28 から全体に鍵。未設定なら付けない(その場合は 401 → 外部材料なし扱い)
+      ...(process.env.INVEST_ALFRED_TOKEN ? { Authorization: `Bearer ${process.env.INVEST_ALFRED_TOKEN}` } : {}),
+      ...(opts.headers ?? {}),
+    },
   });
   if (!res.ok) throw new Error(`HTTP ${res.status} for ${path}`);
   return res.json();
