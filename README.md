@@ -325,7 +325,7 @@ Even after explicitly acknowledging this pattern multiple times in the same sess
 
 ## Author
 
-[@koach08](https://github.com/koach08) — 北海道大学准教授 (英語教育・SLA)。研究の傍ら、複数の SaaS / 教育プロダクトを開発。本 repo は「retail crypto AI auto-trading の限界」を実証データで公開し、次の victim を減らすことを目的とする。
+[@koach08](https://github.com/koach08) — 本業の傍ら、複数の SaaS / 教育プロダクトを開発。本 repo は「retail crypto AI auto-trading の限界」を実証データで公開し、次の victim を減らすことを目的とする。
 
 ## 関連リソース
 
