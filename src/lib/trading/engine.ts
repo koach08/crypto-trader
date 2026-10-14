@@ -1578,7 +1578,12 @@ async function runCycleForPair(pair: string): Promise<void> {
     //    画面には評価額 ¥0 のポジションとして並び、高速監視ループと緊急ロスカットが
     //    毎分それをポーリングして「売却可能数量未満」を出し続けていた。
     //    コアのみのペアも同様に戦術ポジションではないので作らない (sellableNow で控除済み)。
+    // 戦術枠が引退していれば、取引所の残高から戦術ポジションを作り直さない。
+    // 作り直すと、コア枠が買ったばかりで台帳への記録が遅れた分まで「戦術の玉」になり、
+    // 下の売り判断がそれを投げる (2026-10-08 にコアが買った XRP 41 枚を 90 秒後に売った)。
+    // 持ち主が分からない残りは maintainCoreHolding がコア台帳に取り込む。
     if (
+      TACTICAL_LANE_ENABLED &&
       !livePos &&
       realPosition.amount > 0 &&
       ticker.price > 0 &&
@@ -1965,7 +1970,15 @@ async function runCycleForPair(pair: string): Promise<void> {
       }
     }
     // SELL判断
+    // 引退中は判断 (MA ルール撤退など) による売りを出さない。この経路は取引所の残高から
+    // コア台帳を引いた全量を売るので、台帳の記録が一瞬遅れただけでコアの玉を投げてしまう。
+    // 既に持っている戦術の玉の損切り・利確は高速監視 (monitorPositionsFast) が担うので、
+    // 逃げ道は塞がれない。
+    if (!TACTICAL_LANE_ENABLED && decision.action === "SELL") {
+      console.log(`[${pair}] 戦術枠は引退済み: 判断による売り (${decision.reason.slice(0, 40)}) は出さない`);
+    }
     if (
+      TACTICAL_LANE_ENABLED &&
       decision.action === "SELL" &&
       decision.confidence >= LIVE_CONFIDENCE_THRESHOLD &&
       sellableNow > 0 &&
@@ -2491,11 +2504,19 @@ async function maintainCoreHolding(): Promise<void> {
     const at = new Date().toISOString();
     // 約定数量は取引所の実残高で裏取りする。maker 指値の部分約定などで order.amount が
     // 実際の増分を上回ると、台帳が実残高を超えて「売れないペア」を作ってしまう。
+    //
+    // 比べる相手は「買う前の残高」。以前は「コア台帳との差」で見ていたが、成行の直後は
+    // 取引所の残高がまだ更新されていないことがあり、そのとき元からあった端数との差だけが
+    // 増分と判定された (2026-10-08 XRP: 41.2 枚買って 0.128 枚しか台帳に載らず、
+    // 残りを戦術枠の撤退が売った)。残高がまだ動いていなければ約定数量をそのまま信じる。
     let recordedAmount = order.amount;
     try {
+      const base = plan.pair.split("/")[0];
+      const before = balances.find((b) => b.currency === base)?.total ?? 0;
       const after = await exchange.getPosition(plan.pair);
-      const room = Math.max(0, after.amount - coreAmount(state.coreHolding, plan.pair));
-      if (room > 0) recordedAmount = Math.min(order.amount, room);
+      const increase = after.amount - before;
+      // 増分が約定数量の半分以上見えているときだけ、部分約定として小さい方に合わせる
+      if (increase >= order.amount * 0.5) recordedAmount = Math.min(order.amount, increase);
     } catch {
       // 残高が取れなければ order.amount のまま (次サイクルの clamp で整合させる)
     }
