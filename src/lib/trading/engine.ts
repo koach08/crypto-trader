@@ -3516,6 +3516,16 @@ interface NavSnapshot {
  */
 async function reconcileLivePositionsFromExchange(): Promise<void> {
   if (state.paperMode) return;
+  // 戦術枠が引退していれば、取引所の残高から戦術ポジションを作らない。
+  // 作ると、売れない端数 (BTC ¥2,033 < 最小注文 ¥13,000) が戦術の玉になり、
+  // 利確ラインを超えた瞬間から高速監視が毎分売ろうとして失敗し続ける。
+  // 持ち主の無い残りは maintainCoreHolding がコア台帳に取り込む。
+  if (!TACTICAL_LANE_ENABLED) {
+    if (state.livePositions.size > 0) {
+      console.log(`[reconcile] 戦術枠は引退済み: 残高からの再構築はしない (追跡中 ${state.livePositions.size} 件はそのまま)`);
+    }
+    return;
+  }
   try {
     const exchange = getExchange();
     if (!exchange.fetchExecutions) return;
