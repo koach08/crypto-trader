@@ -32,7 +32,7 @@ if [ "$AUTO_START_LIVE" = "true" ]; then
     node -e "
       fetch('http://localhost:$PORT/api/bot/start', {
         method: 'POST',
-        headers: {'Content-Type': 'application/json'},
+        headers: {'Content-Type': 'application/json', 'Authorization': 'Basic ' + Buffer.from(process.env.TRADER_AUTH_USER + ':' + process.env.TRADER_AUTH_PASSWORD).toString('base64')},
         body: JSON.stringify({paperMode: false, pairs: $PAIRS_JSON, intervalSeconds: $INTERVAL})
       }).then(r=>r.json()).then(d=>console.log('[start.sh] Bot result:', JSON.stringify(d))).catch(e=>console.error('[start.sh] Bot start error:', e))
     "
